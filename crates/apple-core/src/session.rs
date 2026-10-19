@@ -16,17 +16,10 @@ use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::mpsc;
 
 use crate::auth::{self, SrpSecret};
+#[cfg(test)]
 use crate::h264::Depacketizer;
 use crate::record::{self, RecordLayer};
 use crate::srtp::{SrtcpEncryptor, SrtpContext};
-
-/// How many distinct video streams are remembered at once. A resized canvas
-/// or a new quality tier brings a new SSRC; the old ones are dropped.
-const MAX_STREAMS: usize = 32;
-
-/// How long the shown stream may be silent before another stream is taken
-/// to be the live one.
-const STREAM_STALL: Duration = Duration::from_millis(750);
 
 /// How long a resize round may take before the session gives up on it and
 /// says so.
@@ -410,21 +403,6 @@ struct MediaCounters {
     pictures: std::sync::atomic::AtomicU64,
     lost: std::sync::atomic::AtomicU64,
     recoveries: std::sync::atomic::AtomicU64,
-}
-
-/// One video stream: its own SRTP state and its own assembler.
-struct Stream {
-    srtp: SrtpContext,
-    depay: Depacketizer,
-}
-
-impl Stream {
-    fn new(keys: &SrtpContext) -> Self {
-        Self {
-            srtp: keys.clone(),
-            depay: Depacketizer::default(),
-        }
-    }
 }
 
 /// Send assembled pictures to the shell. Returns false when the shell has
@@ -841,10 +819,9 @@ async fn connect(
 
     let udp = session.udp.take();
     let ctrl = session.ctrl.take();
-    let mut srtp = session.srtp.take();
+    let srtp = session.srtp.take();
     let width = session.width;
     let height = session.height;
-    let events2 = events.clone();
     // The video receiver has its own lifetime: it ends with the control
     // loop, not with the session. The session's token belongs to the
     // session, and a session that is being retried is not over.
@@ -973,7 +950,7 @@ async fn connect(
     });
     let peer = Peer::resolve(host, ports.0).await;
     let video_task = tokio::spawn(async move {
-        if let (Some(sock), Some(ctx)) = (udp, srtp.as_mut()) {
+        if let (Some(sock), Some(ctx)) = (udp, srtp) {
             let mut buf = vec![0u8; 65535];
             let mut cbuf = vec![0u8; 2048];
             let mut punch = tokio::time::interval(Duration::from_millis(200));
@@ -982,13 +959,9 @@ async fn connect(
             // for ever.
             let mut flush_tick = tokio::time::interval(Duration::from_millis(20));
             let mut packets = 0u32;
-            let mut opened = 0u32;
-            let mut pictures = 0u32;
-            let mut active_ssrc: Option<u32> = None;
-            let mut last_published = Instant::now();
-            let mut stream_count = 1u32;
-            let mut tiled_reported = false;
-            let mut streams: std::collections::HashMap<u32, Stream> = std::collections::HashMap::new();
+            let mut opened = 0u64;
+            let mut streams = crate::video::VideoStreams::new(ctx, Instant::now());
+            let mut last_active = None;
             // How many holes we have already asked about.
             let mut gaps_seen = 0u64;
             // The last time a keyframe was asked for, so a burst of loss
@@ -1031,15 +1004,9 @@ async fn connect(
                                 }
                             }
                         }
-                        // Give up on a hole that has not been filled.
-                        let Some(ssrc) = active_ssrc else { continue };
-                        let Some(stream) = streams.get_mut(&ssrc) else { continue };
-                        let units = stream.depay.flush();
-                        if units.is_empty() { continue; }
-                        if !publish(&events2, units, &video_dimensions, &mut pictures).await {
-                            break;
-                        }
-                        continue;
+                        // Flush candidates as well as the active stream,
+                        // then use the same nonblocking picture queue.
+                        None
                     }
                     r = sock.recv_from(&mut buf) => match r {
                         Ok((n, from)) => {
@@ -1054,7 +1021,7 @@ async fn connect(
                                 }
                                 continue;
                             }
-                            n
+                            Some(n)
                         }
                         Err(_) => break,
                     },
@@ -1077,80 +1044,39 @@ async fn connect(
                         continue;
                     }
                 };
-                packets += 1;
-                if packets <= 3 {
-                    tracing::debug!(bytes = n, "Apple video datagram");
-                }
-                if n < 12 || buf[1] & 0x7f != 123 { continue; }
-                let ssrc = u32::from_be_bytes(buf[8..12].try_into().unwrap());
-                // One stream per SSRC. The sequence space and the rollover
-                // counter belong to the SSRC, and so does the assembly: two
-                // streams interleaved into one assembler corrupt each other.
-                if !streams.contains_key(&ssrc) && streams.len() >= MAX_STREAMS {
-                    // The map is full of streams that are gone. Make room
-                    // rather than refusing a stream that is real.
-                    streams.clear();
-                }
-                let stream = streams.entry(ssrc).or_insert_with(|| Stream::new(&ctx));
-                // Authenticate FIRST. A packet that does not authenticate
-                // must not be able to change which stream is being shown, or
-                // to take a slot in the map.
-                let Some(rtp) = stream.srtp.unprotect(&buf[..n]) else {
-                    if packets <= 3 {
-                        tracing::debug!("SRTP authentication rejected");
-                    }
-                    continue;
-                };
-                opened += 1;
-                if opened == 1 {
-                    tracing::info!(payload_type = rtp.payload_type, "Apple SRTP video authenticated");
-                }
-                // Which stream is the one being shown?
-                //
-                // A new SSRC is a new encoder: a resized canvas or a
-                // different quality tier. It is adopted when the stream we
-                // are showing has gone quiet, and not before: switching
-                // while the current stream is still publishing would show a
-                // different picture every few hundred milliseconds.
-                if active_ssrc != Some(ssrc) {
-                    let quiet = last_published.elapsed() > STREAM_STALL;
-                    if active_ssrc.is_none() || (quiet && stream_count == 1) {
-                        tracing::info!(ssrc, previous = ?active_ssrc, "Apple video stream adopted");
-                        active_ssrc = Some(ssrc);
-                        stream.depay.reset();
-                    } else {
-                        // Another stream is publishing. Count it, report it,
-                        // and keep showing the one that is working. Apple's
-                        // tiled streams carry cross-references, so showing
-                        // one tile on its own is not an option, and mixing
-                        // them is worse than showing the wrong one.
-                        if !tiled_reported {
-                            tiled_reported = true;
-                            tracing::warn!(
-                                ssrc,
-                                "the server is sending more than one video stream; only one is shown"
-                            );
-                        }
-                        stream_count = stream_count.max(streams.len() as u32);
-                        continue;
-                    }
-                }
-                last_published = Instant::now();
-                // A new media generation means the encoder restarted: the
-                // first picture of the new stream is the one that says the
-                // new size is good, and asking for it is what recovers a
-                // restart whose first picture was lost.
                 let generation = video_generation.load(std::sync::atomic::Ordering::SeqCst);
+                let units = match n {
+                    Some(n) => {
+                        packets += 1;
+                        if packets <= 3 {
+                            tracing::debug!(bytes = n, "Apple video datagram");
+                        }
+                        let units = streams.push(&buf[..n], generation, Instant::now());
+                        let authenticated = streams.authenticated();
+                        if opened == 0 && authenticated > 0 {
+                            tracing::info!("Apple SRTP video authenticated");
+                        }
+                        opened = authenticated;
+                        units
+                    }
+                    None => streams.flush(generation, Instant::now()),
+                };
+                let Some(ssrc) = streams.active() else { continue };
+                if last_active != Some(ssrc) {
+                    last_active = Some(ssrc);
+                    gaps_seen = 0;
+                }
+                // A re-offer asks for an independent picture. The receiver
+                // promotes a replacement only with parameter sets and a
+                // complete key picture, not just because its SSRC appeared.
                 if generation != last_generation {
                     last_generation = generation;
                     request_keyframe(&mut feedback, feedback_ssrc, ssrc, ctrl.as_ref(), &ctrl_dest, &mut last_request).await;
                 }
-                let units = stream.depay.push(rtp.seq, rtp.timestamp, rtp.marker, &rtp.payload);
                 if !units.is_empty() {
-                    // A picture belongs to the media generation that was
-                    // running when it was decoded.
-                    video_picture_generation.store(video_generation.load(std::sync::atomic::Ordering::SeqCst), std::sync::atomic::Ordering::SeqCst);
-                    pictures += units.len() as u32;
+                    // This is assembly progress after re-offer, not a
+                    // renderer/decoder acknowledgement of the requested size.
+                    video_picture_generation.store(generation, std::sync::atomic::Ordering::SeqCst);
                     video_counters
                         .pictures
                         .fetch_add(units.len() as u64, std::sync::atomic::Ordering::Relaxed);
@@ -1169,22 +1095,22 @@ async fn connect(
                 // refers to something it never received, and the picture
                 // stays wrong until the next independent picture. Ask for
                 // one.
-                if stream.depay.stats.gaps > gaps_seen {
-                    gaps_seen = stream.depay.stats.gaps;
-                    video_counters.lost.store(stream.depay.stats.lost_packets, std::sync::atomic::Ordering::Relaxed);
+                let Some(stats) = streams.active_stats() else { continue };
+                if stats.gaps > gaps_seen {
+                    gaps_seen = stats.gaps;
+                    video_counters.lost.store(stats.lost_packets, std::sync::atomic::Ordering::Relaxed);
                     video_counters.recoveries.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     // Ask for the packets that went missing, and for a
                     // fresh picture: the missing ones may come back, and
                     // the fresh one is what repairs the reference chain
                     // when they do not.
-                    let missing = stream.depay.stats.lost_sequences.clone();
+                    let missing = stats.lost_sequences.clone();
                     request_retransmission(&mut feedback, feedback_ssrc, ssrc, &missing, ctrl.as_ref(), &ctrl_dest).await;
                     request_keyframe(&mut feedback, feedback_ssrc, ssrc, ctrl.as_ref(), &ctrl_dest, &mut last_request).await;
                 }
                 // Report on the stream's health, so a picture that is going
                 // wrong is visible in the log instead of being guessed at.
-                if packets % 120 == 0 {
-                    let stats = &stream.depay.stats;
+                if n.is_some() && packets % 120 == 0 {
                     if stats.gaps > 0 || stats.malformed > 0 || dropped > 0 {
                         tracing::info!(
                             gaps = stats.gaps,

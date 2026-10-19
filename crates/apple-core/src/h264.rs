@@ -151,6 +151,11 @@ impl Depacketizer {
         std::mem::take(&mut self.ready)
     }
 
+    /// Whether a candidate has parameter sets to accompany a starting picture.
+    pub(crate) fn has_configuration(&self) -> bool {
+        !self.sps.is_empty() && !self.pps.is_empty()
+    }
+
     /// Forget the stream: the next picture starts a new one.
     pub fn reset(&mut self) {
         self.discard_picture();

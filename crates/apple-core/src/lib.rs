@@ -18,6 +18,7 @@ mod record;
 mod rtcp;
 mod session;
 mod srtp;
+mod video;
 
 use remote_core::{ConnectOptions, OptionsMismatch, ProtocolDriver, ProtocolKind, SessionEvent, SessionHandle};
 use tokio::sync::mpsc;
