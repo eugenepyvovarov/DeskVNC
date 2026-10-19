@@ -1215,7 +1215,8 @@ async fn connect(
                             tracing::info!("a quality preset was chosen before the Mac's geometry was known");
                             continue;
                         };
-                        let target = crate::quality::resolution_for(preset, base);
+                        let points = baseline_points.unwrap_or(base);
+                        let target = crate::quality::resolution_for(preset, base, points);
                         let current = (session.width, session.height);
                         resize_requested = true;
                         let base = baseline.unwrap_or(current);
@@ -1379,7 +1380,8 @@ async fn connect(
                         // A preset chosen before this is applied now.
                         if let Some(preset) = pending_preset.take() {
                             let base = baseline.unwrap_or((bw, bh));
-                            let target = crate::quality::resolution_for(preset, base);
+                            let points = baseline_points.unwrap_or(base);
+                            let target = crate::quality::resolution_for(preset, base, points);
                             let current = (session.width, session.height);
                             resize_requested = true;
                             let base = baseline.unwrap_or(current);
