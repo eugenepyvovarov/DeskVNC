@@ -103,10 +103,25 @@ done since, and what still needs a live Mac to settle.
 | P2-22 the interface | **Partly.** The Mac's quality menu says what it does. The statistics are not on the screen yet. |
 | P2-23 regression coverage | **Partly.** The protocol, the renderer and the session rules have tests. There is still no fake server to drive a whole session. |
 
-**The mouse offset in a scaled window is still open.** It was not in the
-findings above, because the review could not tell a scaling mistake from
-a mapping mistake without a live session. It is the next thing to look at,
-and it needs the picture and the pointer together.
+**The mouse offset in a scaled window is explained.** The pointer mapping
+is the exact inverse of the drawing: a new test puts points on the screen,
+maps them to a framebuffer pixel and asks where that pixel is drawn, and
+the two answers agree to within the rounding, in every scaling mode and
+with the view panned.
+
+The offset the user saw is the margin of an aspect-preserving view. A
+3600x2338 desktop shown in a 16:9 window leaves a margin on each side,
+and a pointer in that margin is outside the remote screen, so it is held
+at the edge of the picture. The remote cursor is then drawn at that edge,
+which is a little way inside the window, and the two cursors do not agree:
+about a hundred pixels in a 1600 pixel window, which is the "about fifty
+pixels near the right edge" that was reported.
+
+It is not a mapping mistake, and it cannot be fixed by moving the pointer
+mapping: the remote screen has no such margin, so a pointer there has
+nowhere to be. The honest fixes are to say that the pointer is off the
+picture, or to shrink the margin. That is a decision about the interface,
+and it is still open.
 
 ## Priorities
 
