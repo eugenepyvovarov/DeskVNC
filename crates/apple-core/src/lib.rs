@@ -12,6 +12,7 @@ mod h264;
 mod input;
 mod macos;
 mod offer;
+mod pictures;
 mod plist;
 mod quality;
 mod record;
@@ -20,7 +21,9 @@ mod session;
 mod srtp;
 mod video;
 
-use remote_core::{ConnectOptions, OptionsMismatch, ProtocolDriver, ProtocolKind, SessionEvent, SessionHandle};
+use remote_core::{
+    ConnectOptions, OptionsMismatch, ProtocolDriver, ProtocolKind, SessionEvent, SessionHandle,
+};
 use tokio::sync::mpsc;
 
 /// The Apple driver. One value, built at startup and kept in the registry.
@@ -36,7 +39,9 @@ impl AppleDriver {
     }
 
     pub fn with_host_keys(verifier: impl ssh_transport::HostKeyVerifier) -> Self {
-        Self { host_keys: Some(std::sync::Arc::new(verifier)) }
+        Self {
+            host_keys: Some(std::sync::Arc::new(verifier)),
+        }
     }
 }
 

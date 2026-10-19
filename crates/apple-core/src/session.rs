@@ -82,7 +82,9 @@ async fn request_keyframe(
         return;
     }
     *last = Instant::now();
-    let Some(encryptor) = feedback.as_mut() else { return };
+    let Some(encryptor) = feedback.as_mut() else {
+        return;
+    };
     let Some(socket) = ctrl else { return };
     let packet = crate::rtcp::compound(
         sender,
@@ -93,7 +95,9 @@ async fn request_keyframe(
         ]
         .concat(),
     );
-    let Some(protected) = encryptor.protect(&packet) else { return };
+    let Some(protected) = encryptor.protect(&packet) else {
+        return;
+    };
     if socket.send_to(&protected, ctrl_dest).await.is_err() {
         tracing::warn!("the keyframe request could not be sent");
     } else {
@@ -113,18 +117,25 @@ async fn request_retransmission(
     if missing.is_empty() {
         return;
     }
-    let Some(encryptor) = feedback.as_mut() else { return };
+    let Some(encryptor) = feedback.as_mut() else {
+        return;
+    };
     let Some(socket) = ctrl else { return };
     let nack = crate::rtcp::generic_nack(sender, media, missing);
     if nack.is_empty() {
         return;
     }
     let packet = crate::rtcp::compound(sender, &nack);
-    let Some(protected) = encryptor.protect(&packet) else { return };
+    let Some(protected) = encryptor.protect(&packet) else {
+        return;
+    };
     if socket.send_to(&protected, ctrl_dest).await.is_err() {
         tracing::warn!("the retransmission request could not be sent");
     } else {
-        tracing::info!(packets = missing.len(), "asked the Mac for the missing packets");
+        tracing::info!(
+            packets = missing.len(),
+            "asked the Mac for the missing packets"
+        );
     }
 }
 
@@ -162,21 +173,15 @@ impl Peer {
         // firewall in between may change it, and dropping the media over
         // that would be worse than reading it.
         if from.port() != self.port {
-            tracing::debug!(port = from.port(), expected = self.port, "the media came from another port");
+            tracing::debug!(
+                port = from.port(),
+                expected = self.port,
+                "the media came from another port"
+            );
         }
         true
     }
 }
-
-/// How many assembled pictures may wait for the shell.
-///
-/// The receiver must never stop reading the socket to wait for the shell:
-/// a socket that is not read overflows, and an overflow loses packets, and
-/// a lost packet corrupts the picture that follows it. So the pictures go
-/// into a queue and a second task hands them over. When the queue is full
-/// the oldest picture is dropped and a fresh one is asked for, because a
-/// decoder that misses a picture needs an independent one to recover.
-const PICTURE_QUEUE: usize = 8;
 
 /// The size of the desktop in points, for a picture of a given size.
 ///
@@ -261,7 +266,11 @@ enum ResizeAction {
 }
 
 /// Decide what an ask for a size means, and record it.
-fn plan_resize(round: &mut ResizeRound, target: DisplayGeometry, current: DisplayGeometry) -> ResizeAction {
+fn plan_resize(
+    round: &mut ResizeRound,
+    target: DisplayGeometry,
+    current: DisplayGeometry,
+) -> ResizeAction {
     round.requested = Some(target);
     if round.in_flight {
         // A round is running. The request goes out when it finishes, even
@@ -331,9 +340,13 @@ async fn request_resize(
     desktop: Option<(u16, u16)>,
 ) -> Result<(), SessionError> {
     let current = DisplayGeometry {
-        pixels: current, points: (session.logical_width, session.logical_height),
+        pixels: current,
+        points: (session.logical_width, session.logical_height),
     };
-    let target = DisplayGeometry { pixels: target, points: desktop.unwrap_or(current.points) };
+    let target = DisplayGeometry {
+        pixels: target,
+        points: desktop.unwrap_or(current.points),
+    };
     match plan_resize(round, target, current) {
         ResizeAction::Nothing => Ok(()),
         ResizeAction::Wait => {
@@ -341,10 +354,16 @@ async fn request_resize(
             Ok(())
         }
         ResizeAction::Send(target) => {
-            session.send_body(&display_config(
-                target.pixels.0, target.pixels.1, target.points.0, target.points.1,
-                baseline.0, baseline.1,
-            )).await?;
+            session
+                .send_body(&display_config(
+                    target.pixels.0,
+                    target.pixels.1,
+                    target.points.0,
+                    target.points.1,
+                    baseline.0,
+                    baseline.1,
+                ))
+                .await?;
             tracing::info!(?target, "Apple display resize requested");
             Ok(())
         }
@@ -389,12 +408,15 @@ impl RttEstimator {
 
     /// The best estimate so far: the smallest sample in the window.
     fn best(&self) -> Option<f32> {
-        self.samples.iter().copied().fold(None, |best: Option<f32>, sample| {
-            Some(match best {
-                None => sample,
-                Some(current) => current.min(sample),
+        self.samples
+            .iter()
+            .copied()
+            .fold(None, |best: Option<f32>, sample| {
+                Some(match best {
+                    None => sample,
+                    Some(current) => current.min(sample),
+                })
             })
-        })
     }
 }
 
@@ -422,7 +444,12 @@ async fn publish(
     for au in units {
         *pictures += 1;
         if *pictures <= 5 || (*pictures <= 60 && au.keyframe) {
-            tracing::info!(pictures = *pictures, bytes = au.annex_b.len(), keyframe = au.keyframe, "Apple H.264 picture");
+            tracing::info!(
+                pictures = *pictures,
+                bytes = au.annex_b.len(),
+                keyframe = au.keyframe,
+                "Apple H.264 picture"
+            );
         }
         let size = dimensions.load(std::sync::atomic::Ordering::Relaxed);
         let rect = DecodedRect {
@@ -496,7 +523,9 @@ pub async fn run(
         }
     }
     let (width, height, ports) = match &options.protocol {
-        remote_core::ProtocolOptions::Apple(o) => (o.width, o.height, (o.video_port, o.control_port)),
+        remote_core::ProtocolOptions::Apple(o) => {
+            (o.width, o.height, (o.video_port, o.control_port))
+        }
         _ => (1920, 1080, (5901, 5900)),
     };
     // The session is supervised. A connection that ends is not the end of
@@ -622,7 +651,10 @@ async fn wait_credentials(
     }
 }
 
-async fn fail(events: &mpsc::Sender<SessionEvent>, reason: &str) -> Result<(), remote_core::EventSinkClosed> {
+async fn fail(
+    events: &mpsc::Sender<SessionEvent>,
+    reason: &str,
+) -> Result<(), remote_core::EventSinkClosed> {
     emit_state(
         events,
         SessionState::Disconnected {
@@ -634,6 +666,7 @@ async fn fail(events: &mpsc::Sender<SessionEvent>, reason: &str) -> Result<(), r
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn connect(
     host: &str,
     port: u16,
@@ -657,7 +690,9 @@ async fn connect(
 
     let banner = read_handshake(&mut tcp, 12).await?;
     if &banner != b"RFB 003.889\n" {
-        return Err(SessionError::new("the server did not offer Apple Screen Sharing"));
+        return Err(SessionError::new(
+            "the server did not offer Apple Screen Sharing",
+        ));
     }
     tcp.write_all(b"RFB 003.889\n").await?;
     let count = read_handshake(&mut tcp, 1).await?[0] as usize;
@@ -686,7 +721,8 @@ async fn connect(
         .await
         .map_err(|_| SessionError::new("the Mac stopped answering during the sign-in"))??;
     let identity = auth::seal_identity(&der, username)?;
-    tcp.write_all(&auth::rsa1_packet(2, 0x0100, &identity, 384)).await?;
+    tcp.write_all(&auth::rsa1_packet(2, 0x0100, &identity, 384))
+        .await?;
 
     let challenge_buf = tokio::time::timeout(HANDSHAKE_TIMEOUT, read_counted(&mut tcp))
         .await
@@ -733,7 +769,9 @@ async fn connect(
         // proof has not been confirmed against a live Mac, and a sign-in
         // that fails on a surprise is worse than a sign-in that warns.
         // Make it fatal once a live session has confirmed the framing.
-        tracing::warn!("the server's proof did not match: this does not look like the Mac you expected");
+        tracing::warn!(
+            "the server's proof did not match: this does not look like the Mac you expected"
+        );
         emit(events, SessionEvent::Protocol(remote_core::ProtocolEvent::AppleNotice(
             "The Mac's identity proof did not match. Check that you are connected to the machine you meant.".into(),
         ))).await.ok();
@@ -760,8 +798,10 @@ async fn connect(
 
     tcp.write_all(&viewer_info()).await?;
     // Cleartext follow-up the server requires before it will emit the rekey.
-    tcp.write_all(&[0x12, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01])
-        .await?;
+    tcp.write_all(&[
+        0x12, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+    ])
+    .await?;
     // Encodings go out in the clear. Without them the Mac never sends the
     // rekey, and the session sits on "negotiating" forever.
     tcp.write_all(&set_encodings()).await?;
@@ -792,7 +832,8 @@ async fn connect(
     };
     // This final toggle is CLEAR TEXT: it activates encryption for client
     // messages. Encrypting the toggle leaves the Mac waiting for it forever.
-    session.tcp
+    session
+        .tcp
         .write_all(&[0x12, 0x00, 0x00, 0x02, 0x00, 0x01, 0x00, 0x00])
         .await?;
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -810,7 +851,9 @@ async fn connect(
     // arrive the moment the Mac accepts it.
     session.bind_video(host, ports).await?;
     session.send_body(&offer).await?;
-    session.send_body(&framebuffer_request(session.width, session.height)).await?;
+    session
+        .send_body(&framebuffer_request(session.width, session.height))
+        .await?;
 
     emit(
         events,
@@ -834,14 +877,18 @@ async fn connect(
     let cancel2 = cancel.child_token();
     let video_dest = format!("{host}:5901");
     let ctrl_dest = format!("{host}:5900");
-    let media_dimensions = std::sync::Arc::new(std::sync::atomic::AtomicU32::new((u32::from(width) << 16) | u32::from(height)));
+    let media_dimensions = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(
+        (u32::from(width) << 16) | u32::from(height),
+    ));
     let video_dimensions = media_dimensions.clone();
     // The physical-display controls talk to the Mac over SSH, and the
     // helper it runs takes seconds. That work does not belong in the loop
     // that carries the pointer and the keyboard, so it has a worker of its
     // own and the loop only waits for the answer.
-    let (display_tx, mut display_rx) =
-        mpsc::channel::<(remote_core::MacDisplayAction, mpsc::Sender<Result<remote_core::MacDisplayInfo, String>>)>(4);
+    let (display_tx, mut display_rx) = mpsc::channel::<(
+        remote_core::MacDisplayAction,
+        mpsc::Sender<Result<remote_core::MacDisplayInfo, String>>,
+    )>(4);
     let display_host = host.to_string();
     let display_user = username.to_string();
     let display_password = password.to_string();
@@ -851,9 +898,10 @@ async fn connect(
         while let Some((action, reply)) = display_rx.recv().await {
             let result = async {
                 if display.is_none() {
-                    let verifier = display_keys
-                        .clone()
-                        .ok_or_else(|| "Mac display controls require the application's SSH host-key store".to_owned())?;
+                    let verifier = display_keys.clone().ok_or_else(|| {
+                        "Mac display controls require the application's SSH host-key store"
+                            .to_owned()
+                    })?;
                     display = Some(
                         crate::macos::DisplayController::connect(
                             &display_host,
@@ -864,7 +912,11 @@ async fn connect(
                         .await?,
                     );
                 }
-                display.as_mut().expect("connected above").request(action).await
+                display
+                    .as_mut()
+                    .expect("connected above")
+                    .request(action)
+                    .await
             }
             .await;
             if reply.send(result).await.is_err() {
@@ -880,7 +932,8 @@ async fn connect(
             display.restore_on_disconnect().await;
         }
     });
-    let mut display_reply: Option<mpsc::Receiver<Result<remote_core::MacDisplayInfo, String>>> = None;
+    let mut display_reply: Option<mpsc::Receiver<Result<remote_core::MacDisplayInfo, String>>> =
+        None;
     // The action the pending reply answers, so the answer is read for what
     // it is: reading the mode list says nothing about the desktop, and only
     // a change resizes the picture.
@@ -940,16 +993,56 @@ async fn connect(
     // was lost.
     let mut feedback = session.feedback.take();
     let feedback_ssrc = session.feedback_ssrc;
-    // The pictures go through a queue, so that a shell that is slow to take
+    // The pictures go through a buffer, so that a shell that is slow to take
     // them cannot stop the receiver reading the socket. A socket that is
     // not read overflows, and an overflow loses packets.
-    let (picture_tx, mut picture_rx) = mpsc::channel::<crate::h264::AccessUnit>(PICTURE_QUEUE);
+    //
+    // The buffer keeps the NEWEST pictures. A buffer that keeps the oldest
+    // and drops the newest leaves the view showing a picture from the
+    // past, and every further picture makes it older: the session looks
+    // alive while it shows nothing new. Dropping a picture breaks the
+    // reference chain, so the buffer says when that happened and the
+    // pictures after it wait for an independent one.
+    let picture_buffer = std::sync::Arc::new(tokio::sync::Mutex::new(
+        crate::pictures::PictureBuffer::default(),
+    ));
+    // A wakeup channel, so the consumer can wait for a picture without
+    // holding the lock the producer needs, and without missing one that
+    // arrives between the check and the wait.
+    let (picture_wake_tx, mut picture_wake_rx) = mpsc::channel::<()>(1);
     let picture_events = events.clone();
     let picture_dimensions = video_dimensions.clone();
+    let consumer_buffer = picture_buffer.clone();
     let picture_task = tokio::spawn(async move {
         let mut pictures = 0u32;
-        while let Some(unit) = picture_rx.recv().await {
-            if !publish(&picture_events, vec![unit], &picture_dimensions, &mut pictures).await {
+        loop {
+            let unit = {
+                let mut buffer = consumer_buffer.lock().await;
+                buffer.pop()
+            };
+            let Some(unit) = unit else {
+                // Nothing to hand over: either the buffer is empty or the
+                // chain is broken and an independent picture has not arrived
+                // yet. Wait for the next one.
+                let buffer = consumer_buffer.lock().await;
+                if buffer.is_broken() && buffer.len() > 0 {
+                    tracing::info!(
+                        "the picture chain was broken; waiting for an independent picture"
+                    );
+                }
+                if picture_wake_rx.recv().await.is_none() {
+                    break;
+                }
+                continue;
+            };
+            if !publish(
+                &picture_events,
+                vec![unit],
+                &picture_dimensions,
+                &mut pictures,
+            )
+            .await
+            {
                 break;
             }
         }
@@ -977,6 +1070,7 @@ async fn connect(
             let mut last_generation = 0u64;
             // Pictures the shell did not take in time.
             let mut dropped = 0u64;
+            let mut chain_broken = false;
             // Packets from somewhere other than the Mac.
             let mut stray = 0u64;
             // The round trip to the Mac, measured on the RTCP path.
@@ -1022,7 +1116,7 @@ async fn connect(
                             // rubbish into the decoder.
                             if !peer.matches(&from) {
                                 stray += 1;
-                                if stray <= 3 || stray % 100 == 0 {
+                                if stray <= 3 || stray.is_multiple_of(100) {
                                     tracing::warn!(%from, stray, "a packet from somewhere else was ignored");
                                 }
                                 continue;
@@ -1067,7 +1161,9 @@ async fn connect(
                     }
                     None => streams.flush(generation, Instant::now()),
                 };
-                let Some(ssrc) = streams.active() else { continue };
+                let Some(ssrc) = streams.active() else {
+                    continue;
+                };
                 if last_active != Some(ssrc) {
                     last_active = Some(ssrc);
                     gaps_seen = 0;
@@ -1077,7 +1173,15 @@ async fn connect(
                 // complete key picture, not just because its SSRC appeared.
                 if generation != last_generation {
                     last_generation = generation;
-                    request_keyframe(&mut feedback, feedback_ssrc, ssrc, ctrl.as_ref(), &ctrl_dest, &mut last_request).await;
+                    request_keyframe(
+                        &mut feedback,
+                        feedback_ssrc,
+                        ssrc,
+                        ctrl.as_ref(),
+                        &ctrl_dest,
+                        &mut last_request,
+                    )
+                    .await;
                 }
                 if !units.is_empty() {
                     // This is assembly progress after re-offer, not a
@@ -1087,48 +1191,98 @@ async fn connect(
                         .pictures
                         .fetch_add(units.len() as u64, std::sync::atomic::Ordering::Relaxed);
                     for unit in units {
-                        // The queue never blocks the receiver. A picture that
-                        // does not fit is dropped, and the decoder is given a
-                        // fresh independent picture to recover with.
-                        if picture_tx.try_send(unit).is_err() {
-                            dropped += 1;
-                            video_counters.recoveries.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            request_keyframe(&mut feedback, feedback_ssrc, ssrc, ctrl.as_ref(), &ctrl_dest, &mut last_request).await;
+                        // The buffer never blocks the receiver. A picture
+                        // that does not fit pushes the oldest one out, and
+                        // the chain is repaired by the next independent
+                        // picture.
+                        let overflowed = {
+                            let mut buffer = picture_buffer.lock().await;
+                            let overflowed = buffer.push(unit);
+                            dropped = buffer.dropped();
+                            chain_broken = buffer.is_broken();
+                            overflowed
+                        };
+                        if overflowed {
+                            // The client is behind, not the network. The
+                            // picture that did not fit is complete, so
+                            // asking the Mac for another one adds work
+                            // without fixing anything: it is what turned a
+                            // slow client into a stalled one. One request
+                            // per overflow, rate limited, is enough to get
+                            // an independent picture to restart from.
+                            video_counters
+                                .recoveries
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            request_keyframe(
+                                &mut feedback,
+                                feedback_ssrc,
+                                ssrc,
+                                ctrl.as_ref(),
+                                &ctrl_dest,
+                                &mut last_request,
+                            )
+                            .await;
                         }
+                        // Wake the consumer. A signal that is already
+                        // waiting is enough: it re-checks the buffer.
+                        let _ = picture_wake_tx.try_send(());
                     }
                 }
                 // A lost packet leaves the decoder holding a picture that
                 // refers to something it never received, and the picture
                 // stays wrong until the next independent picture. Ask for
                 // one.
-                let Some(stats) = streams.active_stats() else { continue };
+                let Some(stats) = streams.active_stats() else {
+                    continue;
+                };
                 if stats.gaps > gaps_seen {
                     gaps_seen = stats.gaps;
-                    video_counters.lost.store(stats.lost_packets, std::sync::atomic::Ordering::Relaxed);
-                    video_counters.recoveries.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    video_counters
+                        .lost
+                        .store(stats.lost_packets, std::sync::atomic::Ordering::Relaxed);
+                    video_counters
+                        .recoveries
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     // Ask for the packets that went missing, and for a
                     // fresh picture: the missing ones may come back, and
                     // the fresh one is what repairs the reference chain
                     // when they do not.
                     let missing = stats.lost_sequences.clone();
-                    request_retransmission(&mut feedback, feedback_ssrc, ssrc, &missing, ctrl.as_ref(), &ctrl_dest).await;
-                    request_keyframe(&mut feedback, feedback_ssrc, ssrc, ctrl.as_ref(), &ctrl_dest, &mut last_request).await;
+                    request_retransmission(
+                        &mut feedback,
+                        feedback_ssrc,
+                        ssrc,
+                        &missing,
+                        ctrl.as_ref(),
+                        &ctrl_dest,
+                    )
+                    .await;
+                    request_keyframe(
+                        &mut feedback,
+                        feedback_ssrc,
+                        ssrc,
+                        ctrl.as_ref(),
+                        &ctrl_dest,
+                        &mut last_request,
+                    )
+                    .await;
                 }
                 // Report on the stream's health, so a picture that is going
                 // wrong is visible in the log instead of being guessed at.
-                if n.is_some() && packets % 120 == 0 {
-                    if stats.gaps > 0 || stats.malformed > 0 || dropped > 0 {
-                        tracing::info!(
-                            gaps = stats.gaps,
-                            lost = stats.lost_packets,
-                            reordered = stats.reordered,
-                            late = stats.late,
-                            malformed = stats.malformed,
-                            discarded = stats.discarded,
-                            dropped,
-                            "Apple video stream health"
-                        );
-                    }
+                if n.is_some()
+                    && packets.is_multiple_of(120)
+                    && (stats.gaps > 0 || stats.malformed > 0 || dropped > 0 || chain_broken)
+                {
+                    tracing::info!(
+                        gaps = stats.gaps,
+                        lost = stats.lost_packets,
+                        reordered = stats.reordered,
+                        late = stats.late,
+                        malformed = stats.malformed,
+                        discarded = stats.discarded,
+                        dropped,
+                        "Apple video stream health"
+                    );
                 }
             }
             tracing::debug!(packets, opened, "Apple video receiver stopped");
@@ -1579,11 +1733,13 @@ impl Live {
         loop {
             if self.incoming.len() >= 2 {
                 let len = u16::from_be_bytes([self.incoming[0], self.incoming[1]]) as usize;
-                if len == 0 || len % 16 != 0 {
+                if len == 0 || !len.is_multiple_of(16) {
                     return Err(SessionError::new("invalid Apple record length"));
                 }
                 if self.incoming.len() >= len + 2 {
-                    let body = self.layer.open(&self.incoming[2..len + 2])
+                    let body = self
+                        .layer
+                        .open(&self.incoming[2..len + 2])
                         .map_err(|e| SessionError::new(e.to_string()))?;
                     self.incoming.drain(..len + 2);
                     return Ok(body);
@@ -1639,7 +1795,11 @@ fn bind_udp(port: u16) -> Result<UdpSocket, SessionError> {
     }
     match reference.recv_buffer_size() {
         Ok(size) if size < RECEIVE_BUFFER => {
-            tracing::info!(size, wanted = RECEIVE_BUFFER, "the receive buffer is smaller than asked for");
+            tracing::info!(
+                size,
+                wanted = RECEIVE_BUFFER,
+                "the receive buffer is smaller than asked for"
+            );
         }
         Ok(size) => tracing::debug!(size, "receive buffer ready"),
         Err(error) => tracing::warn!(%error, "the receive buffer size could not be read"),
@@ -1706,19 +1866,19 @@ fn display_config(
     m.extend_from_slice(&1u16.to_be_bytes()); // version
     m.extend_from_slice(&1u16.to_be_bytes()); // display_count
     m.extend_from_slice(&0u32.to_be_bytes()); // header flags
-    // Display descriptor, offsets from its start (RFC §7.1).
+                                              // Display descriptor, offsets from its start (RFC §7.1).
     m.extend_from_slice(&(di_size as u16).to_be_bytes()); // display_info_size
     let mut region = [0u8; 120];
     region[..b"DeskVNC".len()].copy_from_slice(b"DeskVNC");
     m.extend_from_slice(&region); // display_info_region, NUL-terminated name
     m.extend_from_slice(&1u32.to_be_bytes()); // display_flags: DYNAMIC_RESOLUTION
-    // display_type 4. The value is required for a dynamic descriptor, and
-    // the native viewer sends the same descriptor for the physical console
-    // display, so it is not a request for a private display. The server
-    // also uses the field to choose between its display paths, and that is
-    // what the name "virtual" in the protocol notes comes from: the
-    // meaning of the field is not the same thing as what the session
-    // shows.
+                                              // display_type 4. The value is required for a dynamic descriptor, and
+                                              // the native viewer sends the same descriptor for the physical console
+                                              // display, so it is not a request for a private display. The server
+                                              // also uses the field to choose between its display paths, and that is
+                                              // what the name "virtual" in the protocol notes comes from: the
+                                              // meaning of the field is not the same thing as what the session
+                                              // shows.
     m.extend_from_slice(&4u32.to_be_bytes());
     m.extend_from_slice(&369.45f32.to_be_bytes()); // physical mm (native)
     m.extend_from_slice(&207.82f32.to_be_bytes());
@@ -1730,12 +1890,15 @@ fn display_config(
     m.extend_from_slice(&u32::from(height).max(u32::from(max_height)).to_be_bytes()); // max_height
     m.extend_from_slice(&0u16.to_be_bytes()); // current_mode_index
     m.extend_from_slice(&0u16.to_be_bytes()); // preferred_mode_index
-    m.extend_from_slice(&7u32.to_be_bytes()); // rotations — native sends 7
+    m.extend_from_slice(&7u32.to_be_bytes()); // rotations: the native sends 7
     m.extend_from_slice(&(MODE_COUNT as u16).to_be_bytes());
     // The mode table: the same desktop, at a different pixel size. The
     // first entry is the mode that is asked for; the others are the same
     // desktop at the sizes the server may prefer.
-    let logical = (u32::from(logical_width).max(1), u32::from(logical_height).max(1));
+    let logical = (
+        u32::from(logical_width).max(1),
+        u32::from(logical_height).max(1),
+    );
     let mut modes: Vec<(u32, u32)> = vec![(width as u32, height as u32)];
     // A few smaller steps, so the server has something to choose from if it
     // does not want the size that was asked for.
@@ -1806,7 +1969,9 @@ fn rectangles(body: &[u8]) -> Vec<WireRect<'_>> {
         if p + 12 > body.len() {
             break;
         }
-        let Ok(raw) = <[u8; 4]>::try_from(&body[p + 8..p + 12]) else { break };
+        let Ok(raw) = <[u8; 4]>::try_from(&body[p + 8..p + 12]) else {
+            break;
+        };
         let encoding = i32::from_be_bytes(raw);
         p += 12;
         let payload = match encoding {
@@ -1819,7 +1984,9 @@ fn rectangles(body: &[u8]) -> Vec<WireRect<'_>> {
             // shorter than it says is still worth reading: the fields that
             // matter are at the front.
             0x451 => {
-                let Some(header) = body.get(p..p + 2) else { break };
+                let Some(header) = body.get(p..p + 2) else {
+                    break;
+                };
                 let len = u16::from_be_bytes([header[0], header[1]]) as usize;
                 let end = (p + len).min(body.len());
                 &body[p..end]
@@ -1885,10 +2052,7 @@ fn framebuffer_request(width: u16, height: u16) -> Vec<u8> {
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Read one step of the handshake, with a deadline.
-async fn read_handshake(
-    tcp: &mut TcpStream,
-    n: usize,
-) -> Result<Vec<u8>, SessionError> {
+async fn read_handshake(tcp: &mut TcpStream, n: usize) -> Result<Vec<u8>, SessionError> {
     tokio::time::timeout(HANDSHAKE_TIMEOUT, read_exact(tcp, n))
         .await
         .map_err(|_| SessionError::new("the Mac stopped answering during the sign-in"))?
@@ -1906,7 +2070,9 @@ async fn read_counted(tcp: &mut TcpStream) -> Result<Vec<u8>, SessionError> {
     let lenb = read_exact(tcp, 4).await?;
     let n = u32::from_be_bytes(lenb.clone().try_into().unwrap()) as usize;
     if n > 1_048_576 {
-        return Err(SessionError::new("a handshake record was implausibly large"));
+        return Err(SessionError::new(
+            "a handshake record was implausibly large",
+        ));
     }
     let mut rest = read_exact(tcp, n).await?;
     let mut all = lenb;
@@ -1917,8 +2083,10 @@ async fn read_counted(tcp: &mut TcpStream) -> Result<Vec<u8>, SessionError> {
 async fn read_rsa_key(tcp: &mut TcpStream) -> Result<Vec<u8>, SessionError> {
     let head = read_exact(tcp, 4).await?;
     let n = u32::from_be_bytes(head.try_into().unwrap()) as usize;
-    if n < 10 || n > 8192 {
-        return Err(SessionError::new("the server's public key framing was rejected"));
+    if !(10..=8192).contains(&n) {
+        return Err(SessionError::new(
+            "the server's public key framing was rejected",
+        ));
     }
     let rest = read_exact(tcp, n).await?;
     // 2-byte prefix, then u32 big-endian DER length, then the key.
@@ -1949,7 +2117,9 @@ async fn read_clear_message(tcp: &mut TcpStream) -> Result<Vec<u8>, SessionError
         // Not a framebuffer update. Read nothing more; the caller loops and
         // this byte is lost, which is only safe because the rekey is a
         // framebuffer update. Surface it so a surprise message fails closed.
-        return Err(SessionError::new(format!("unexpected cleartext message {kind:#x}")));
+        return Err(SessionError::new(format!(
+            "unexpected cleartext message {kind:#x}"
+        )));
     }
     let header = read_exact(tcp, 3).await?;
     let n = u16::from_be_bytes([header[1], header[2]]) as usize;
@@ -1962,7 +2132,9 @@ async fn read_clear_message(tcp: &mut TcpStream) -> Result<Vec<u8>, SessionError
         let payload = if enc == 0x44f {
             read_exact(tcp, 36).await?
         } else {
-            return Err(SessionError::new(format!("unsupported cleartext encoding {enc:#x}")));
+            return Err(SessionError::new(format!(
+                "unsupported cleartext encoding {enc:#x}"
+            )));
         };
         msg.extend(payload);
     }
@@ -2042,7 +2214,10 @@ mod tests {
         // The next report is answered 120 ms later, because the Mac's
         // reporting gap was long that time.
         rtt.sent(start);
-        assert_eq!(rtt.answered(start + Duration::from_millis(120)), Some(120.0));
+        assert_eq!(
+            rtt.answered(start + Duration::from_millis(120)),
+            Some(120.0)
+        );
         // The best estimate is the smallest of them.
         assert_eq!(rtt.best(), Some(40.0));
         // And an answer with no report to answer is not a sample.
@@ -2064,13 +2239,14 @@ mod tests {
 
         // A key picture: an IDR, split over three packets, with the
         // parameter sets in front of it.
-        let mut wire: Vec<(u16, u32, bool, Vec<u8>)> = Vec::new();
-        wire.push((1, 100, false, vec![0x67, 0x64, 0x00, 0x1f]));
-        wire.push((2, 100, false, vec![0x68, 0xee]));
-        wire.push((3, 100, false, vec![0x7c, 0x85, 0xaa, 0xbb]));
-        wire.push((4, 100, true, vec![0x7c, 0x45, 0xcc]));
-        // Then a delta picture.
-        wire.push((5, 200, true, vec![0x41, 0x9a]));
+        let wire: Vec<(u16, u32, bool, Vec<u8>)> = vec![
+            (1, 100, false, vec![0x67, 0x64, 0x00, 0x1f]),
+            (2, 100, false, vec![0x68, 0xee]),
+            (3, 100, false, vec![0x7c, 0x85, 0xaa, 0xbb]),
+            (4, 100, true, vec![0x7c, 0x45, 0xcc]),
+            // Then a delta picture.
+            (5, 200, true, vec![0x41, 0x9a]),
+        ];
 
         let mut pictures = Vec::new();
         for (seq, timestamp, marker, payload) in wire {
@@ -2082,7 +2258,9 @@ mod tests {
             packet.extend_from_slice(&7u32.to_be_bytes());
             packet.extend_from_slice(&payload);
             let protected = sender.protect(&packet).expect("the packet was protected");
-            let rtp = receiver.unprotect(&protected).expect("the packet authenticated");
+            let rtp = receiver
+                .unprotect(&protected)
+                .expect("the packet authenticated");
             assert_eq!(rtp.marker, marker, "the marker did not survive the wire");
             for unit in depay.push(rtp.seq, rtp.timestamp, rtp.marker, &rtp.payload) {
                 pictures.push(unit);
@@ -2098,7 +2276,10 @@ mod tests {
         assert!(!pictures[1].reset);
         // And the key picture carries the parameter sets with it, because a
         // decoder that has just been built needs them.
-        assert!(pictures[0].annex_b.windows(4).any(|w| w == [0x67, 0x64, 0x00, 0x1f]));
+        assert!(pictures[0]
+            .annex_b
+            .windows(4)
+            .any(|w| w == [0x67, 0x64, 0x00, 0x1f]));
         assert!(pictures[0].annex_b.windows(2).any(|w| w == [0x68, 0xee]));
     }
 
@@ -2112,7 +2293,10 @@ mod tests {
             (800, 450)
         );
         // A panel that is not scaled needs no conversion.
-        assert_eq!(desktop_points((1600, 900), (1920, 1080), (1920, 1080)), (1600, 900));
+        assert_eq!(
+            desktop_points((1600, 900), (1920, 1080), (1920, 1080)),
+            (1600, 900)
+        );
         // With nothing known about the panel, the size is taken as it is.
         assert_eq!(desktop_points((1600, 900), (0, 0), (0, 0)), (1600, 900));
     }
@@ -2132,7 +2316,10 @@ mod tests {
         // may change it, and dropping the media over that would be worse.
         assert!(peer.matches(&"10.0.0.5:40000".parse().unwrap()));
         // With nothing to check against, everything is read.
-        let unknown = Peer { addresses: Vec::new(), port: 5901 };
+        let unknown = Peer {
+            addresses: Vec::new(),
+            port: 5901,
+        };
         assert!(unknown.matches(&"192.168.1.2:1234".parse().unwrap()));
     }
 
@@ -2153,7 +2340,10 @@ mod tests {
         tx.send(ClientCommand::ReconnectNow).await.unwrap();
         let start = Instant::now();
         assert!(!wait_for_retry(&mut rx, &cancel, Duration::from_secs(30), &mut credentials).await);
-        assert!(start.elapsed() < Duration::from_secs(1), "the retry waited anyway");
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "the retry waited anyway"
+        );
     }
 
     #[tokio::test]
@@ -2180,9 +2370,17 @@ mod tests {
         // a receiver report so the peer accepts it.
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let dest = format!("{}", socket.local_addr().unwrap());
-        let mut encryptor = SrtcpEncryptor::from_blob(&[3; 46]).unwrap();
+        let encryptor = SrtcpEncryptor::from_blob(&[3; 46]).unwrap();
         let mut last = Instant::now() - Duration::from_secs(10);
-        request_keyframe(&mut Some(encryptor), 0x1111_2222, 0x3333_4444, Some(&socket), &dest, &mut last).await;
+        request_keyframe(
+            &mut Some(encryptor),
+            0x1111_2222,
+            0x3333_4444,
+            Some(&socket),
+            &dest,
+            &mut last,
+        )
+        .await;
         let mut buf = [0u8; 2048];
         let (n, _) = socket.recv_from(&mut buf).await.unwrap();
         assert!(n > 24);
@@ -2201,16 +2399,18 @@ mod tests {
         // A burst of loss must not turn into a burst of requests.
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let dest = format!("{}", socket.local_addr().unwrap());
-        let mut encryptor = SrtcpEncryptor::from_blob(&[3; 46]).unwrap();
+        let encryptor = SrtcpEncryptor::from_blob(&[3; 46]).unwrap();
         let mut last = Instant::now() - Duration::from_secs(10);
         request_keyframe(&mut Some(encryptor), 1, 2, Some(&socket), &dest, &mut last).await;
         let mut buf = [0u8; 2048];
         socket.recv_from(&mut buf).await.unwrap();
         // The second request is held back.
-        let mut encryptor = SrtcpEncryptor::from_blob(&[3; 46]).unwrap();
+        let encryptor = SrtcpEncryptor::from_blob(&[3; 46]).unwrap();
         request_keyframe(&mut Some(encryptor), 1, 2, Some(&socket), &dest, &mut last).await;
         assert!(
-            tokio::time::timeout(Duration::from_millis(50), socket.recv_from(&mut buf)).await.is_err(),
+            tokio::time::timeout(Duration::from_millis(50), socket.recv_from(&mut buf))
+                .await
+                .is_err(),
             "a second request was sent straight after the first"
         );
     }
@@ -2220,14 +2420,22 @@ mod tests {
         // A key or a button that was pressed and never released stays down on
         // the remote machine. The only way to release it is to say so.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let tcp = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let tcp = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
         let (mut server, _) = listener.accept().await.unwrap();
         let mut live = Live {
             tcp,
             layer: RecordLayer::new([1; 16], [2; 16]),
-            width: 1, height: 1, logical_width: 1, logical_height: 1,
-            srtp: None, feedback: None, feedback_ssrc: 0,
-            udp: None, ctrl: None,
+            width: 1,
+            height: 1,
+            logical_width: 1,
+            logical_height: 1,
+            srtp: None,
+            feedback: None,
+            feedback_ssrc: 0,
+            udp: None,
+            ctrl: None,
             incoming: Vec::with_capacity(8192),
         };
         let mut held = Held::default();
@@ -2259,21 +2467,33 @@ mod tests {
     #[tokio::test]
     async fn interrupted_record_read_keeps_partial_ciphertext() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let tcp = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let tcp = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
         let (mut server, _) = listener.accept().await.unwrap();
         let mut live = Live {
             tcp,
             layer: RecordLayer::new([1; 16], [2; 16]),
-            width: 1, height: 1, logical_width: 1, logical_height: 1,
-            srtp: None, feedback: None, feedback_ssrc: 0,
-            udp: None, ctrl: None,
+            width: 1,
+            height: 1,
+            logical_width: 1,
+            logical_height: 1,
+            srtp: None,
+            feedback: None,
+            feedback_ssrc: 0,
+            udp: None,
+            ctrl: None,
             incoming: Vec::with_capacity(8192),
         };
         let mut sender = RecordLayer::new([1; 16], [2; 16]);
         let packet = sender.seal(b"control reply");
         server.write_all(&packet[..5]).await.unwrap();
         // Simulate a click winning the outer select while a reply is partial.
-        assert!(tokio::time::timeout(Duration::from_millis(20), live.read_body()).await.is_err());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), live.read_body())
+                .await
+                .is_err()
+        );
         assert_eq!(live.incoming.len(), 5);
         server.write_all(&packet[5..]).await.unwrap();
         assert_eq!(live.read_body().await.unwrap(), b"control reply");
@@ -2299,18 +2519,48 @@ mod tests {
         let d = 12;
         let di_size = u16::from_be_bytes([m[d], m[d + 1]]) as usize;
         assert_eq!(di_size, 0x9c + 5 * 28);
-        assert_eq!(u32::from_be_bytes(m[d + 0x7a..d + 0x7e].try_into().unwrap()), 1); // dynamic flag
-        assert_eq!(u32::from_be_bytes(m[d + 0x7e..d + 0x82].try_into().unwrap()), 4); // display_type
-        // The maximum bounds are the Mac's own panel.
-        assert_eq!(u32::from_be_bytes(m[d + 0x8a..d + 0x8e].try_into().unwrap()), 3600);
-        assert_eq!(u32::from_be_bytes(m[d + 0x8e..d + 0x92].try_into().unwrap()), 2338);
-        assert_eq!(u16::from_be_bytes(m[d + 0x92..d + 0x94].try_into().unwrap()), 0); // mode index < count
-        assert_eq!(u32::from_be_bytes(m[d + 0x96..d + 0x9a].try_into().unwrap()), 7);
-        assert_eq!(u16::from_be_bytes(m[d + 0x9a..d + 0x9c].try_into().unwrap()), 5);
+        assert_eq!(
+            u32::from_be_bytes(m[d + 0x7a..d + 0x7e].try_into().unwrap()),
+            1
+        ); // dynamic flag
+        assert_eq!(
+            u32::from_be_bytes(m[d + 0x7e..d + 0x82].try_into().unwrap()),
+            4
+        ); // display_type
+           // The maximum bounds are the Mac's own panel.
+        assert_eq!(
+            u32::from_be_bytes(m[d + 0x8a..d + 0x8e].try_into().unwrap()),
+            3600
+        );
+        assert_eq!(
+            u32::from_be_bytes(m[d + 0x8e..d + 0x92].try_into().unwrap()),
+            2338
+        );
+        assert_eq!(
+            u16::from_be_bytes(m[d + 0x92..d + 0x94].try_into().unwrap()),
+            0
+        ); // mode index < count
+        assert_eq!(
+            u32::from_be_bytes(m[d + 0x96..d + 0x9a].try_into().unwrap()),
+            7
+        );
+        assert_eq!(
+            u16::from_be_bytes(m[d + 0x9a..d + 0x9c].try_into().unwrap()),
+            5
+        );
         let mode = d + 0x9c;
-        assert_eq!(u32::from_be_bytes(m[mode..mode + 4].try_into().unwrap()), 1920);
-        assert_eq!(u32::from_be_bytes(m[mode + 4..mode + 8].try_into().unwrap()), 1080);
-        assert_eq!(f64::from_be_bytes(m[mode + 16..mode + 24].try_into().unwrap()), 60.0);
+        assert_eq!(
+            u32::from_be_bytes(m[mode..mode + 4].try_into().unwrap()),
+            1920
+        );
+        assert_eq!(
+            u32::from_be_bytes(m[mode + 4..mode + 8].try_into().unwrap()),
+            1080
+        );
+        assert_eq!(
+            f64::from_be_bytes(m[mode + 16..mode + 24].try_into().unwrap()),
+            60.0
+        );
     }
 
     /// A framebuffer update carrying one rectangle with the given encoding
@@ -2341,7 +2591,10 @@ mod tests {
         payload[8..10].copy_from_slice(&3600u16.to_be_bytes());
         payload[10..12].copy_from_slice(&2338u16.to_be_bytes());
         body.extend_from_slice(&payload);
-        assert_eq!(find_display_layout(&body), Some(((1800, 1169), (3600, 2338))));
+        assert_eq!(
+            find_display_layout(&body),
+            Some(((1800, 1169), (3600, 2338)))
+        );
     }
 
     #[test]
@@ -2388,8 +2641,14 @@ mod tests {
             assert!(pixel_w > 0 && pixel_h > 0);
         }
         // And the first entry is the size that was asked for.
-        assert_eq!(u32::from_be_bytes(m[mode..mode + 4].try_into().unwrap()), 2216);
-        assert_eq!(u32::from_be_bytes(m[mode + 4..mode + 8].try_into().unwrap()), 1440);
+        assert_eq!(
+            u32::from_be_bytes(m[mode..mode + 4].try_into().unwrap()),
+            2216
+        );
+        assert_eq!(
+            u32::from_be_bytes(m[mode + 4..mode + 8].try_into().unwrap()),
+            1440
+        );
     }
 
     #[test]
@@ -2403,7 +2662,10 @@ mod tests {
         body.extend_from_slice(&1169u16.to_be_bytes()); // scaled h
         body.extend_from_slice(&3600u16.to_be_bytes()); // backing w
         body.extend_from_slice(&2338u16.to_be_bytes()); // backing h
-        assert_eq!(find_display_layout(&body), Some(((1800, 1169), (3600, 2338))));
+        assert_eq!(
+            find_display_layout(&body),
+            Some(((1800, 1169), (3600, 2338)))
+        );
         // 1105 BE is 00 00 04 51, so clobber the 0x04 byte to break the tag.
         body[12..16].copy_from_slice(&1104i32.to_be_bytes());
         assert_eq!(find_display_layout(&body), None);
@@ -2417,14 +2679,20 @@ mod tests {
     }
 
     fn retina(pixels: (u16, u16)) -> DisplayGeometry {
-        DisplayGeometry { pixels, points: (1800, 1169) }
+        DisplayGeometry {
+            pixels,
+            points: (1800, 1169),
+        }
     }
 
     #[test]
     fn a_resize_request_for_the_size_already_shown_does_nothing() {
         let mut round = ResizeRound::default();
         let current = retina((3600, 2338));
-        assert_eq!(plan_resize(&mut round, current, current), ResizeAction::Nothing);
+        assert_eq!(
+            plan_resize(&mut round, current, current),
+            ResizeAction::Nothing
+        );
         assert!(!round.in_flight);
     }
 
@@ -2432,7 +2700,10 @@ mod tests {
     fn a_resize_request_starts_a_round() {
         let mut round = ResizeRound::default();
         let target = retina((2700, 1754));
-        assert_eq!(plan_resize(&mut round, target, retina((3600, 2338))), ResizeAction::Send(target));
+        assert_eq!(
+            plan_resize(&mut round, target, retina((3600, 2338))),
+            ResizeAction::Send(target)
+        );
         assert!(round.in_flight && round.awaiting_layout);
         assert_eq!(round.sent, Some(target));
     }
@@ -2442,14 +2713,20 @@ mod tests {
         let mut round = ResizeRound::default();
         let current = retina((3600, 2338));
         plan_resize(&mut round, retina((1800, 1170)), current);
-        let manual = DisplayGeometry { pixels: (2560, 1440), points: (1280, 720) };
+        let manual = DisplayGeometry {
+            pixels: (2560, 1440),
+            points: (1280, 720),
+        };
         assert_eq!(plan_resize(&mut round, manual, current), ResizeAction::Wait);
         // A later layout can change the session geometry, but must not
         // replace the points carried by the queued request.
         round.confirmed = Some(retina((1800, 1170)));
         assert_eq!(finish_round(&mut round), RoundEnd::Send(manual));
         assert_eq!(round.sent, Some(manual));
-        assert_eq!(round.confirmed, None, "old acknowledgement must not leak into next round");
+        assert_eq!(
+            round.confirmed, None,
+            "old acknowledgement must not leak into next round"
+        );
         assert!(round.awaiting_layout);
     }
 
@@ -2458,26 +2735,41 @@ mod tests {
         let mut round = ResizeRound::default();
         let current = retina((3600, 2338));
         plan_resize(&mut round, retina((1800, 1170)), current);
-        assert_eq!(plan_resize(&mut round, current, current), ResizeAction::Wait);
+        assert_eq!(
+            plan_resize(&mut round, current, current),
+            ResizeAction::Wait
+        );
         assert_eq!(finish_round(&mut round), RoundEnd::Send(current));
     }
 
     #[test]
     fn identical_pixels_with_changed_points_are_not_a_noop() {
         let mut round = ResizeRound::default();
-        let current = DisplayGeometry { pixels: (2700, 1754), points: (1350, 877) };
+        let current = DisplayGeometry {
+            pixels: (2700, 1754),
+            points: (1350, 877),
+        };
         let target = retina(current.pixels);
-        assert_eq!(plan_resize(&mut round, target, current), ResizeAction::Send(target));
+        assert_eq!(
+            plan_resize(&mut round, target, current),
+            ResizeAction::Send(target)
+        );
     }
 
     #[test]
     fn a_queued_quality_choice_keeps_baseline_points_even_after_a_manual_resize() {
         let mut round = ResizeRound::default();
         let current = retina((3600, 2338));
-        let manual = DisplayGeometry { pixels: (2560, 1440), points: (1280, 720) };
+        let manual = DisplayGeometry {
+            pixels: (2560, 1440),
+            points: (1280, 720),
+        };
         plan_resize(&mut round, manual, current);
         let balanced = retina((2700, 1754));
-        assert_eq!(plan_resize(&mut round, balanced, current), ResizeAction::Wait);
+        assert_eq!(
+            plan_resize(&mut round, balanced, current),
+            ResizeAction::Wait
+        );
         round.confirmed = Some(manual);
         assert_eq!(finish_round(&mut round), RoundEnd::Send(balanced));
         assert_eq!(round.sent.unwrap().points, (1800, 1169));
@@ -2487,13 +2779,19 @@ mod tests {
     fn a_round_reports_both_pixel_and_desktop_mismatches() {
         for confirmed in [
             retina((1800, 1170)),
-            DisplayGeometry { pixels: (2700, 1754), points: (1350, 877) },
+            DisplayGeometry {
+                pixels: (2700, 1754),
+                points: (1350, 877),
+            },
         ] {
             let mut round = ResizeRound::default();
             let target = retina((2700, 1754));
             plan_resize(&mut round, target, retina((3600, 2338)));
             round.confirmed = Some(confirmed);
-            assert_eq!(finish_round(&mut round), RoundEnd::Done(Some((target, confirmed))));
+            assert_eq!(
+                finish_round(&mut round),
+                RoundEnd::Done(Some((target, confirmed)))
+            );
             assert!(!round.in_flight);
         }
     }
@@ -2514,7 +2812,9 @@ mod tests {
             payload.extend_from_slice(&n.to_be_bytes());
         }
         let body = update_with(0x451, &payload);
-        assert_eq!(find_display_layout(&body), Some(((1800, 1169), (1200, 780))));
+        assert_eq!(
+            find_display_layout(&body),
+            Some(((1800, 1169), (1200, 780)))
+        );
     }
 }
-
