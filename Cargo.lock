@@ -374,6 +374,7 @@ dependencies = [
  "serde_json",
  "sha1 0.10.7",
  "sha2 0.10.9",
+ "socket2 0.5.10",
  "ssh-transport",
  "thiserror 2.0.19",
  "tokio",

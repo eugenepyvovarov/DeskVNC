@@ -212,6 +212,12 @@ impl ProtocolOptions {
 pub struct AppleOptions {
     pub width: u16,
     pub height: u16,
+    /// The local port the video arrives on. The Mac sends its video to this
+    /// port, so it cannot be an arbitrary one: 5901 is what the protocol
+    /// uses, and a session needs it to itself.
+    pub video_port: u16,
+    /// The local port the control and feedback traffic arrives on.
+    pub control_port: u16,
 }
 
 impl Default for AppleOptions {
@@ -219,13 +225,19 @@ impl Default for AppleOptions {
         Self {
             width: 1920,
             height: 1080,
+            video_port: 5901,
+            control_port: 5900,
         }
     }
 }
 
 impl AppleOptions {
     pub fn new(width: u16, height: u16) -> Self {
-        Self { width, height }
+        Self {
+            width,
+            height,
+            ..Self::default()
+        }
     }
 }
 

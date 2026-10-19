@@ -135,6 +135,56 @@ async fn request_retransmission(
     }
 }
 
+/// Who the media is expected to come from.
+///
+/// The Mac sends its video and its feedback from a known address. A
+/// datagram from anywhere else is not part of the session, and reading one
+/// as video would put rubbish into the decoder.
+struct Peer {
+    addresses: Vec<std::net::IpAddr>,
+    port: u16,
+}
+
+impl Peer {
+    async fn resolve(host: &str, port: u16) -> Self {
+        let addresses = match tokio::net::lookup_host((host, port)).await {
+            Ok(list) => list.map(|addr| addr.ip()).collect(),
+            Err(error) => {
+                tracing::warn!(%error, host, "the Mac's address could not be resolved; packets from any address will be read");
+                Vec::new()
+            }
+        };
+        Self { addresses, port }
+    }
+
+    fn matches(&self, from: &std::net::SocketAddr) -> bool {
+        if self.addresses.is_empty() {
+            return true; // nothing to check against
+        }
+        if !self.addresses.contains(&from.ip()) {
+            return false;
+        }
+        // The port is checked and reported rather than enforced: the Mac has
+        // been seen to answer from the matching port, but a NAT or a
+        // firewall in between may change it, and dropping the media over
+        // that would be worse than reading it.
+        if from.port() != self.port {
+            tracing::debug!(port = from.port(), expected = self.port, "the media came from another port");
+        }
+        true
+    }
+}
+
+/// How many assembled pictures may wait for the shell.
+///
+/// The receiver must never stop reading the socket to wait for the shell:
+/// a socket that is not read overflows, and an overflow loses packets, and
+/// a lost packet corrupts the picture that follows it. So the pictures go
+/// into a queue and a second task hands them over. When the queue is full
+/// the oldest picture is dropped and a fresh one is asked for, because a
+/// decoder that misses a picture needs an independent one to recover.
+const PICTURE_QUEUE: usize = 8;
+
 /// How often a fresh picture may be asked for.
 const KEYFRAME_REQUEST_INTERVAL: Duration = Duration::from_millis(500);
 
@@ -361,9 +411,9 @@ pub async fn run(
             }
         }
     }
-    let (width, height) = match &options.protocol {
-        remote_core::ProtocolOptions::Apple(o) => (o.width, o.height),
-        _ => (1920, 1080),
+    let (width, height, ports) = match &options.protocol {
+        remote_core::ProtocolOptions::Apple(o) => (o.width, o.height, (o.video_port, o.control_port)),
+        _ => (1920, 1080, (5901, 5900)),
     };
     // The session is supervised. A connection that ends is not the end of
     // the session: the driver tries again, and the person watching sees a
@@ -384,6 +434,7 @@ pub async fn run(
             &password,
             width,
             height,
+            ports,
             &events,
             &mut commands,
             &cancel,
@@ -506,6 +557,7 @@ async fn connect(
     password: &str,
     _width: u16,
     _height: u16,
+    ports: (u16, u16),
     events: &mpsc::Sender<SessionEvent>,
     commands: &mut mpsc::Receiver<ClientCommand>,
     cancel: &tokio_util::sync::CancellationToken,
@@ -670,9 +722,11 @@ async fn connect(
     let mut ssrc_bytes = [0u8; 4];
     rand::rng().fill_bytes(&mut ssrc_bytes);
     session.feedback_ssrc = u32::from_be_bytes(ssrc_bytes);
+    // The sockets are bound before the offer goes out, so the media can
+    // arrive the moment the Mac accepts it.
+    session.bind_video(host, ports).await?;
     session.send_body(&offer).await?;
     session.send_body(&framebuffer_request(session.width, session.height)).await?;
-    session.bind_video(host).await?;
 
     emit(
         events,
@@ -778,6 +832,21 @@ async fn connect(
     // was lost.
     let mut feedback = session.feedback.take();
     let feedback_ssrc = session.feedback_ssrc;
+    // The pictures go through a queue, so that a shell that is slow to take
+    // them cannot stop the receiver reading the socket. A socket that is
+    // not read overflows, and an overflow loses packets.
+    let (picture_tx, mut picture_rx) = mpsc::channel::<crate::h264::AccessUnit>(PICTURE_QUEUE);
+    let picture_events = events.clone();
+    let picture_dimensions = video_dimensions.clone();
+    let picture_task = tokio::spawn(async move {
+        let mut pictures = 0u32;
+        while let Some(unit) = picture_rx.recv().await {
+            if !publish(&picture_events, vec![unit], &picture_dimensions, &mut pictures).await {
+                break;
+            }
+        }
+    });
+    let peer = Peer::resolve(host, ports.0).await;
     let video_task = tokio::spawn(async move {
         if let (Some(sock), Some(ctx)) = (udp, srtp.as_mut()) {
             let mut buf = vec![0u8; 65535];
@@ -802,6 +871,10 @@ async fn connect(
             let mut last_request = Instant::now() - Duration::from_secs(10);
             // The media generation the video task last saw.
             let mut last_generation = 0u64;
+            // Pictures the shell did not take in time.
+            let mut dropped = 0u64;
+            // Packets from somewhere other than the Mac.
+            let mut stray = 0u64;
             loop {
                 let n = tokio::select! {
                     _ = cancel2.cancelled() => break,
@@ -823,8 +896,21 @@ async fn connect(
                         }
                         continue;
                     }
-                    r = sock.recv(&mut buf) => match r {
-                        Ok(n) => n,
+                    r = sock.recv_from(&mut buf) => match r {
+                        Ok((n, from)) => {
+                            // Only the Mac's own packets are read. A stray
+                            // datagram on the port is not part of the
+                            // session, and treating one as video would put
+                            // rubbish into the decoder.
+                            if !peer.matches(&from) {
+                                stray += 1;
+                                if stray <= 3 || stray % 100 == 0 {
+                                    tracing::warn!(%from, stray, "a packet from somewhere else was ignored");
+                                }
+                                continue;
+                            }
+                            n
+                        }
                         Err(_) => break,
                     },
                     r = async {
@@ -910,9 +996,16 @@ async fn connect(
                     // A picture belongs to the media generation that was
                     // running when it was decoded.
                     video_picture_generation.store(video_generation.load(std::sync::atomic::Ordering::SeqCst), std::sync::atomic::Ordering::SeqCst);
-                }
-                if !publish(&events2, units, &video_dimensions, &mut pictures).await {
-                    break;
+                    pictures += units.len() as u32;
+                    for unit in units {
+                        // The queue never blocks the receiver. A picture that
+                        // does not fit is dropped, and the decoder is given a
+                        // fresh independent picture to recover with.
+                        if picture_tx.try_send(unit).is_err() {
+                            dropped += 1;
+                            request_keyframe(&mut feedback, feedback_ssrc, ssrc, ctrl.as_ref(), &ctrl_dest, &mut last_request).await;
+                        }
+                    }
                 }
                 // A lost packet leaves the decoder holding a picture that
                 // refers to something it never received, and the picture
@@ -932,7 +1025,7 @@ async fn connect(
                 // wrong is visible in the log instead of being guessed at.
                 if packets % 120 == 0 {
                     let stats = &stream.depay.stats;
-                    if stats.gaps > 0 || stats.malformed > 0 {
+                    if stats.gaps > 0 || stats.malformed > 0 || dropped > 0 {
                         tracing::info!(
                             gaps = stats.gaps,
                             lost = stats.lost_packets,
@@ -940,6 +1033,7 @@ async fn connect(
                             late = stats.late,
                             malformed = stats.malformed,
                             discarded = stats.discarded,
+                            dropped,
                             "Apple video stream health"
                         );
                     }
@@ -1230,6 +1324,7 @@ async fn connect(
     drop(display_tx);
     let _ = tokio::time::timeout(Duration::from_secs(25), display_task).await;
     video_task.abort();
+    picture_task.abort();
     let _ = fail(events, "disconnected").await;
     Ok(())
 }
@@ -1286,24 +1381,53 @@ impl Live {
         }
     }
 
-    async fn bind_video(&mut self, host: &str) -> Result<(), SessionError> {
+    async fn bind_video(&mut self, host: &str, ports: (u16, u16)) -> Result<(), SessionError> {
         // The Mac sends video from its UDP 5901 to our UDP 5901, and the
         // control stream the same way on 5900. An ephemeral port never
         // receives the picture. One outbound byte opens the firewall hole.
-        let video = bind_udp(5901)?;
-        let ctrl = bind_udp(5900)?;
-        video.send_to(&[0], format!("{host}:5901")).await.ok();
-        ctrl.send_to(&[0], format!("{host}:5900")).await.ok();
+        let (video_port, control_port) = ports;
+        let video = bind_udp(video_port)?;
+        let ctrl = bind_udp(control_port)?;
+        // The sockets are bound before the offer goes out, so the media can
+        // arrive the moment the Mac accepts it.
+        if let Err(error) = video.send_to(&[0], format!("{host}:{video_port}")).await {
+            tracing::warn!(%error, "the first hole punch to the Mac did not get through");
+        }
+        if let Err(error) = ctrl.send_to(&[0], format!("{host}:{control_port}")).await {
+            tracing::warn!(%error, "the first control hole punch to the Mac did not get through");
+        }
         self.udp = Some(video);
         self.ctrl = Some(ctrl);
         Ok(())
     }
 }
 
+/// How much the socket is asked to hold, in bytes.
+///
+/// A picture is a burst of packets, and the decoder may be a moment behind
+/// the wire. A small buffer overflows in exactly that moment, and an
+/// overflow loses packets, and a lost packet corrupts the picture that
+/// follows it. This is a request, not a promise: the kernel may cap it.
+const RECEIVE_BUFFER: usize = 4 * 1024 * 1024;
+
 fn bind_udp(port: u16) -> Result<UdpSocket, SessionError> {
     let sock = std::net::UdpSocket::bind(("0.0.0.0", port)).map_err(|e| {
-        SessionError::new(format!("UDP {port} is already in use ({e})"))
+        SessionError::new(format!(
+            "UDP port {port} is not available ({e}). Another Apple session is probably using it: the Mac sends its video to this exact port, so two sessions to one Mac cannot share it."
+        ))
     })?;
+    // Ask for a big receive buffer, and say what we actually got.
+    let reference = socket2::SockRef::from(&sock);
+    if let Err(error) = reference.set_recv_buffer_size(RECEIVE_BUFFER) {
+        tracing::warn!(%error, "the receive buffer could not be enlarged");
+    }
+    match reference.recv_buffer_size() {
+        Ok(size) if size < RECEIVE_BUFFER => {
+            tracing::info!(size, wanted = RECEIVE_BUFFER, "the receive buffer is smaller than asked for");
+        }
+        Ok(size) => tracing::debug!(size, "receive buffer ready"),
+        Err(error) => tracing::warn!(%error, "the receive buffer size could not be read"),
+    }
     sock.set_nonblocking(true)
         .map_err(|e| SessionError::new(e.to_string()))?;
     UdpSocket::from_std(sock).map_err(|e| SessionError::new(e.to_string()))
@@ -1677,6 +1801,25 @@ impl From<std::io::Error> for SessionError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_packet_from_somewhere_else_is_not_read_as_video() {
+        // The Mac's own packets are read. A stray datagram on the port is
+        // not part of the session, and reading one as video would put
+        // rubbish into the decoder.
+        let peer = Peer {
+            addresses: vec!["10.0.0.5".parse().unwrap()],
+            port: 5901,
+        };
+        assert!(peer.matches(&"10.0.0.5:5901".parse().unwrap()));
+        assert!(!peer.matches(&"10.0.0.6:5901".parse().unwrap()));
+        // The port is reported rather than enforced: a firewall in between
+        // may change it, and dropping the media over that would be worse.
+        assert!(peer.matches(&"10.0.0.5:40000".parse().unwrap()));
+        // With nothing to check against, everything is read.
+        let unknown = Peer { addresses: Vec::new(), port: 5901 };
+        assert!(unknown.matches(&"192.168.1.2:1234".parse().unwrap()));
+    }
 
     #[tokio::test]
     async fn the_retry_wait_ends_when_the_session_is_told_to_stop() {
