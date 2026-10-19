@@ -222,18 +222,20 @@ const KEYFRAME_REQUEST_INTERVAL: Duration = Duration::from_millis(500);
 /// running is remembered and sent when the round ends, even when it asks
 /// for the size the session had before the round started: that is a real
 /// request, and dropping it is how a quality change used to disappear.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DisplayGeometry {
+    pixels: (u16, u16),
+    points: (u16, u16),
+}
+
 #[derive(Default)]
 struct ResizeRound {
-    /// The newest size the user asked for.
-    requested: Option<(u16, u16)>,
-    /// The desktop size that was asked for, in points.
-    asked_desktop: Option<(u16, u16)>,
-    /// Whether the mode table has been tried the other way round already.
-    swapped_tried: bool,
-    /// The size the request that is running asked for.
-    sent: Option<(u16, u16)>,
-    /// The size the server confirmed in the layout that answered it.
-    confirmed: Option<(u16, u16)>,
+    /// Keep both coordinate spaces with the latest intent and the sent
+    /// request. Queuing just pixels silently loses the requested desktop.
+    requested: Option<DisplayGeometry>,
+    sent: Option<DisplayGeometry>,
+    /// Raw geometry acknowledged by the server; not decoded output.
+    confirmed: Option<DisplayGeometry>,
     /// A request is with the server.
     in_flight: bool,
     /// When the request was sent.
@@ -253,13 +255,13 @@ enum ResizeAction {
     /// The picture is already that size. Nothing to ask for.
     Nothing,
     /// Send the request now.
-    Send((u16, u16)),
+    Send(DisplayGeometry),
     /// A round is running. The request goes out when that round ends.
     Wait,
 }
 
 /// Decide what an ask for a size means, and record it.
-fn plan_resize(round: &mut ResizeRound, target: (u16, u16), current: (u16, u16)) -> ResizeAction {
+fn plan_resize(round: &mut ResizeRound, target: DisplayGeometry, current: DisplayGeometry) -> ResizeAction {
     round.requested = Some(target);
     if round.in_flight {
         // A round is running. The request goes out when it finishes, even
@@ -273,6 +275,7 @@ fn plan_resize(round: &mut ResizeRound, target: (u16, u16), current: (u16, u16))
         return ResizeAction::Nothing;
     }
     round.sent = Some(target);
+    round.confirmed = None;
     round.sent_at = Some(Instant::now());
     round.in_flight = true;
     round.needs_picture = true;
@@ -285,10 +288,10 @@ fn plan_resize(round: &mut ResizeRound, target: (u16, u16), current: (u16, u16))
 enum RoundEnd {
     /// The round is over. The pair is the size that was asked for and the
     /// size the server chose, when they differ.
-    Done(Option<((u16, u16), (u16, u16))>),
+    Done(Option<(DisplayGeometry, DisplayGeometry)>),
     /// Another request goes out, because a newer one arrived while this
     /// round was running.
-    Send((u16, u16)),
+    Send(DisplayGeometry),
 }
 
 /// Close a round that has been answered and has produced its picture.
@@ -300,6 +303,7 @@ fn finish_round(round: &mut ResizeRound) -> RoundEnd {
         Some(target) if Some(target) != sent => {
             // A newer request arrived while this round was running. It wins.
             round.sent = Some(target);
+            round.confirmed = None;
             round.sent_at = Some(Instant::now());
             round.in_flight = true;
             round.needs_picture = true;
@@ -326,20 +330,22 @@ async fn request_resize(
     baseline: (u16, u16),
     desktop: Option<(u16, u16)>,
 ) -> Result<(), SessionError> {
-    round.asked_desktop = desktop.or_else(|| Some((session.logical_width, session.logical_height)));
+    let current = DisplayGeometry {
+        pixels: current, points: (session.logical_width, session.logical_height),
+    };
+    let target = DisplayGeometry { pixels: target, points: desktop.unwrap_or(current.points) };
     match plan_resize(round, target, current) {
         ResizeAction::Nothing => Ok(()),
         ResizeAction::Wait => {
-            tracing::debug!(w = target.0, h = target.1, "Apple resize request queued");
+            tracing::debug!(?target, "Apple resize request queued");
             Ok(())
         }
-        ResizeAction::Send((w, h)) => {
-            // The desktop keeps the size it has, unless the request is for
-            // the desktop itself: then the desktop takes the new shape and
-            // the picture follows it.
-            let (lw, lh) = desktop.unwrap_or((session.logical_width, session.logical_height));
-            session.send_body(&display_config(w, h, lw, lh, baseline.0, baseline.1)).await?;
-            tracing::info!(w, h, "Apple display resize requested");
+        ResizeAction::Send(target) => {
+            session.send_body(&display_config(
+                target.pixels.0, target.pixels.1, target.points.0, target.points.1,
+                baseline.0, baseline.1,
+            )).await?;
+            tracing::info!(?target, "Apple display resize requested");
             Ok(())
         }
     }
@@ -1230,7 +1236,7 @@ async fn connect(
                         let current = (session.width, session.height);
                         resize_requested = true;
                         let base = baseline.unwrap_or(current);
-                        request_resize(&mut session, &mut round, target, current, base, None).await?;
+                        request_resize(&mut session, &mut round, target, current, base, Some(points)).await?;
                     }
                     Some(ClientCommand::MacDisplay(action)) => {
                         use remote_core::MacDisplayAction;
@@ -1366,20 +1372,9 @@ async fn connect(
                     }
                 }
                 // AppleDisplayLayout (0x451): authoritative geometry (R-A15).
-                if let Some(((mut lw, mut lh), (mut bw, mut bh))) = find_display_layout(&body) {
-                    // The desktop is never larger in pixels than in points:
-                    // a retina display has more pixels than points, never
-                    // fewer. A layout that says otherwise has the two the
-                    // other way round, and believing it would make every
-                    // quality preset ask for a picture of the wrong size.
-                    if bw < lw || bh < lh {
-                        tracing::warn!(
-                            logical = ?(lw, lh), backing = ?(bw, bh),
-                            "the layout has the desktop and the picture the other way round; correcting it"
-                        );
-                        std::mem::swap(&mut lw, &mut bw);
-                        std::mem::swap(&mut lh, &mut bh);
-                    }
+                if let Some(((lw, lh), (bw, bh))) = find_display_layout(&body) {
+                    // Keep the wire fields as reported. Pixel/point ratios
+                    // do not establish field order or justify a second resize.
                     let changed = (bw, bh) != (session.width, session.height);
                     session.width = bw;
                     session.height = bh;
@@ -1396,7 +1391,8 @@ async fn connect(
                     }
                     // The first layout, before anything was asked of the
                     // Mac, is the Mac's own geometry.
-                    if baseline.is_none() && !resize_requested {
+                    let learn_baseline = baseline.is_none() && !resize_requested;
+                    if learn_baseline {
                         baseline = Some((bw, bh));
                         baseline_points = Some((session.logical_width, session.logical_height));
                         tracing::info!(
@@ -1404,16 +1400,6 @@ async fn connect(
                             logical_width = session.logical_width, logical_height = session.logical_height,
                             "the Mac's own geometry"
                         );
-                        // A preset chosen before this is applied now.
-                        if let Some(preset) = pending_preset.take() {
-                            let base = baseline.unwrap_or((bw, bh));
-                            let points = baseline_points.unwrap_or(base);
-                            let target = crate::quality::resolution_for(preset, base, points);
-                            let current = (session.width, session.height);
-                            resize_requested = true;
-                            let base = baseline.unwrap_or(current);
-                        request_resize(&mut session, &mut round, target, current, base, None).await?;
-                        }
                     }
                     media_dimensions.store((u32::from(bw) << 16) | u32::from(bh), std::sync::atomic::Ordering::Relaxed);
                     if changed {
@@ -1422,40 +1408,7 @@ async fn connect(
                     // R-A16b: re-arm the sender on every layout, geometry or not.
                     session.send_body(&auto_framebuffer(bw, bh)).await?;
                     session.send_body(&framebuffer_request(bw, bh)).await?;
-                    // The desktop came back as something else than the one
-                    // that was asked for. The mode table carries two sizes,
-                    // and a server that reads them the other way round would
-                    // give the desktop the size that was meant for the
-                    // picture. That is worth one try, because it turns a
-                    // desktop that moves under the person into one that does
-                    // not.
-                    if let (Some(asked), (lw, lh)) = (round.asked_desktop, (lw, lh)) {
-                        if !round.swapped_tried && (lw, lh) != asked {
-                            let asked_pixels = round.sent;
-                            let close_to_pixels = asked_pixels
-                                .map(|(px, py)| {
-                                    f64::from(lw) / f64::from(px.max(1)) > 0.9
-                                        && f64::from(lh) / f64::from(py.max(1)) > 0.9
-                                })
-                                .unwrap_or(false);
-                            if close_to_pixels {
-                                round.swapped_tried = true;
-                                tracing::warn!(
-                                    asked = ?asked, got = ?(lw, lh),
-                                    "the Mac gave the desktop the size of the picture; trying the mode table the other way round"
-                                );
-                                let (mw, mh) = baseline.unwrap_or((session.width, session.height));
-                                let (lw2, lh2) = (lw, lh);
-                                // The picture size becomes the desktop size
-                                // and the other way round.
-                                session
-                                    .send_body(&display_config(lw2, lh2, asked.0, asked.1, mw, mh))
-                                    .await?;
-                                continue;
-                            }
-                        }
-                    }
-                    if round.in_flight {
+                    if round.in_flight && round.awaiting_layout {
                         // §10.9 step 3: the re-offer is what restarts the
                         // encoder at the new canvas. Keys are reused.
                         //
@@ -1465,10 +1418,22 @@ async fn connect(
                         // the new size has been decoded.
                         session.send_body(&offer).await?;
                         generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                        round.confirmed = Some((bw, bh));
+                        round.confirmed = Some(DisplayGeometry { pixels: (bw, bh), points: (lw, lh) });
                         round.needs_picture = changed;
                         round.awaiting_layout = false;
-                        tracing::info!(bw, bh, "Apple display layout applied; media re-offered");
+                        tracing::info!(bw, bh, "Apple display layout received; media re-offered");
+                    }
+                    // Start a deferred preset only AFTER processing this
+                    // unsolicited baseline layout. It cannot acknowledge a
+                    // request that was not sent when the layout arrived.
+                    if learn_baseline {
+                        if let Some(preset) = pending_preset.take() {
+                            let base = baseline.unwrap();
+                            let points = baseline_points.unwrap();
+                            let target = crate::quality::resolution_for(preset, base, points);
+                            resize_requested = true;
+                            request_resize(&mut session, &mut round, target, (bw, bh), base, Some(points)).await?;
+                        }
                     }
                 }
             }
@@ -1516,11 +1481,12 @@ async fn connect(
                     // encoder says nothing about the size that was asked for.
                     if !round.awaiting_layout && (!round.needs_picture || picture_arrived) {
                         match finish_round(&mut round) {
-                            RoundEnd::Send((w, h)) => {
-                                tracing::info!(w, h, "Apple queued resize sent");
-                                let (lw, lh) = (session.logical_width, session.logical_height);
+                            RoundEnd::Send(target) => {
+                                tracing::info!(?target, "Apple queued resize sent");
                                 let (mw, mh) = baseline.unwrap_or((session.width, session.height));
-                                session.send_body(&display_config(w, h, lw, lh, mw, mh)).await?;
+                                session.send_body(&display_config(
+                                    target.pixels.0, target.pixels.1, target.points.0, target.points.1, mw, mh,
+                                )).await?;
                             }
                             RoundEnd::Done(clamped) => {
                                 tracing::info!("Apple resize round complete");
@@ -1529,7 +1495,11 @@ async fn connect(
                                 // rather than leaving the user to guess.
                                 if let Some((sent, confirmed)) = clamped {
                                     emit(events, SessionEvent::Protocol(remote_core::ProtocolEvent::AppleNotice(
-                                        format!("The Mac streams at {}x{}, not the {}x{} that was asked for.", confirmed.0, confirmed.1, sent.0, sent.1),
+                                        format!(
+                                            "The Mac reported {}x{} pixels / {}x{} points; requested {}x{} pixels / {}x{} points. This is a layout acknowledgement, not decoded output.",
+                                            confirmed.pixels.0, confirmed.pixels.1, confirmed.points.0, confirmed.points.1,
+                                            sent.pixels.0, sent.pixels.1, sent.points.0, sent.points.1,
+                                        ),
                                     ))).await.ok();
                                 }
                             }
@@ -1544,7 +1514,7 @@ async fn connect(
                             round.requested = None;
                             tracing::warn!("Apple resize round timed out");
                             emit(events, SessionEvent::Protocol(remote_core::ProtocolEvent::AppleNotice(
-                                "The Mac did not answer the resize request. The picture is unchanged.".into(),
+                                "The stream-size request timed out. Its effective size has not been verified; check the decoded picture dimensions.".into(),
                             ))).await.ok();
                         }
                     }
@@ -2438,89 +2408,105 @@ mod tests {
         assert_eq!(u16::from_be_bytes([msg[2], msg[3]]) as usize, msg.len() - 4);
     }
 
+    fn retina(pixels: (u16, u16)) -> DisplayGeometry {
+        DisplayGeometry { pixels, points: (1800, 1169) }
+    }
+
     #[test]
     fn a_resize_request_for_the_size_already_shown_does_nothing() {
         let mut round = ResizeRound::default();
-        assert_eq!(plan_resize(&mut round, (1920, 1080), (1920, 1080)), ResizeAction::Nothing);
+        let current = retina((3600, 2338));
+        assert_eq!(plan_resize(&mut round, current, current), ResizeAction::Nothing);
         assert!(!round.in_flight);
     }
 
     #[test]
     fn a_resize_request_starts_a_round() {
         let mut round = ResizeRound::default();
-        assert_eq!(plan_resize(&mut round, (1663, 1080), (1920, 1080)), ResizeAction::Send((1663, 1080)));
-        assert!(round.in_flight);
-        assert_eq!(round.sent, Some((1663, 1080)));
+        let target = retina((2700, 1754));
+        assert_eq!(plan_resize(&mut round, target, retina((3600, 2338))), ResizeAction::Send(target));
+        assert!(round.in_flight && round.awaiting_layout);
+        assert_eq!(round.sent, Some(target));
     }
 
     #[test]
-    fn a_request_during_a_round_is_remembered_and_sent_when_the_round_ends() {
+    fn a_request_during_a_round_keeps_both_pixels_and_points() {
         let mut round = ResizeRound::default();
-        plan_resize(&mut round, (1663, 1080), (1920, 1080));
-        // A second request arrives while the first is still running.
-        assert_eq!(plan_resize(&mut round, (2560, 1440), (1920, 1080)), ResizeAction::Wait);
-        // The round ends: the newer request goes out.
-        assert_eq!(finish_round(&mut round), RoundEnd::Send((2560, 1440)));
-        assert!(round.in_flight);
-        assert_eq!(round.sent, Some((2560, 1440)));
+        let current = retina((3600, 2338));
+        plan_resize(&mut round, retina((1800, 1170)), current);
+        let manual = DisplayGeometry { pixels: (2560, 1440), points: (1280, 720) };
+        assert_eq!(plan_resize(&mut round, manual, current), ResizeAction::Wait);
+        // A later layout can change the session geometry, but must not
+        // replace the points carried by the queued request.
+        round.confirmed = Some(retina((1800, 1170)));
+        assert_eq!(finish_round(&mut round), RoundEnd::Send(manual));
+        assert_eq!(round.sent, Some(manual));
+        assert_eq!(round.confirmed, None, "old acknowledgement must not leak into next round");
+        assert!(round.awaiting_layout);
     }
 
     #[test]
     fn a_request_for_the_size_before_the_round_is_not_lost() {
-        // The user asks for Low, then for the size the session had before.
-        // The second request asks for the CURRENT size, so a check against
-        // the current size would drop it, and the session would end up at
-        // the size the user asked for first.
         let mut round = ResizeRound::default();
-        plan_resize(&mut round, (1663, 1080), (1920, 1080));
-        assert_eq!(plan_resize(&mut round, (1920, 1080), (1920, 1080)), ResizeAction::Wait);
-        assert_eq!(finish_round(&mut round), RoundEnd::Send((1920, 1080)));
+        let current = retina((3600, 2338));
+        plan_resize(&mut round, retina((1800, 1170)), current);
+        assert_eq!(plan_resize(&mut round, current, current), ResizeAction::Wait);
+        assert_eq!(finish_round(&mut round), RoundEnd::Send(current));
     }
 
     #[test]
-    fn a_round_ends_with_the_size_the_server_chose_when_it_differs() {
+    fn identical_pixels_with_changed_points_are_not_a_noop() {
         let mut round = ResizeRound::default();
-        plan_resize(&mut round, (3000, 2000), (1920, 1080));
-        // The server answered with a different size.
-        round.confirmed = Some((2560, 1440));
-        assert_eq!(finish_round(&mut round), RoundEnd::Done(Some(((3000, 2000), (2560, 1440)))));
-        assert!(!round.in_flight);
+        let current = DisplayGeometry { pixels: (2700, 1754), points: (1350, 877) };
+        let target = retina(current.pixels);
+        assert_eq!(plan_resize(&mut round, target, current), ResizeAction::Send(target));
+    }
+
+    #[test]
+    fn a_queued_quality_choice_keeps_baseline_points_even_after_a_manual_resize() {
+        let mut round = ResizeRound::default();
+        let current = retina((3600, 2338));
+        let manual = DisplayGeometry { pixels: (2560, 1440), points: (1280, 720) };
+        plan_resize(&mut round, manual, current);
+        let balanced = retina((2700, 1754));
+        assert_eq!(plan_resize(&mut round, balanced, current), ResizeAction::Wait);
+        round.confirmed = Some(manual);
+        assert_eq!(finish_round(&mut round), RoundEnd::Send(balanced));
+        assert_eq!(round.sent.unwrap().points, (1800, 1169));
+    }
+
+    #[test]
+    fn a_round_reports_both_pixel_and_desktop_mismatches() {
+        for confirmed in [
+            retina((1800, 1170)),
+            DisplayGeometry { pixels: (2700, 1754), points: (1350, 877) },
+        ] {
+            let mut round = ResizeRound::default();
+            let target = retina((2700, 1754));
+            plan_resize(&mut round, target, retina((3600, 2338)));
+            round.confirmed = Some(confirmed);
+            assert_eq!(finish_round(&mut round), RoundEnd::Done(Some((target, confirmed))));
+            assert!(!round.in_flight);
+        }
     }
 
     #[test]
     fn a_round_ends_quietly_when_the_server_chose_what_was_asked() {
         let mut round = ResizeRound::default();
-        plan_resize(&mut round, (1663, 1080), (1920, 1080));
-        round.confirmed = Some((1663, 1080));
+        let target = retina((2700, 1754));
+        plan_resize(&mut round, target, retina((3600, 2338)));
+        round.confirmed = Some(target);
         assert_eq!(finish_round(&mut round), RoundEnd::Done(None));
     }
 
     #[test]
-    fn a_round_waits_for_the_layout_before_the_picture() {
-        let mut round = ResizeRound::default();
-        plan_resize(&mut round, (1663, 1080), (1920, 1080));
-        // A picture from the old encoder must not end the round: the layout
-        // that answers the request has not arrived yet.
-        assert!(round.awaiting_layout);
-        round.confirmed = Some((1663, 1080));
-        round.needs_picture = true;
-        round.awaiting_layout = false;
-        assert!(round.in_flight);
-    }
-
-    #[test]
-    fn a_round_waits_for_a_picture_at_the_new_size() {
-        let mut round = ResizeRound::default();
-        plan_resize(&mut round, (1663, 1080), (1920, 1080));
-        // The layout arrived: the round is not over, the encoder restarts
-        // and the new picture has to arrive.
-        round.confirmed = Some((1663, 1080));
-        round.needs_picture = true;
-        assert!(round.in_flight);
-        // Only a layout that did not change the geometry ends the round
-        // straight away.
-        round.needs_picture = false;
-        assert_eq!(finish_round(&mut round), RoundEnd::Done(None));
+    fn layout_parser_does_not_swap_downsampled_pixel_and_point_fields() {
+        let mut payload = Vec::new();
+        for n in [12u16, 5, 1800, 1169, 1200, 780] {
+            payload.extend_from_slice(&n.to_be_bytes());
+        }
+        let body = update_with(0x451, &payload);
+        assert_eq!(find_display_layout(&body), Some(((1800, 1169), (1200, 780))));
     }
 }
 
