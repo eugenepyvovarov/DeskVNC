@@ -233,6 +233,10 @@ const KEYFRAME_REQUEST_INTERVAL: Duration = Duration::from_millis(500);
 struct ResizeRound {
     /// The newest size the user asked for.
     requested: Option<(u16, u16)>,
+    /// The desktop size that was asked for, in points.
+    asked_desktop: Option<(u16, u16)>,
+    /// Whether the mode table has been tried the other way round already.
+    swapped_tried: bool,
     /// The size the request that is running asked for.
     sent: Option<(u16, u16)>,
     /// The size the server confirmed in the layout that answered it.
@@ -329,6 +333,7 @@ async fn request_resize(
     baseline: (u16, u16),
     desktop: Option<(u16, u16)>,
 ) -> Result<(), SessionError> {
+    round.asked_desktop = desktop.or_else(|| Some((session.logical_width, session.logical_height)));
     match plan_resize(round, target, current) {
         ResizeAction::Nothing => Ok(()),
         ResizeAction::Wait => {
@@ -1435,10 +1440,27 @@ async fn connect(
                     }
                 }
                 // AppleDisplayLayout (0x451): authoritative geometry (R-A15).
-                if let Some(((lw, lh), (bw, bh))) = find_display_layout(&body) {
+                if let Some(((mut lw, mut lh), (mut bw, mut bh))) = find_display_layout(&body) {
+                    // The desktop is never larger in pixels than in points:
+                    // a retina display has more pixels than points, never
+                    // fewer. A layout that says otherwise has the two the
+                    // other way round, and believing it would make every
+                    // quality preset ask for a picture of the wrong size.
+                    if bw < lw || bh < lh {
+                        tracing::warn!(
+                            logical = ?(lw, lh), backing = ?(bw, bh),
+                            "the layout has the desktop and the picture the other way round; correcting it"
+                        );
+                        std::mem::swap(&mut lw, &mut bw);
+                        std::mem::swap(&mut lh, &mut bh);
+                    }
                     let changed = (bw, bh) != (session.width, session.height);
                     session.width = bw;
                     session.height = bh;
+                    media_state.desktop_width = u32::from(lw);
+                    media_state.desktop_height = u32::from(lh);
+                    media_state.canvas_width = u32::from(bw);
+                    media_state.canvas_height = u32::from(bh);
                     // The layout also says how big the desktop is in points.
                     // On a retina display that is half the pixel size, and
                     // it is what a quality change must leave alone.
@@ -1474,6 +1496,39 @@ async fn connect(
                     // R-A16b: re-arm the sender on every layout, geometry or not.
                     session.send_body(&auto_framebuffer(bw, bh)).await?;
                     session.send_body(&framebuffer_request(bw, bh)).await?;
+                    // The desktop came back as something else than the one
+                    // that was asked for. The mode table carries two sizes,
+                    // and a server that reads them the other way round would
+                    // give the desktop the size that was meant for the
+                    // picture. That is worth one try, because it turns a
+                    // desktop that moves under the person into one that does
+                    // not.
+                    if let (Some(asked), (lw, lh)) = (round.asked_desktop, (lw, lh)) {
+                        if !round.swapped_tried && (lw, lh) != asked {
+                            let asked_pixels = round.sent;
+                            let close_to_pixels = asked_pixels
+                                .map(|(px, py)| {
+                                    f64::from(lw) / f64::from(px.max(1)) > 0.9
+                                        && f64::from(lh) / f64::from(py.max(1)) > 0.9
+                                })
+                                .unwrap_or(false);
+                            if close_to_pixels {
+                                round.swapped_tried = true;
+                                tracing::warn!(
+                                    asked = ?asked, got = ?(lw, lh),
+                                    "the Mac gave the desktop the size of the picture; trying the mode table the other way round"
+                                );
+                                let (mw, mh) = baseline.unwrap_or((session.width, session.height));
+                                let (lw2, lh2) = (lw, lh);
+                                // The picture size becomes the desktop size
+                                // and the other way round.
+                                session
+                                    .send_body(&display_config(lw2, lh2, asked.0, asked.1, mw, mh))
+                                    .await?;
+                                continue;
+                            }
+                        }
+                    }
                     if round.in_flight {
                         // §10.9 step 3: the re-offer is what restarts the
                         // encoder at the new canvas. Keys are reused.

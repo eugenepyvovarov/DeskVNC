@@ -38,6 +38,10 @@ export function MacDisplayControls(props: {
   media?: {
     canvasWidth: number;
     canvasHeight: number;
+    desktopWidth: number;
+    desktopHeight: number;
+    pictureWidth: number;
+    pictureHeight: number;
     tiles: number;
     pictures: number;
     lost: number;
@@ -80,9 +84,13 @@ export function MacDisplayControls(props: {
       )}
       {props.media && (props.media.pictures > 0 || props.media.canvasWidth > 0) && (
         <p className="text-tertiary">
-          {props.media.canvasWidth > 0
-            ? `The Mac is sending ${props.media.canvasWidth}×${props.media.canvasHeight}`
-            : "The Mac has not answered the offer yet"}
+          {props.media.desktopWidth > 0
+            ? `Desktop ${props.media.desktopWidth}×${props.media.desktopHeight} points`
+            : "The Mac has not said how big its desktop is"}
+          {props.media.canvasWidth > 0 &&
+            `, picture ${props.media.canvasWidth}×${props.media.canvasHeight} pixels`}
+          {props.media.canvasWidth > 0 && props.media.desktopWidth > 0 &&
+            ` (${(props.media.canvasWidth / props.media.desktopWidth).toFixed(2)}×)`}
           {props.media.tiles > 1 ? ` in ${props.media.tiles} tiles` : ""}.
           {props.media.pictures > 0 && ` ${props.media.pictures} pictures`}
           {props.media.lost > 0 && `, ${props.media.lost} packets lost`}

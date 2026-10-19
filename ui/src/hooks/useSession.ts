@@ -80,6 +80,10 @@ type SessionOrSshEventPayload = SessionEventPayload | (SshOnlyEvent & { sessionI
       state: {
         canvasWidth: number;
         canvasHeight: number;
+        desktopWidth: number;
+        desktopHeight: number;
+        pictureWidth: number;
+        pictureHeight: number;
         tiles: number;
         pictures: number;
         lost: number;
@@ -140,6 +144,10 @@ export interface SessionApi {
   appleMedia: {
     canvasWidth: number;
     canvasHeight: number;
+    desktopWidth: number;
+    desktopHeight: number;
+    pictureWidth: number;
+    pictureHeight: number;
     tiles: number;
     pictures: number;
     lost: number;
