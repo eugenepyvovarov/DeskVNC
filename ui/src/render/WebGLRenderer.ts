@@ -762,6 +762,21 @@ export class WebGLRenderer {
 
   /** Set remote framebuffer size (on connect and DesktopResize). */
   setRemoteSize(width: number, height: number, preserveVideo = false): void {
+    // The PICTURE decides the size of the frame, not the layout.
+    //
+    // A layout says how big the remote desktop is; the picture says how big
+    // the frame has to be to hold it. When the two disagree — and they do,
+    // because a Mac may answer with a different picture size than the one
+    // that was asked for — a frame of the layout's size either crops the
+    // picture or magnifies it, and the picture looks wrong in a way nobody
+    // can name. The picture is what is on the screen, so the picture wins.
+    if (
+      this.mediaPictureWidth > 0 &&
+      (this.mediaPictureWidth !== width || this.mediaPictureHeight !== height)
+    ) {
+      width = this.mediaPictureWidth;
+      height = this.mediaPictureHeight;
+    }
     if (width === this.fbWidth && height === this.fbHeight) return;
     const gl = this.gl;
     this.fbWidth = width;
