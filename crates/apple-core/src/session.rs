@@ -185,6 +185,31 @@ impl Peer {
 /// decoder that misses a picture needs an independent one to recover.
 const PICTURE_QUEUE: usize = 8;
 
+/// The size of the desktop in points, for a picture of a given size.
+///
+/// A retina panel is twice the points of its pixels, so a window of a given
+/// size in pixels is half that size in points on the Mac's screen. The
+/// ratio comes from the Mac's own geometry, which is the only place it is
+/// written down.
+fn desktop_points(
+    pixels: (u16, u16),
+    baseline_pixels: (u16, u16),
+    baseline_points: (u16, u16),
+) -> (u16, u16) {
+    if baseline_points.0 == 0 || baseline_points.1 == 0 {
+        return pixels;
+    }
+    let scale_x = f64::from(baseline_pixels.0) / f64::from(baseline_points.0);
+    let scale_y = f64::from(baseline_pixels.1) / f64::from(baseline_points.1);
+    if scale_x <= 0.0 || scale_y <= 0.0 {
+        return pixels;
+    }
+    (
+        ((f64::from(pixels.0) / scale_x).round() as u32).max(1) as u16,
+        ((f64::from(pixels.1) / scale_y).round() as u32).max(1) as u16,
+    )
+}
+
 /// How many times the offer is asked again when the Mac answers with an
 /// empty canvas. The Mac does that while its encoder is warming up, and
 /// the answer that follows is the one that counts.
@@ -302,6 +327,7 @@ async fn request_resize(
     target: (u16, u16),
     current: (u16, u16),
     baseline: (u16, u16),
+    desktop: Option<(u16, u16)>,
 ) -> Result<(), SessionError> {
     match plan_resize(round, target, current) {
         ResizeAction::Nothing => Ok(()),
@@ -310,7 +336,10 @@ async fn request_resize(
             Ok(())
         }
         ResizeAction::Send((w, h)) => {
-            let (lw, lh) = (session.logical_width, session.logical_height);
+            // The desktop keeps the size it has, unless the request is for
+            // the desktop itself: then the desktop takes the new shape and
+            // the picture follows it.
+            let (lw, lh) = desktop.unwrap_or((session.logical_width, session.logical_height));
             session.send_body(&display_config(w, h, lw, lh, baseline.0, baseline.1)).await?;
             tracing::info!(w, h, "Apple display resize requested");
             Ok(())
@@ -828,6 +857,9 @@ async fn connect(
     // what "native" means, what the quality presets are measured against,
     // and what a restore has to put back.
     let mut baseline: Option<(u16, u16)> = None;
+    // The same, in points: a retina panel is twice the points of its pixels,
+    // and the difference is what turns a window's size into a desktop's size.
+    let mut baseline_points: Option<(u16, u16)> = None;
     // Whether a resize has been asked for. The first layout after that is
     // the answer to the resize, not the Mac's own geometry.
     let mut resize_requested = false;
@@ -1187,7 +1219,7 @@ async fn connect(
                         let current = (session.width, session.height);
                         resize_requested = true;
                         let base = baseline.unwrap_or(current);
-                        request_resize(&mut session, &mut round, target, current, base).await?;
+                        request_resize(&mut session, &mut round, target, current, base, None).await?;
                     }
                     Some(ClientCommand::MacDisplay(action)) => {
                         use remote_core::MacDisplayAction;
@@ -1224,7 +1256,23 @@ async fn connect(
                             let current = (session.width, session.height);
                             resize_requested = true;
                             let base = baseline.unwrap_or(current);
-                            request_resize(&mut session, &mut round, (width, height), current, base).await?;
+                            // The size asked for is the size of the remote
+                            // desktop, in the units the desktop uses. On a
+                            // retina panel that is points, and the picture
+                            // that arrives is twice as many pixels.
+                            let points = match (baseline, baseline_points) {
+                                (Some(px), Some(points)) => desktop_points((width, height), px, points),
+                                _ => (width, height),
+                            };
+                            request_resize(
+                                &mut session,
+                                &mut round,
+                                (width, height),
+                                current,
+                                base,
+                                Some(points),
+                            )
+                            .await?;
                         } else {
                             emit(events, SessionEvent::Protocol(remote_core::ProtocolEvent::AppleNotice("That size is outside the range the Mac can stream.".into()))).await.ok();
                         }
@@ -1322,6 +1370,7 @@ async fn connect(
                     // Mac, is the Mac's own geometry.
                     if baseline.is_none() && !resize_requested {
                         baseline = Some((bw, bh));
+                        baseline_points = Some((session.logical_width, session.logical_height));
                         tracing::info!(
                             width = bw, height = bh,
                             logical_width = session.logical_width, logical_height = session.logical_height,
@@ -1334,7 +1383,7 @@ async fn connect(
                             let current = (session.width, session.height);
                             resize_requested = true;
                             let base = baseline.unwrap_or(current);
-                        request_resize(&mut session, &mut round, target, current, base).await?;
+                        request_resize(&mut session, &mut round, target, current, base, None).await?;
                         }
                     }
                     media_dimensions.store((u32::from(bw) << 16) | u32::from(bh), std::sync::atomic::Ordering::Relaxed);
@@ -1975,6 +2024,21 @@ mod tests {
         // decoder that has just been built needs them.
         assert!(pictures[0].annex_b.windows(4).any(|w| w == [0x67, 0x64, 0x00, 0x1f]));
         assert!(pictures[0].annex_b.windows(2).any(|w| w == [0x68, 0xee]));
+    }
+
+    #[test]
+    fn a_window_size_becomes_a_desktop_size_in_points() {
+        // The Mac's panel is 3600x2338 pixels and 1800x1169 points, so it
+        // is twice each. A window of 1600x900 pixels is therefore a desktop
+        // of 800x450 points.
+        assert_eq!(
+            desktop_points((1600, 900), (3600, 2338), (1800, 1169)),
+            (800, 450)
+        );
+        // A panel that is not scaled needs no conversion.
+        assert_eq!(desktop_points((1600, 900), (1920, 1080), (1920, 1080)), (1600, 900));
+        // With nothing known about the panel, the size is taken as it is.
+        assert_eq!(desktop_points((1600, 900), (0, 0), (0, 0)), (1600, 900));
     }
 
     #[tokio::test]
