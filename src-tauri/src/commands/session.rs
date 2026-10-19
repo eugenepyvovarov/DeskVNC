@@ -1106,6 +1106,11 @@ pub async fn connect_session(
     // profile, which is what a fixed resolution wants anyway.
     viewport_width: Option<u16>,
     viewport_height: Option<u16>,
+    // The Mac's own geometry, as the last session confirmed it: the
+    // picture size in pixels and the desktop size in points. The client
+    // sends it in its first record so the Mac attaches to the running
+    // console session instead of starting a new one with a login screen.
+    apple_geometry: Option<[u16; 4]>,
     on_event: Channel<InvokeResponseBody>,
 ) -> Result<SessionConnectOutcome, String> {
     let id = match session_id {
@@ -1238,7 +1243,18 @@ pub async fn connect_session(
         }
         // Apple options are fixed at construction. There is no saved
         // blob to fold in, and this arm must not call `vnc_mut`.
-        ProtocolKind::Apple => {}
+        ProtocolKind::Apple => {
+            if let Some(geometry) = apple_geometry {
+                if geometry.iter().all(|value| *value > 0) {
+                    options.apple_mut().desktop = Some(remote_core::options::AppleGeometry {
+                        pixel_width: geometry[0],
+                        pixel_height: geometry[1],
+                        point_width: geometry[2],
+                        point_height: geometry[3],
+                    });
+                }
+            }
+        }
         _ => {
             let vnc = options.vnc_mut();
             vnc.security_pref = profile.as_ref().and_then(|p| p.security_pref.clone());

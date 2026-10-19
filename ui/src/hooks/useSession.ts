@@ -31,6 +31,7 @@ import { encodeTerminalInput, encodeTerminalResize } from "../render/input";
 import type { PromptAnswer } from "../lib/credentials";
 import type { MacDisplayAction, MacDisplayInfo } from "../components/MacDisplayControls";
 import type { AppleMediaState } from "../lib/appleMedia";
+import { appleGeometryArguments, readAppleGeometry, writeAppleGeometry } from "../lib/appleGeometry";
 import { initTrace, traceMark } from "../render/trace";
 import type {
   CredentialRequest,
@@ -524,9 +525,22 @@ export function useSession(
           if (ev.info) setMacDisplayInfo(ev.info);
           setMacDisplayNotice(ev.error ?? "Physical display mode confirmed by macOS.");
           break;
-        case "apple-media":
+        case "apple-media": {
           setAppleMedia(ev.state);
+          // The layout the Mac confirmed is the geometry of its desktop.
+          // Remembering it is what lets the next connection say which
+          // display the session is about.
+          const { layoutWidth, layoutHeight, desktopWidth, desktopHeight } = ev.state;
+          if (layoutWidth > 0 && layoutHeight > 0 && desktopWidth > 0 && desktopHeight > 0) {
+            writeAppleGeometry(params.profileId, {
+              pixelWidth: layoutWidth,
+              pixelHeight: layoutHeight,
+              pointWidth: desktopWidth,
+              pointHeight: desktopHeight,
+            });
+          }
           break;
+        }
         case "apple-notice":
           setMacDisplayNotice(ev.message);
           break;
@@ -623,6 +637,10 @@ export function useSession(
           viewportHeight: Math.round(
             (availableRef.current?.height || window.innerHeight) * window.devicePixelRatio,
           ),
+          // The Mac's own geometry, as the last session confirmed it, so
+          // the Mac attaches to the running console session instead of
+          // starting a new one that shows a login screen.
+          appleGeometry: appleGeometryArguments(readAppleGeometry(params.profileId)),
           onEvent: channel,
         });
         repromptRef.current = false;

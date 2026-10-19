@@ -21,6 +21,31 @@ use crate::h264::Depacketizer;
 use crate::record::{self, RecordLayer};
 use crate::srtp::{SrtcpEncryptor, SrtpContext};
 
+/// The first encrypted records the client sends.
+///
+/// The native client's first two records are the display configuration and
+/// then the encodings (RFC section 6.4). The order matters: the display
+/// configuration says which display the session is about, and the encodings
+/// say what the client can do with it. A client that sends the encodings
+/// first, or never sends a display configuration at all, lets the Mac
+/// choose a session for itself, and the choice can be a new one with a
+/// login screen rather than the console the person is already using.
+fn first_records(geometry: Option<remote_core::options::AppleGeometry>) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    if let Some(geometry) = geometry {
+        out.push(display_config(
+            geometry.pixel_width,
+            geometry.pixel_height,
+            geometry.point_width,
+            geometry.point_height,
+            geometry.pixel_width,
+            geometry.pixel_height,
+        ));
+    }
+    out.push(set_encodings());
+    out
+}
+
 /// Whether a fresh picture should be asked for because the client is the
 /// one that is behind.
 ///
@@ -550,11 +575,11 @@ pub async fn run(
             }
         }
     }
-    let (width, height, ports) = match &options.protocol {
+    let (width, height, ports, geometry) = match &options.protocol {
         remote_core::ProtocolOptions::Apple(o) => {
-            (o.width, o.height, (o.video_port, o.control_port))
+            (o.width, o.height, (o.video_port, o.control_port), o.desktop)
         }
-        _ => (1920, 1080, (5901, 5900)),
+        _ => (1920, 1080, (5901, 5900), None),
     };
     // The session is supervised. A connection that ends is not the end of
     // the session: the driver tries again, and the person watching sees a
@@ -576,6 +601,7 @@ pub async fn run(
             width,
             height,
             ports,
+            geometry,
             &events,
             &mut commands,
             &cancel,
@@ -703,6 +729,7 @@ async fn connect(
     _width: u16,
     _height: u16,
     ports: (u16, u16),
+    geometry: Option<remote_core::options::AppleGeometry>,
     events: &mpsc::Sender<SessionEvent>,
     commands: &mut mpsc::Receiver<ClientCommand>,
     cancel: &tokio_util::sync::CancellationToken,
@@ -865,7 +892,17 @@ async fn connect(
         .write_all(&[0x12, 0x00, 0x00, 0x02, 0x00, 0x01, 0x00, 0x00])
         .await?;
     tokio::time::sleep(Duration::from_millis(200)).await;
-    session.send_body(&set_encodings()).await?;
+    // The first encrypted records, in the order the native client sends
+    // them: the display configuration, then the encodings.
+    //
+    // The display configuration is what says which display the session is
+    // about. A client that says nothing lets the Mac choose, and what it
+    // may choose is a new session with a login screen rather than the
+    // console the person is already using. The geometry is the one the
+    // last session confirmed, so the desktop is not resized either.
+    for record in first_records(geometry) {
+        session.send_body(&record).await?;
+    }
     let (offer, srtp_blob, feedback_blob) = crate::offer::media_offer();
     session.srtp = SrtpContext::from_blob(&srtp_blob);
     // The other half of the video key encrypts the feedback we send back.
@@ -2421,6 +2458,54 @@ mod tests {
         tx.send(ClientCommand::ReconnectNow).await.unwrap();
         assert!(!wait_for_retry(&mut rx, &cancel, Duration::from_secs(30), &mut credentials).await);
         assert_eq!(credentials, ("other".to_string(), "new".to_string()));
+    }
+
+    #[test]
+    fn the_display_configuration_is_the_first_record() {
+        // The native client's first two records are the display
+        // configuration and then the encodings. The display configuration
+        // says which display the session is about: without it the Mac
+        // chooses, and what it may choose is a new session with a login
+        // screen rather than the console the person is already using.
+        let geometry = remote_core::options::AppleGeometry {
+            pixel_width: 3600,
+            pixel_height: 2338,
+            point_width: 1800,
+            point_height: 1169,
+        };
+        let records = first_records(Some(geometry));
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0][0], 0x1d, "the display configuration comes first");
+        assert_eq!(records[1][0], 0x02, "the encodings come second");
+        // The desktop keeps its size: the picture changes, the points do
+        // not.
+        let d = 12;
+        let mode = d + 0x9c;
+        assert_eq!(
+            u32::from_be_bytes(records[0][mode..mode + 4].try_into().unwrap()),
+            3600
+        );
+        assert_eq!(
+            u32::from_be_bytes(records[0][mode + 4..mode + 8].try_into().unwrap()),
+            2338
+        );
+        assert_eq!(
+            u32::from_be_bytes(records[0][mode + 8..mode + 12].try_into().unwrap()),
+            1800
+        );
+        assert_eq!(
+            u32::from_be_bytes(records[0][mode + 12..mode + 16].try_into().unwrap()),
+            1169
+        );
+    }
+
+    #[test]
+    fn without_a_known_geometry_the_encodings_are_still_sent() {
+        // A first ever connection has no geometry to send. The encodings
+        // still go out, so the session works.
+        let records = first_records(None);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0][0], 0x02);
     }
 
     #[test]

@@ -173,6 +173,18 @@ impl ConnectOptions {
             other => panic!("expected RDP options, got {:?}", other.kind()),
         }
     }
+
+    /// The Apple half, mutably, on the same terms as [`Self::vnc_mut`].
+    ///
+    /// # Panics
+    ///
+    /// When the options are not Apple.
+    pub fn apple_mut(&mut self) -> &mut AppleOptions {
+        match &mut self.protocol {
+            ProtocolOptions::Apple(a) => a,
+            other => panic!("expected Apple options, got {:?}", other.kind()),
+        }
+    }
 }
 
 /// The protocol specific half of [`ConnectOptions`].
@@ -218,6 +230,26 @@ pub struct AppleOptions {
     pub video_port: u16,
     /// The local port the control and feedback traffic arrives on.
     pub control_port: u16,
+    /// The Mac's own geometry, as the last session confirmed it.
+    ///
+    /// The native client sends the console display's geometry in its first
+    /// record, so the Mac attaches to the running console session instead
+    /// of starting a new one, which shows a login screen. A client that
+    /// does not know the geometry cannot send that record, so it is
+    /// remembered from the last session and sent again.
+    pub desktop: Option<AppleGeometry>,
+}
+
+/// The geometry of the Mac's desktop, in both coordinate spaces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppleGeometry {
+    /// The picture size, in pixels.
+    pub pixel_width: u16,
+    pub pixel_height: u16,
+    /// The desktop size, in points.
+    pub point_width: u16,
+    pub point_height: u16,
 }
 
 impl Default for AppleOptions {
@@ -227,6 +259,7 @@ impl Default for AppleOptions {
             height: 1080,
             video_port: 5901,
             control_port: 5900,
+            desktop: None,
         }
     }
 }
