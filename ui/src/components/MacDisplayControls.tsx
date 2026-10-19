@@ -1,4 +1,5 @@
 import { useState } from "react";
+import type { AppleMediaState } from "../lib/appleMedia";
 
 export interface MacDisplayInfo {
   displayId: number;
@@ -34,19 +35,8 @@ export function MacDisplayControls(props: {
   busy: boolean;
   size: { w: number; h: number } | null;
   native: { w: number; h: number } | null;
-  /** What the Mac's media path is doing, as its answer says. */
-  media?: {
-    canvasWidth: number;
-    canvasHeight: number;
-    desktopWidth: number;
-    desktopHeight: number;
-    pictureWidth: number;
-    pictureHeight: number;
-    tiles: number;
-    pictures: number;
-    lost: number;
-    recoveries: number;
-  } | null;
+  /** Control-plane reports; separate from actual decoder output. */
+  media?: AppleMediaState | null;
   /** What the video path is doing: the decoder's queue and its delay. */
   stats?: {
     queued: number;
@@ -64,20 +54,19 @@ export function MacDisplayControls(props: {
   const [open, setOpen] = useState(false);
   const [selected, setSelected] = useState("");
   const modes = props.info ? Array.from(new Set(props.info.modes.filter(m => m.pixelWidth <= 4096 && m.pixelHeight <= 4096).map(m => `${m.width}x${m.height}`))) : [];
-  const streamSize = props.size ? `${props.size.w}×${props.size.h}` : "…";
   const native = props.native;
   return <div className="absolute bottom-3 right-3 z-20 text-xs">
     <button className="rounded-md border border-subtle bg-raised px-3 py-2" onClick={() => setOpen(!open)}>Mac</button>
     {open && <div className="absolute bottom-full right-0 mb-2 w-80 space-y-3 rounded-lg border border-subtle bg-raised p-4 shadow-lg">
       <p className="text-secondary">
         {props.stats && props.stats.pictureWidth > 0
-          ? `Streaming at ${props.stats.pictureWidth}×${props.stats.pictureHeight} pixels`
-          : `Streaming at ${streamSize} pixels`}
+          ? `Decoded picture: ${props.stats.pictureWidth}×${props.stats.pictureHeight} pixels`
+          : "No decoded picture yet"}
       </p>
       {props.stats && props.stats.submitted > 0 && (
         <p className="text-tertiary">
           Decoder: {props.stats.queued} queued, {props.stats.decoded} of {props.stats.submitted}{" "}
-          decoded, {props.stats.latencyMs} ms behind
+          decoded, {props.stats.latencyMs} ms submission-to-output
           {props.stats.pictureWidth > 0 && (
             <>
               {" "}· picture {props.stats.pictureWidth}×{props.stats.pictureHeight} in a{" "}
@@ -86,24 +75,25 @@ export function MacDisplayControls(props: {
           )}
         </p>
       )}
-      {props.media && (props.media.pictures > 0 || props.media.canvasWidth > 0) && (
-        <p className="text-tertiary">
-          {props.media.desktopWidth > 0
-            ? `Desktop ${props.media.desktopWidth}×${props.media.desktopHeight} points`
-            : "The Mac has not said how big its desktop is"}
-          {props.media.canvasWidth > 0 &&
-            `, picture ${props.media.canvasWidth}×${props.media.canvasHeight} pixels`}
-          {props.media.canvasWidth > 0 && props.media.desktopWidth > 0 &&
-            ` (${(props.media.canvasWidth / props.media.desktopWidth).toFixed(2)}×)`}
-          {props.media.tiles > 1 ? ` in ${props.media.tiles} tiles` : ""}.
-          {props.media.pictures > 0 && ` ${props.media.pictures} pictures`}
-          {props.media.lost > 0 && `, ${props.media.lost} packets lost`}
-          {props.media.recoveries > 0 && `, ${props.media.recoveries} recoveries`}
-        </p>
-      )}
+      {props.media && <div className="space-y-1 text-tertiary">
+        {props.media.requestedWidth > 0 && <p>
+          Requested: {props.media.requestedWidth}×{props.media.requestedHeight} pixels (not confirmation)
+        </p>}
+        {props.media.layoutWidth > 0 && <p>
+          Server layout: {props.media.layoutWidth}×{props.media.layoutHeight} pixels
+          {props.media.desktopWidth > 0 &&
+            ` / ${props.media.desktopWidth}×${props.media.desktopHeight} desktop points`}
+        </p>}
+        {props.media.canvasWidth > 0 && <p>
+          Media answer: {props.media.canvasWidth}×{props.media.canvasHeight} pixels
+          {props.media.tiles > 0 && ` / ${props.media.tiles} tile(s)`}
+        </p>}
+        <p>{props.media.pictures} assembled pictures, {props.media.lost} packets lost,
+          {" "}{props.media.recoveries} recovery attempts</p>
+      </div>}
       <div>
-        <strong>Stream size</strong>
-        <p className="mt-1 text-secondary">Ask the Mac to render and stream at a smaller resolution, over the live session. This is the Apple Remote Desktop approach; the layout the Mac confirms is what you get.</p>
+        <strong>Remote desktop size (experimental)</strong>
+        <p className="mt-1 text-secondary">These manual requests can change the desktop&apos;s logical size and rearrange windows. They are not physical-panel mode controls.</p>
         <div className="mt-2 flex flex-wrap gap-2">
           {native && <>
             <button className="rounded border border-subtle px-2 py-1" onClick={() => props.onStreamResize(native.w, native.h)}>Native ({native.w}×{native.h})</button>
@@ -111,7 +101,7 @@ export function MacDisplayControls(props: {
             <button className="rounded border border-subtle px-2 py-1" onClick={() => props.onStreamResize(third(native).w, third(native).h)}>Third ({third(native).w}×{third(native).h})</button>
           </>}
         </div>
-        <p className="mt-1 text-tertiary">The Mac keeps its desktop at the size you arranged it at; only the number of pixels that arrive changes. The Quality menu maps its presets onto these sizes for a Mac.</p>
+        <p className="mt-1 text-tertiary">Quality presets instead request the original desktop-point size with fewer pixels. Compare requested, server-reported and decoded sizes above; a request alone does not prove it took effect.</p>
       </div>
       <div>
         <strong>Physical panel mode (advanced)</strong>

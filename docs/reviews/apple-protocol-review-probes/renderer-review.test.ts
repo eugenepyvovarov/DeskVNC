@@ -80,7 +80,7 @@ it("compressed input accepted by WebCodecs must not count as a first presented f
   const renderer = Object.assign(Object.create(WebGLRenderer.prototype), {
     h264Failed: false, continuousH264: true, sawFrame: false,
     disposed: false, generation: 1, latestVideo: null, gl: {},
-    h264: new Map([[0, { avc: false, timestamp: 0, generation: 1, decoder: { state: "configured", decode: vi.fn() } }]]),
+    h264: new Map([[0, { avc: false, timestamp: 0, generation: 1, submitted: new Map(), decoder: { state: "configured", decode: vi.fn() } }]]),
     onFirstFrame: firstFrame, markDirty: vi.fn(),
   });
   await renderer.applyFrameOrdered([{ format: RectFormat.H264, h264Key: true, payload: new Uint8Array([0, 0, 0, 1, 0x65, 0xaa]) }], [null], 1);
@@ -93,7 +93,7 @@ it("a key picture that is not a reset must reuse the existing decoder", async ()
   // chunk, so it can start a decoder, but rebuilding the decoder would
   // throw away the reference pictures the next delta picture needs.
   const existing = {
-    avc: true, timestamp: 0, generation: 1, waiters: new Map(),
+    avc: true, timestamp: 0, generation: 1, waiters: new Map(), submitted: new Map(),
     decoder: { state: "configured", decode: vi.fn() },
   };
   vi.stubGlobal("VideoDecoder", class { state = "configured"; configure() {} close() {} });
@@ -104,7 +104,7 @@ it("a key picture that is not a reset must reuse the existing decoder", async ()
     h264: new Map([[0, existing]]),
     closeH264: vi.fn(function (this: any, id: number) { this.h264.delete(id); }),
     createH264: vi.fn(function (this: any) {
-      const ctx = { avc: true, timestamp: 0, generation: 1, waiters: new Map(), decoder: { state: "configured", decode: vi.fn() } };
+      const ctx = { avc: true, timestamp: 0, generation: 1, waiters: new Map(), submitted: new Map(), decoder: { state: "configured", decode: vi.fn() } };
       this.h264.set(0, ctx);
       return ctx;
     }),

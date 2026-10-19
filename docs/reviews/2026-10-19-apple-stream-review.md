@@ -70,10 +70,60 @@ Normal softness from reducing resolution and enlarging H.264 4:2:0 is expected. 
 | Intermittent disconnects | Rekey resets the record sequence counters; unparsed control messages; worker death is silent | P1-11, P1-10, P1-14 |
 | Mac resolution changes unexpectedly | The resize path is a virtual-display configuration with flat 1× modes, not a panel-preserving quality control | P0-6, P1-7, P1-18 |
 
-## Where the work stands
+## Latest corrective pass: quality switches still appear ineffective
 
-The findings below are the review as it was written. This is what has been
-done since, and what still needs a live Mac to settle.
+The earlier **Fixed/Done table below is historical and overstates completion**;
+it is not a live verification record. No Mac control or reconnect was performed
+in this pass; human takeover remains in force.
+
+Locally reproduced and corrected:
+
+- A cached decoded size overrode later framebuffer sizes, including non-Apple
+  sessions. A new decoder whose rectangle already matched its output skipped
+  resizing the old texture. Continuous output now sizes the texture directly;
+  layout announcements keep the old picture/decoder until replacement output.
+- Late output/errors from a retired decoder could affect its replacement in the
+  same slot. Callbacks now check context identity as well as generation.
+- Merely seeing two SSRCs permanently blocked further stream adoption. Candidates
+  also lost their configuration burst because they were ignored before assembly.
+  Per-SSRC assembly now keeps candidates; configured key pictures may replace the
+  active stream after re-offer or a stall, and retired streams cannot take it back.
+  Unknown SSRCs authenticate before allocation; the bounded cache no longer clears
+  active replay state. Its 32-stream limit remains a per-connection limitation.
+- Queued requests lost logical-point dimensions. Both coordinate spaces now travel
+  with each request, and quality requests explicitly use baseline desktop points.
+  A baseline layout is processed before starting a deferred quality request.
+- Removed the speculative pixel/point swap and automatic retry introduced in
+  `7631a81`. A size ratio is not evidence of reversed wire fields. Neither Dock
+  position nor screenshots prove physical-panel changes or their cause.
+- Control reports now distinguish requested pixels, layout pixels/desktop points,
+  media-answer canvas and actual frontend-decoded dimensions. Reports refresh once
+  per second, independent of picture-count modulo. Backend pictures are labelled
+  **assembled**, not decoded; decoder delay is submission-to-output only.
+
+Auto/High intentionally share one resolution target; Low/B&W share another, with
+B&W additionally using local grayscale. Balanced still requests 1.5 pixels/point;
+**no evidence here establishes whether macOS accepts that density**. Earlier
+claims that macOS can only supply 1×/2× were not established.
+
+Validation: **88 apple-core tests, 453 UI tests (28 files), TypeScript, 37 Rust
+review probes and 6 renderer review probes pass**. Regression tests first failed
+for texture sizing, retired callbacks, SSRC replacement/replay-state allocation
+and misleading panel labels. These use synthetic packets/mocked WebCodecs, not
+real hardware decoding. Two review-probe fixtures needed the previously added
+submission-timing map; their assertions were unchanged.
+
+Still unverified/incomplete: negotiated stream identity/geometry correlation,
+renderer acknowledgement and rollback, complete same-SSRC restart handling,
+physical desktop/panel preservation, genuine RTT correlation, loss/backpressure
+recovery and post-change hardware performance. Assembly progress is not proof of
+successful decoding/presentation at the requested size. Do not infer successful
+SRP server-side test impossibility from the earlier incorrect server equations.
+
+## Historical implementation status (not live verification)
+
+The findings below are the original implementation status. Read the corrective
+pass above before relying on any **Fixed/Done** label.
 
 | Finding | State |
 |---|---|

@@ -401,7 +401,7 @@ impl RttEstimator {
 /// The counters the video receiver keeps and the control loop reads.
 ///
 /// The receiver and the control loop are different tasks, and the numbers
-/// are about the media: how many pictures have been decoded, how many
+/// are about the media: how many access units have been assembled, how many
 /// packets went missing, and how many times the picture was asked for
 /// again.
 #[derive(Default)]
@@ -914,9 +914,8 @@ async fn connect(
     // Ask for a fresh frame every tick, for servers whose damage tracking
     // cannot be trusted.
     let mut always_refresh = false;
-    // The media generation. Every re-offer starts a new one, and a picture
-    // carries the generation it belongs to, so "the new picture has arrived"
-    // is a fact rather than a guess.
+    // Re-offer counter and assembly-progress signal. This is NOT an
+    // authenticated encoder epoch or a renderer presentation acknowledgement.
     let generation = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1));
     let picture_generation = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let video_generation = generation.clone();
@@ -929,6 +928,7 @@ async fn connect(
     let mut tick = tokio::time::interval(Duration::from_millis(250));
     // What the Mac's media path is doing, as its answer says.
     let mut media_state = remote_core::apple_media::MediaState::default();
+    let mut last_media_report = Instant::now() - Duration::from_secs(1);
     // The counters the video receiver keeps.
     let counters = std::sync::Arc::new(MediaCounters::default());
     let video_counters = counters.clone();
@@ -1236,6 +1236,8 @@ async fn connect(
                         let current = (session.width, session.height);
                         resize_requested = true;
                         let base = baseline.unwrap_or(current);
+                        media_state.requested_width = u32::from(target.0);
+                        media_state.requested_height = u32::from(target.1);
                         request_resize(&mut session, &mut round, target, current, base, Some(points)).await?;
                     }
                     Some(ClientCommand::MacDisplay(action)) => {
@@ -1281,6 +1283,8 @@ async fn connect(
                                 (Some(px), Some(points)) => desktop_points((width, height), px, points),
                                 _ => (width, height),
                             };
+                            media_state.requested_width = u32::from(width);
+                            media_state.requested_height = u32::from(height);
                             request_resize(
                                 &mut session,
                                 &mut round,
@@ -1380,8 +1384,8 @@ async fn connect(
                     session.height = bh;
                     media_state.desktop_width = u32::from(lw);
                     media_state.desktop_height = u32::from(lh);
-                    media_state.canvas_width = u32::from(bw);
-                    media_state.canvas_height = u32::from(bh);
+                    media_state.layout_width = u32::from(bw);
+                    media_state.layout_height = u32::from(bh);
                     // The layout also says how big the desktop is in points.
                     // On a retina display that is half the pixel size, and
                     // it is what a quality change must leave alone.
@@ -1415,7 +1419,8 @@ async fn connect(
                         // The round is NOT over yet. The encoder restarts
                         // after this answer, and a request sent into that
                         // restart races it. The round ends when a picture at
-                        // the new size has been decoded.
+                        // re-offer has assembly progress. This still lacks
+                        // a renderer acknowledgement of the effective size.
                         session.send_body(&offer).await?;
                         generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         round.confirmed = Some(DisplayGeometry { pixels: (bw, bh), points: (lw, lh) });
@@ -1432,6 +1437,8 @@ async fn connect(
                             let points = baseline_points.unwrap();
                             let target = crate::quality::resolution_for(preset, base, points);
                             resize_requested = true;
+                            media_state.requested_width = u32::from(target.0);
+                            media_state.requested_height = u32::from(target.1);
                             request_resize(&mut session, &mut round, target, (bw, bh), base, Some(points)).await?;
                         }
                     }
@@ -1439,7 +1446,7 @@ async fn connect(
             }
             _ = tick.tick() => {
                 // The media state is reported every few seconds: how many
-                // pictures have been decoded, how many packets went missing,
+                // access units have been assembled, how many packets went missing,
                 // and how many times the picture was asked for again.
                 // The statistics the status panel shows. The round trip is
                 // the one the Mac's own RTCP gives us.
@@ -1457,7 +1464,8 @@ async fn connect(
                 media_state.pictures = counters.pictures.load(std::sync::atomic::Ordering::Relaxed);
                 media_state.lost = counters.lost.load(std::sync::atomic::Ordering::Relaxed);
                 media_state.recoveries = counters.recoveries.load(std::sync::atomic::Ordering::Relaxed);
-                if media_state.pictures % 120 < 1 {
+                if last_media_report.elapsed() >= Duration::from_secs(1) {
+                    last_media_report = Instant::now();
                     emit(events, SessionEvent::Protocol(remote_core::ProtocolEvent::AppleMedia(media_state))).await.ok();
                 }
                 // A video receiver that died leaves a session that reports
@@ -1663,9 +1671,9 @@ fn viewer_info() -> Vec<u8> {
 
 /// `0x1d` SetDisplayConfiguration carrying the FULL dynamic descriptor
 /// (RFC §7.1/§7.3): `display_flags = 1`, `display_type = 4`, `rotations = 7`,
-/// a five-entry mode table scaled to the request, and a flat 1× HiDPI ratio
-/// so `width`/`height` are streamed as-is (~¼ the pixels of a Retina table).
+/// a five-entry mode table with separately requested pixel/point geometry.
 /// A mid-session request is answered with `0x451` + a re-offered encoder.
+/// Acceptance and preservation of the physical desktop require live verification.
 /// A display configuration for the Mac.
 ///
 /// `width` and `height` are the PIXEL size the picture should be encoded

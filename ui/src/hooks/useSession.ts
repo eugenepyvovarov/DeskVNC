@@ -30,6 +30,7 @@ import {
 import { encodeTerminalInput, encodeTerminalResize } from "../render/input";
 import type { PromptAnswer } from "../lib/credentials";
 import type { MacDisplayAction, MacDisplayInfo } from "../components/MacDisplayControls";
+import type { AppleMediaState } from "../lib/appleMedia";
 import { initTrace, traceMark } from "../render/trace";
 import type {
   CredentialRequest,
@@ -77,18 +78,7 @@ type SessionOrSshEventPayload = SessionEventPayload | (SshOnlyEvent & { sessionI
   | {
       type: "apple-media";
       sessionId: string;
-      state: {
-        canvasWidth: number;
-        canvasHeight: number;
-        desktopWidth: number;
-        desktopHeight: number;
-        pictureWidth: number;
-        pictureHeight: number;
-        tiles: number;
-        pictures: number;
-        lost: number;
-        recoveries: number;
-      };
+      state: AppleMediaState;
     };
 
 export interface CertPromptState {
@@ -141,18 +131,7 @@ export interface SessionApi {
   macDisplayNotice: string | null;
   macDisplayBusy: boolean;
   /** What the Mac's media path is doing, as its answer says. */
-  appleMedia: {
-    canvasWidth: number;
-    canvasHeight: number;
-    desktopWidth: number;
-    desktopHeight: number;
-    pictureWidth: number;
-    pictureHeight: number;
-    tiles: number;
-    pictures: number;
-    lost: number;
-    recoveries: number;
-  } | null;
+  appleMedia: AppleMediaState | null;
   requestMacDisplay: (action: MacDisplayAction) => void;
   boundaryControl: boolean | null;
   state: SessionState;

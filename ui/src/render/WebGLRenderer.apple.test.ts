@@ -101,6 +101,30 @@ it("adopts decoded dimensions even when they already match the new context recta
   }
 });
 
+it("uploads the whole decoded picture after both clamped and enlarged size transitions", () => {
+  let output: (frame: unknown) => void = () => {};
+  vi.stubGlobal("VideoDecoder", class {
+    state = "configured";
+    constructor(callbacks: { output: typeof output }) { output = callbacks.output; }
+    configure() {}
+    close() { this.state = "closed"; }
+  });
+  const renderer = sizedDecoderHarness();
+  renderer.createH264({ x: 0, y: 0, w: 2700, h: 1754 }, 0, new Uint8Array());
+  for (const [w, h] of [[1800, 1170], [2700, 1754], [3600, 2338]]) {
+    const frame = { displayWidth: w, displayHeight: h, close: vi.fn() };
+    output(frame);
+    const pending = renderer.latestVideo;
+    renderer.latestVideo = null;
+    expect(pending.ctx.w).toBe(w);
+    expect(pending.ctx.h).toBe(h);
+    expect(renderer.getRemoteSize()).toEqual({ width: w, height: h });
+    renderer.uploadVideoFrame(pending.frame, pending.ctx);
+    expect(renderer.gl.texSubImage2D).toHaveBeenLastCalledWith(1, 0, 0, 0, 3, 4, frame);
+    expect(frame.close).toHaveBeenCalledOnce();
+  }
+});
+
 it("keeps the last continuous picture until replacement output, not the layout, arrives", () => {
   let output: (frame: unknown) => void = () => {};
   vi.stubGlobal("VideoDecoder", class {

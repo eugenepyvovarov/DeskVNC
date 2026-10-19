@@ -2,21 +2,23 @@
 
 /// The state of the media path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", default)]
 pub struct MediaState {
-    /// The canvas the encoder renders, in pixels.
+    /// Canvas advertised in the media answer, not measured decoder output.
     pub canvas_width: u32,
     pub canvas_height: u32,
     /// The size of the Mac's desktop, in points.
     pub desktop_width: u32,
     pub desktop_height: u32,
-    /// The size of the picture that is actually arriving, in pixels.
-    pub picture_width: u32,
-    pub picture_height: u32,
+    /// Pixel geometry from the latest display layout.
+    pub layout_width: u32,
+    pub layout_height: u32,
+    /// Latest requested pixel geometry; not confirmation of application.
+    pub requested_width: u32,
+    pub requested_height: u32,
     /// How many tile streams the video is split into.
     pub tiles: u32,
-    /// The number of pictures that have been decoded since the session
-    /// started.
+    /// Access units assembled by the backend, not decoded/presented frames.
     pub pictures: u64,
     /// The number of packets that went missing.
     pub lost: u64,

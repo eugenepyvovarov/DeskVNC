@@ -949,29 +949,30 @@ export function SessionToolbar(props: SessionToolbarProps): ReactNode {
                 asks the Mac for a picture of a given size and the Mac
                 renders it. So the labels say what the preset does rather
                 than promising a cleverness that is not there. "Auto" is the
-                Mac's own resolution, and "Black & White" is the smallest
-                picture, not a grey one.
+                Mac's own resolution. B&W requests the same size as Low;
+                its grayscale conversion is local to the renderer.
               */}
               {props.protocol === "apple" ? (
                 <>
                   <MenuRow selected={props.quality === "auto"} onClick={() => props.onQuality("auto")}>
-                    Full resolution — the Mac&apos;s own
+                    Full resolution — same stream as Sharp
                   </MenuRow>
                   <MenuRow selected={props.quality === "high"} onClick={() => props.onQuality("high")}>
                     Sharp — the Mac&apos;s own resolution
                   </MenuRow>
                   <MenuRow selected={props.quality === "medium"} onClick={() => props.onQuality("medium")}>
-                    Balanced — fewer pixels, same desktop
+                    Balanced — request fewer pixels
                   </MenuRow>
                   <MenuRow selected={props.quality === "low"} onClick={() => props.onQuality("low")}>
-                    Responsive — fewest pixels, lowest lag
+                    Responsive — request the smallest stream
                   </MenuRow>
                   <MenuRow selected={props.quality === "bw"} onClick={() => props.onQuality("bw")}>
-                    Smallest — fewest pixels
+                    Smallest + grayscale — same stream as Responsive
                   </MenuRow>
                   <p className="px-2.5 pb-1 text-2xs text-tertiary">
-                    The Mac renders the picture at this size. Its desktop keeps the size
-                    you arranged it at; the physical panel is a separate control.
+                    These are requested sizes, not confirmed modes. The Mac panel
+                    shows requested versus decoded pixels. Presets request the original
+                    desktop-point size; the physical panel is a separate control.
                   </p>
                 </>
               ) : (
