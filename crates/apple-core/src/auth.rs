@@ -44,7 +44,12 @@ pub struct SrpSecret {
 }
 
 impl SrpSecret {
-    pub fn client(password: &str, salt: &[u8], iterations: u32, server_public: &[u8]) -> Result<Self, AuthError> {
+    pub fn client(
+        password: &str,
+        salt: &[u8],
+        iterations: u32,
+        server_public: &[u8],
+    ) -> Result<Self, AuthError> {
         let n = BigUint::parse_bytes(MODP_4096.as_bytes(), 16).ok_or(AuthError::Group)?;
         let g = BigUint::from(5u32);
         let b = BigUint::from_bytes_be(server_public);
@@ -55,7 +60,9 @@ impl SrpSecret {
         pbkdf2_hmac::<Sha512>(password.as_bytes(), salt, iterations, &mut stretched);
         let mut inner = b":".to_vec();
         inner.extend_from_slice(&stretched);
-        let x = BigUint::from_bytes_be(&Sha512::digest(&[&salt[..], &Sha512::digest(&inner)[..]].concat()));
+        let x = BigUint::from_bytes_be(&Sha512::digest(
+            [salt, &Sha512::digest(&inner)[..]].concat(),
+        ));
         stretched.zeroize();
         inner.zeroize();
 
@@ -66,15 +73,11 @@ impl SrpSecret {
         let a_pub = g.modpow(&a, &n);
         let a_bytes = pad(&a_pub);
 
-        let k = BigUint::from_bytes_be(&Sha512::digest(&[&pad(&n)[..], &pad(&g)[..]].concat()));
-        let u = BigUint::from_bytes_be(&Sha512::digest(&[&a_bytes[..], &pad(&b)[..]].concat()));
+        let k = BigUint::from_bytes_be(&Sha512::digest([&pad(&n)[..], &pad(&g)[..]].concat()));
+        let u = BigUint::from_bytes_be(&Sha512::digest([&a_bytes[..], &pad(&b)[..]].concat()));
         let gx = g.modpow(&x, &n);
         let kgx = (&k * &gx) % &n;
-        let base = if b >= kgx {
-            &b - kgx
-        } else {
-            &n - (kgx - &b)
-        };
+        let base = if b >= kgx { &b - kgx } else { &n - (kgx - &b) };
         let exponent = &a + &u * &x;
         let s = base.modpow(&exponent, &n);
         let session = Sha512::digest(pad(&s));
@@ -85,7 +88,7 @@ impl SrpSecret {
             mix[i] = hn[i] ^ hg[i];
         }
         let m1_full = Sha512::digest(
-            &[
+            [
                 &mix[..],
                 &Sha512::digest(b"")[..],
                 salt,
@@ -98,7 +101,7 @@ impl SrpSecret {
         let mut m1 = [0u8; 64];
         m1.copy_from_slice(&m1_full);
         // M2 = H(PAD(A) || M1 || K). Kept so the server proof can be checked.
-        let expected = Sha512::digest(&[&a_bytes[..], &m1[..], &session[..]].concat());
+        let expected = Sha512::digest([&a_bytes[..], &m1[..], &session[..]].concat());
         let digest = Sha256::digest(session);
         let mut wrap_key = [0u8; 16];
         wrap_key.copy_from_slice(&digest[..16]);
@@ -244,7 +247,10 @@ pub fn parse_challenge(body: &[u8]) -> Result<Challenge, AuthError> {
     p += g_len;
     let salt_len = *body.get(p).ok_or(AuthError::Truncated)? as usize;
     p += 1;
-    let salt = body.get(p..p + salt_len).ok_or(AuthError::Truncated)?.to_vec();
+    let salt = body
+        .get(p..p + salt_len)
+        .ok_or(AuthError::Truncated)?
+        .to_vec();
     p += salt_len;
     if p + 2 > body.len() {
         return Err(AuthError::Truncated);
@@ -260,9 +266,7 @@ pub fn parse_challenge(body: &[u8]) -> Result<Challenge, AuthError> {
     p += 8;
     let cap_len = u16::from_be_bytes([body[p], body[p + 1]]) as usize;
     p += 2;
-    let options = body
-        .get(p..p + cap_len)
-        .ok_or(AuthError::Truncated)?;
+    let options = body.get(p..p + cap_len).ok_or(AuthError::Truncated)?;
     let options = String::from_utf8(options.to_vec()).map_err(|_| AuthError::Truncated)?;
     if modulus.len() != MOD_LEN || iterations == 0 || iterations > 1_000_000 {
         return Err(AuthError::Range);
@@ -276,7 +280,6 @@ pub fn parse_challenge(body: &[u8]) -> Result<Challenge, AuthError> {
     })
 }
 
-
 /// The places the server's proof may be in the final-proof payload.
 ///
 /// The inner grammar is `%o M2 || %o server_random || %s empty || %u zero`,
@@ -288,7 +291,7 @@ pub fn parse_challenge(body: &[u8]) -> Result<Challenge, AuthError> {
 pub fn server_proofs(payload: &[u8]) -> Vec<&[u8]> {
     const HASH: usize = 64;
     let mut out = Vec::new();
-    if payload.len() >= HASH + 1 && payload[0] == HASH as u8 {
+    if payload.len() > HASH && payload[0] == HASH as u8 {
         out.push(&payload[1..HASH + 1]);
     }
     if payload.len() >= HASH {
@@ -356,7 +359,14 @@ mod tests {
         let server_public = pad(&g.modpow(&b, &n));
         let salt = b"salt-for-the-unit-test-only!!!!";
         let secret = SrpSecret::client("password", salt, 1000, &server_public).unwrap();
-        let m2 = Sha512::digest(&[&secret.a_public[..], &secret.m1[..], &secret.session_key()[..]].concat());
+        let m2 = Sha512::digest(
+            [
+                &secret.a_public[..],
+                &secret.m1[..],
+                &secret.session_key()[..],
+            ]
+            .concat(),
+        );
         assert!(secret.m2_matches(&m2), "the server's proof did not verify");
         // And a proof from a server that does not know the password does
         // not verify.

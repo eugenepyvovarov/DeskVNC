@@ -32,7 +32,8 @@ pub fn resolution_for(preset: QualityPreset, native: (u16, u16), points: (u16, u
         return native;
     }
     // How many pixels the Mac draws for every point of its screen.
-    let native_scale = (f64::from(native.0) / f64::from(points.0)).min(f64::from(native.1) / f64::from(points.1));
+    let native_scale =
+        (f64::from(native.0) / f64::from(points.0)).min(f64::from(native.1) / f64::from(points.1));
     let wanted = match preset {
         QualityPreset::Low | QualityPreset::BlackAndWhite => 1.0,
         QualityPreset::Medium => 1.5,
@@ -89,7 +90,11 @@ mod tests {
         // This is the case that made "balanced" useless: an absolute box
         // put a retina Mac below one pixel per point.
         let (native, points) = RETINA;
-        for preset in [QualityPreset::Low, QualityPreset::Medium, QualityPreset::High] {
+        for preset in [
+            QualityPreset::Low,
+            QualityPreset::Medium,
+            QualityPreset::High,
+        ] {
             let (w, h) = resolution_for(preset, native, points);
             assert!(
                 f64::from(w) >= f64::from(points.0),
@@ -105,7 +110,12 @@ mod tests {
         // One pixel for every point is all a plain screen has, so there is
         // nothing to take away and nothing to add.
         let (native, points) = PLAIN;
-        for preset in [QualityPreset::Low, QualityPreset::Medium, QualityPreset::High, QualityPreset::Auto] {
+        for preset in [
+            QualityPreset::Low,
+            QualityPreset::Medium,
+            QualityPreset::High,
+            QualityPreset::Auto,
+        ] {
             assert_eq!(resolution_for(preset, native, points), native, "{preset:?}");
         }
     }
@@ -126,6 +136,9 @@ mod tests {
     #[test]
     fn nothing_is_known_yet() {
         assert_eq!(resolution_for(QualityPreset::Low, (0, 0), (0, 0)), (0, 0));
-        assert_eq!(resolution_for(QualityPreset::Medium, (1920, 1080), (0, 0)), (1920, 1080));
+        assert_eq!(
+            resolution_for(QualityPreset::Medium, (1920, 1080), (0, 0)),
+            (1920, 1080)
+        );
     }
 }

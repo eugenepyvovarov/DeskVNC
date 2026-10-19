@@ -10,6 +10,12 @@ export interface AppleMediaState {
   canvasHeight: number;
   tiles: number;
   pictures: number;
+  /** Packets lost on the way. */
   lost: number;
+  /** Pictures dropped because the client could not keep up. */
+  dropped: number;
+  /** Fresh pictures asked for. */
   recoveries: number;
+  /** Feedback packets sent to the Mac. */
+  requests: number;
 }

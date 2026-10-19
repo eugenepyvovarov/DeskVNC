@@ -136,7 +136,9 @@ fn event_json(session_id: &str, event: &SessionEvent) -> Option<serde_json::Valu
         // would put a remote machine's bytes in our own UI for a person who
         // asked for none of it (PRDAgentPlug/00 R51b).
         SessionEvent::AgentRefused(_) | SessionEvent::AgentServed(_) => return None,
-        SessionEvent::Protocol(ProtocolEvent::AppleNotice(message)) => json!({ "type": "apple-notice", "message": message }),
+        SessionEvent::Protocol(ProtocolEvent::AppleNotice(message)) => {
+            json!({ "type": "apple-notice", "message": message })
+        }
         SessionEvent::Protocol(ProtocolEvent::AppleMedia(state)) => {
             json!({ "type": "apple-media", "state": state })
         }
@@ -1044,8 +1046,10 @@ fn prefill_typed_username(
     creds: &mut vnc_core::Credentials,
     typed: Option<String>,
 ) {
-    if !matches!(kind, ProtocolKind::Vnc | ProtocolKind::Rdp | ProtocolKind::Apple)
-        || creds.password.is_some()
+    if !matches!(
+        kind,
+        ProtocolKind::Vnc | ProtocolKind::Rdp | ProtocolKind::Apple
+    ) || creds.password.is_some()
     {
         return;
     }
@@ -1804,9 +1808,14 @@ pub async fn apple_display(
     session_id: String,
     action: remote_core::MacDisplayAction,
 ) -> Result<(), String> {
-    let apple = state.sessions.lock().get(&session_id)
+    let apple = state
+        .sessions
+        .lock()
+        .get(&session_id)
         .is_some_and(|entry| entry.handle.kind == ProtocolKind::Apple);
-    if !apple { return Err("Physical Mac display control requires an Apple session".into()); }
+    if !apple {
+        return Err("Physical Mac display control requires an Apple session".into());
+    }
     send_command(&state, &session_id, ClientCommand::MacDisplay(action)).await
 }
 

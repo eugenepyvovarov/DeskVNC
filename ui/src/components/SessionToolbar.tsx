@@ -955,19 +955,19 @@ export function SessionToolbar(props: SessionToolbarProps): ReactNode {
               {props.protocol === "apple" ? (
                 <>
                   <MenuRow selected={props.quality === "auto"} onClick={() => props.onQuality("auto")}>
-                    Full resolution — same stream as Sharp
+                    Full resolution: same stream as Sharp
                   </MenuRow>
                   <MenuRow selected={props.quality === "high"} onClick={() => props.onQuality("high")}>
-                    Sharp — the Mac&apos;s own resolution
+                    Sharp: the Mac&apos;s own resolution
                   </MenuRow>
                   <MenuRow selected={props.quality === "medium"} onClick={() => props.onQuality("medium")}>
-                    Balanced — request fewer pixels
+                    Balanced: request fewer pixels
                   </MenuRow>
                   <MenuRow selected={props.quality === "low"} onClick={() => props.onQuality("low")}>
-                    Responsive — request the smallest stream
+                    Responsive: request the smallest stream
                   </MenuRow>
                   <MenuRow selected={props.quality === "bw"} onClick={() => props.onQuality("bw")}>
-                    Smallest + grayscale — same stream as Responsive
+                    Smallest + grayscale: same stream as Responsive
                   </MenuRow>
                   <p className="px-2.5 pb-1 text-2xs text-tertiary">
                     These are requested sizes, not confirmed modes. The Mac panel
@@ -978,16 +978,16 @@ export function SessionToolbar(props: SessionToolbarProps): ReactNode {
               ) : (
                 <>
                   <MenuRow selected={props.quality === "auto"} onClick={() => props.onQuality("auto")}>
-                    Auto — sharp when idle, faster under load
+                    Auto: sharp when idle, faster under load
                   </MenuRow>
                   <MenuRow selected={props.quality === "high"} onClick={() => props.onQuality("high")}>
-                    Sharp — best picture, never adapts
+                    Sharp: best picture, never adapts
                   </MenuRow>
                   <MenuRow selected={props.quality === "medium"} onClick={() => props.onQuality("medium")}>
                     Balanced
                   </MenuRow>
                   <MenuRow selected={props.quality === "low"} onClick={() => props.onQuality("low")}>
-                    Responsive — softer picture, lowest lag
+                    Responsive: softer picture, lowest lag
                   </MenuRow>
                   <MenuRow selected={props.quality === "bw"} onClick={() => props.onQuality("bw")}>
                     Black &amp; White

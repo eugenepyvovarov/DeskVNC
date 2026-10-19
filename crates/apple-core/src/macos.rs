@@ -1,25 +1,40 @@
 //! Optional physical-display control uses authenticated SSH, not a virtual
 //! Screen Sharing display. Host keys use the application's existing pin store.
-use std::sync::Arc;
-use std::time::Duration;
 use russh::ChannelMsg;
 use ssh_transport::{HostKeyVerifier, SshAuth, SshConfig, SshHandle};
+use std::sync::Arc;
+use std::time::Duration;
 
 pub type Verifier = Arc<dyn HostKeyVerifier + Send + Sync>;
 
-pub async fn connect(host: &str, user: &str, password: &str, verifier: Verifier) -> Result<SshHandle, String> {
+pub async fn connect(
+    host: &str,
+    user: &str,
+    password: &str,
+    verifier: Verifier,
+) -> Result<SshHandle, String> {
     let mut config = SshConfig::new(host, user);
     config.auth = SshAuth::Password(password.to_owned());
-    tokio::time::timeout(Duration::from_secs(15), ssh_transport::connect_and_authenticate(&config, verifier))
-        .await.map_err(|_| "Mac display SSH connection timed out".to_owned())?
-        .map_err(|e| format!("Mac display SSH connection: {e}"))
+    tokio::time::timeout(
+        Duration::from_secs(15),
+        ssh_transport::connect_and_authenticate(&config, verifier),
+    )
+    .await
+    .map_err(|_| "Mac display SSH connection timed out".to_owned())?
+    .map_err(|e| format!("Mac display SSH connection: {e}"))
 }
 
 /// Bounded command output; never log account passwords or authentication data.
 pub async fn execute(ssh: &SshHandle, command: &str) -> Result<String, String> {
     tokio::time::timeout(Duration::from_secs(30), async {
-        let mut channel = ssh.channel_open_session().await.map_err(|e| e.to_string())?;
-        channel.exec(true, command.as_bytes()).await.map_err(|e| e.to_string())?;
+        let mut channel = ssh
+            .channel_open_session()
+            .await
+            .map_err(|e| e.to_string())?;
+        channel
+            .exec(true, command.as_bytes())
+            .await
+            .map_err(|e| e.to_string())?;
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         let mut status = None;
@@ -36,14 +51,25 @@ pub async fn execute(ssh: &SshHandle, command: &str) -> Result<String, String> {
             }
         }
         if status != Some(0) {
-            return Err(format!("Mac display command failed: {}", String::from_utf8_lossy(&stderr).chars().take(800).collect::<String>()));
+            return Err(format!(
+                "Mac display command failed: {}",
+                String::from_utf8_lossy(&stderr)
+                    .chars()
+                    .take(800)
+                    .collect::<String>()
+            ));
         }
         String::from_utf8(stdout).map_err(|_| "Mac display response was not UTF-8".into())
-    }).await.map_err(|_| "Mac display command timed out".to_owned())?
+    })
+    .await
+    .map_err(|_| "Mac display command timed out".to_owned())?
 }
 
 fn display_command(arguments: &str) -> String {
-    format!("/usr/bin/swift - {arguments} <<'DESKVNC_DISPLAY_SWIFT'\n{}\nDESKVNC_DISPLAY_SWIFT", include_str!("mac_display.swift"))
+    format!(
+        "/usr/bin/swift - {arguments} <<'DESKVNC_DISPLAY_SWIFT'\n{}\nDESKVNC_DISPLAY_SWIFT",
+        include_str!("mac_display.swift")
+    )
 }
 
 pub struct DisplayController {
@@ -53,8 +79,17 @@ pub struct DisplayController {
 }
 
 impl DisplayController {
-    pub async fn connect(host: &str, user: &str, password: &str, verifier: Verifier) -> Result<Self, String> {
-        Ok(Self { ssh: Arc::new(connect(host, user, password, verifier).await?), original: None, last_applied: None })
+    pub async fn connect(
+        host: &str,
+        user: &str,
+        password: &str,
+        verifier: Verifier,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            ssh: Arc::new(connect(host, user, password, verifier).await?),
+            original: None,
+            last_applied: None,
+        })
     }
 
     pub async fn restore_on_disconnect(&mut self) {
@@ -65,7 +100,10 @@ impl DisplayController {
         }
     }
 
-    pub async fn request(&mut self, action: remote_core::MacDisplayAction) -> Result<remote_core::MacDisplayInfo, String> {
+    pub async fn request(
+        &mut self,
+        action: remote_core::MacDisplayAction,
+    ) -> Result<remote_core::MacDisplayInfo, String> {
         use remote_core::MacDisplayAction;
         let arguments = match action {
             MacDisplayAction::List => "list".into(),
@@ -75,12 +113,10 @@ impl DisplayController {
                 }
                 format!("set {width} {height}")
             }
-            MacDisplayAction::Restore => {
-                match (self.original, self.last_applied) {
-                    (Some(original), Some(applied)) => format!("restore {original} {applied}"),
-                    _ => return Err("This connection has not changed the physical display".into()),
-                }
-            }
+            MacDisplayAction::Restore => match (self.original, self.last_applied) {
+                (Some(original), Some(applied)) => format!("restore {original} {applied}"),
+                _ => return Err("This connection has not changed the physical display".into()),
+            },
         };
         if let MacDisplayAction::Set { width, height } = action {
             // Save rollback state BEFORE mutating the Mac, including the mode
@@ -89,11 +125,24 @@ impl DisplayController {
             let before: remote_core::MacDisplayInfo = serde_json::from_str(&before)
                 .map_err(|_| "macOS returned an invalid mode list".to_owned())?;
             let ratio = f64::from(before.pixel_width) / f64::from(before.width.max(1));
-            let chosen = before.modes.iter().filter(|mode| mode.width == width && mode.height == height && mode.pixel_width <= 4096 && mode.pixel_height <= 4096)
+            let chosen = before
+                .modes
+                .iter()
+                .filter(|mode| {
+                    mode.width == width
+                        && mode.height == height
+                        && mode.pixel_width <= 4096
+                        && mode.pixel_height <= 4096
+                })
                 .min_by(|a, b| {
-                    let distance = |mode: &remote_core::MacDisplayMode| (f64::from(mode.pixel_width) / f64::from(mode.width.max(1)) - ratio).abs();
+                    let distance = |mode: &remote_core::MacDisplayMode| {
+                        (f64::from(mode.pixel_width) / f64::from(mode.width.max(1)) - ratio).abs()
+                    };
                     distance(a).total_cmp(&distance(b))
-                }).ok_or_else(|| "Requested resolution is not an available physical display mode".to_owned())?;
+                })
+                .ok_or_else(|| {
+                    "Requested resolution is not an available physical display mode".to_owned()
+                })?;
             self.original.get_or_insert(before.current_mode_id);
             self.last_applied = Some(chosen.id);
         }
@@ -108,7 +157,10 @@ impl DisplayController {
                 self.original.get_or_insert(info.original_mode_id);
                 self.last_applied = Some(info.current_mode_id);
             }
-            MacDisplayAction::Restore => { self.original = None; self.last_applied = None; }
+            MacDisplayAction::Restore => {
+                self.original = None;
+                self.last_applied = None;
+            }
             MacDisplayAction::List => {}
         }
         info.can_restore = self.original.is_some();
@@ -122,13 +174,19 @@ impl Drop for DisplayController {
             // Best effort on ordinary disconnect/error; the helper refuses to
             // undo a display change made outside this connection.
             let ssh = self.ssh.clone();
-            let Ok(runtime) = tokio::runtime::Handle::try_current() else { return };
+            let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+                return;
+            };
             runtime.spawn(async move {
-                if let Err(error) = execute(&ssh, &display_command(&format!("restore {original} {applied}"))).await {
+                if let Err(error) = execute(
+                    &ssh,
+                    &display_command(&format!("restore {original} {applied}")),
+                )
+                .await
+                {
                     tracing::warn!(%error, "Could not restore Mac display after disconnect");
                 }
             });
         }
     }
 }
-

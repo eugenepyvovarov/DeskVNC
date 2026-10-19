@@ -8,9 +8,9 @@
 //! Two properties are reported separately, because a decoder cares about
 //! them separately:
 //!
-//! * `keyframe` — the picture can start a decoder on its own. WebCodecs
+//! * `keyframe`: the picture can start a decoder on its own. WebCodecs
 //!   needs this to accept the chunk.
-//! * `reset` — the picture resets the decoder's reference pictures. Only an
+//! * `reset`: the picture resets the decoder's reference pictures. Only an
 //!   IDR does that. An intra picture that is not an IDR is a "starting
 //!   picture": independently decodable, but throwing the decoder's
 //!   references away would corrupt every picture that follows it, and the
@@ -104,7 +104,13 @@ impl Depacketizer {
     /// rather than published half-decoded: a decoder given a picture with a
     /// missing slice does not fail, it quietly paints corruption that lasts
     /// until the next independent picture.
-    pub fn push(&mut self, seq: u16, timestamp: u32, marker: bool, payload: &[u8]) -> Vec<AccessUnit> {
+    pub fn push(
+        &mut self,
+        seq: u16,
+        timestamp: u32,
+        marker: bool,
+        payload: &[u8],
+    ) -> Vec<AccessUnit> {
         self.ready.clear();
         self.stats.packets += 1;
         if payload.is_empty() {
@@ -167,11 +173,15 @@ impl Depacketizer {
     }
 
     fn buffer(&mut self, seq: u16, timestamp: u32, marker: bool, payload: &[u8]) {
-        if self.reorder.len() >= MAX_REORDER_PACKETS || self.reorder_bytes + payload.len() > MAX_REORDER_BYTES {
+        if self.reorder.len() >= MAX_REORDER_PACKETS
+            || self.reorder_bytes + payload.len() > MAX_REORDER_BYTES
+        {
             // The buffer is full: the missing packets are not coming. Give
             // up on the hole and carry on with what has arrived.
             self.flush_oldest();
-            if self.reorder.len() >= MAX_REORDER_PACKETS || self.reorder_bytes + payload.len() > MAX_REORDER_BYTES {
+            if self.reorder.len() >= MAX_REORDER_PACKETS
+                || self.reorder_bytes + payload.len() > MAX_REORDER_BYTES
+            {
                 return;
             }
         }
@@ -180,7 +190,15 @@ impl Depacketizer {
         if self.waiting_since.is_none() {
             self.waiting_since = Some(arrived);
         }
-        self.reorder.insert(seq, Packet { timestamp, marker, payload: payload.to_vec(), arrived });
+        self.reorder.insert(
+            seq,
+            Packet {
+                timestamp,
+                marker,
+                payload: payload.to_vec(),
+                arrived,
+            },
+        );
         self.stats.reordered += 1;
     }
 
@@ -192,7 +210,9 @@ impl Depacketizer {
     /// carries on from the packet that did arrive.
     pub fn flush(&mut self) -> Vec<AccessUnit> {
         self.ready.clear();
-        let Some(since) = self.waiting_since else { return Vec::new() };
+        let Some(since) = self.waiting_since else {
+            return Vec::new();
+        };
         if since.elapsed() < REORDER_WAIT {
             return Vec::new();
         }
@@ -203,7 +223,9 @@ impl Depacketizer {
     /// Process the buffered packets that have become consecutive.
     fn drain(&mut self) {
         while let Some(expected) = self.expected {
-            let Some(packet) = self.reorder.remove(&expected) else { break };
+            let Some(packet) = self.reorder.remove(&expected) else {
+                break;
+            };
             self.reorder_bytes = self.reorder_bytes.saturating_sub(packet.payload.len());
             self.assemble(packet.timestamp, packet.marker, &packet.payload);
             self.expected = Some(expected.wrapping_add(1));
@@ -217,11 +239,15 @@ impl Depacketizer {
 
     /// Abandon the hole and process the oldest buffered packet.
     fn flush_oldest(&mut self) {
-        let Some(&seq) = self.reorder.keys().next() else { return };
+        let Some(&seq) = self.reorder.keys().next() else {
+            return;
+        };
         let expected = self.expected.unwrap_or(seq);
         let skipped = seq.wrapping_sub(expected);
         self.report_gap(expected, u64::from(skipped));
-        let Some(packet) = self.reorder.remove(&seq) else { return };
+        let Some(packet) = self.reorder.remove(&seq) else {
+            return;
+        };
         self.reorder_bytes = self.reorder_bytes.saturating_sub(packet.payload.len());
         self.expected = Some(seq);
         self.assemble(packet.timestamp, packet.marker, &packet.payload);
@@ -321,14 +347,24 @@ impl Depacketizer {
             return;
         }
         self.stats.access_units += 1;
-        self.ready.push(AccessUnit { annex_b, keyframe, reset });
+        self.ready.push(AccessUnit {
+            annex_b,
+            keyframe,
+            reset,
+        });
     }
 
     // Apple's configuration packet contains an ISO BMFF avcC box, not a NAL.
     fn config(&mut self, payload: &[u8]) {
-        let Some(at) = payload.windows(4).position(|w| w == b"avcC") else { return };
-        let Some(data) = payload.get(at + 4..) else { return };
-        if data.len() < 6 || data[0] != 1 { return; }
+        let Some(at) = payload.windows(4).position(|w| w == b"avcC") else {
+            return;
+        };
+        let Some(data) = payload.get(at + 4..) else {
+            return;
+        };
+        if data.len() < 6 || data[0] != 1 {
+            return;
+        }
         let mut pos = 6;
         for kind in [7, 8] {
             let count = if kind == 7 {
@@ -339,14 +375,21 @@ impl Depacketizer {
                 n
             };
             for _ in 0..count {
-                let Some(len) = data.get(pos..pos + 2) else { return };
+                let Some(len) = data.get(pos..pos + 2) else {
+                    return;
+                };
                 let len = u16::from_be_bytes([len[0], len[1]]) as usize;
                 pos += 2;
-                let Some(nal) = data.get(pos..pos + len) else { return };
+                let Some(nal) = data.get(pos..pos + len) else {
+                    return;
+                };
                 pos += len;
                 if nal_type_of(nal) == kind {
-                    if kind == 7 { self.sps = nal.to_vec(); }
-                    else { self.pps = nal.to_vec(); }
+                    if kind == 7 {
+                        self.sps = nal.to_vec();
+                    } else {
+                        self.pps = nal.to_vec();
+                    }
                 }
             }
         }
@@ -478,9 +521,13 @@ fn slice_type_of(nal: &[u8]) -> Option<u32> {
         loop {
             let b = (*rbsp.get(bit / 8)? >> (7 - bit % 8)) & 1;
             bit += 1;
-            if b == 1 { break; }
+            if b == 1 {
+                break;
+            }
             leading += 1;
-            if leading > 31 { return None; }
+            if leading > 31 {
+                return None;
+            }
         }
         let mut value = 1u32;
         for _ in 0..leading {
@@ -545,7 +592,10 @@ mod tests {
         d.push(1, 7, false, &INTRA);
         let units = d.push(2, 7, true, &INTER);
         assert_eq!(units.len(), 1);
-        assert!(!units[0].keyframe, "a picture with an inter slice needs its references");
+        assert!(
+            !units[0].keyframe,
+            "a picture with an inter slice needs its references"
+        );
         assert!(!units[0].reset);
     }
 
@@ -556,7 +606,11 @@ mod tests {
         assert!(d.push(1, 100, false, &[0x7c, 0x85, 0xaa]).is_empty());
         // The next picture arrives complete and must be published.
         let units = d.push(2, 200, true, &[0x65, 0xbb, 0xcc]);
-        assert_eq!(units.len(), 1, "the unfinished fragment suppressed the next picture");
+        assert_eq!(
+            units.len(),
+            1,
+            "the unfinished fragment suppressed the next picture"
+        );
         assert!(units[0].reset);
     }
 
@@ -577,12 +631,21 @@ mod tests {
         // numbers show the hole.
         d.push(10, 100, false, &[0x7c, 0x85, 0xaa]);
         let units = d.push(12, 100, true, &[0x7c, 0x45, 0xcc]);
-        assert!(units.is_empty(), "a picture with a missing slice was published");
+        assert!(
+            units.is_empty(),
+            "a picture with a missing slice was published"
+        );
         // The hole is only given up on once the wait is over.
-        assert_eq!(d.stats.gaps, 0, "a single hole is not a loss until it has waited");
+        assert_eq!(
+            d.stats.gaps, 0,
+            "a single hole is not a loss until it has waited"
+        );
         std::thread::sleep(REORDER_WAIT + Duration::from_millis(10));
         let units = d.flush();
-        assert!(units.is_empty(), "the broken picture was published after the wait");
+        assert!(
+            units.is_empty(),
+            "the broken picture was published after the wait"
+        );
         assert_eq!(d.stats.gaps, 1);
         assert_eq!(d.stats.lost_packets, 1);
         assert_eq!(d.stats.discarded, 1);
@@ -617,7 +680,10 @@ mod tests {
         for i in 1..=(MAX_REORDER_PACKETS as u16 + 8) {
             d.push(1000 + i, 1000 + u32::from(i), false, &[0x61, 0xaa]);
         }
-        assert!(d.reorder.len() <= MAX_REORDER_PACKETS, "the reorder buffer grew past its bound");
+        assert!(
+            d.reorder.len() <= MAX_REORDER_PACKETS,
+            "the reorder buffer grew past its bound"
+        );
     }
 
     #[test]
@@ -630,4 +696,3 @@ mod tests {
         assert!(!units[0].keyframe, "an inter slice is not a key picture");
     }
 }
-

@@ -55,7 +55,11 @@ impl ReplayWindow {
             }
             Some(high) if index > high => {
                 let shift = index - high;
-                self.seen = if shift >= REPLAY_WINDOW { 1 } else { (self.seen << shift) | 1 };
+                self.seen = if shift >= REPLAY_WINDOW {
+                    1
+                } else {
+                    (self.seen << shift) | 1
+                };
                 self.highest = Some(index);
                 true
             }
@@ -150,7 +154,10 @@ impl SrtpContext {
             }
             // The packet is genuine. Now decide whether it is new.
             if !self.replay.accept(index) {
-                if self.highest.is_some_and(|high| index + REPLAY_WINDOW <= high) {
+                if self
+                    .highest
+                    .is_some_and(|high| index + REPLAY_WINDOW <= high)
+                {
                     self.stats.too_old += 1;
                 } else {
                     self.stats.replayed += 1;
@@ -208,7 +215,11 @@ impl SrtpContext {
         // costs one authentication.
         let ahead = seq.wrapping_sub(s_l);
         let estimate = if s_l < 0x8000 {
-            if ahead > 0x8000 { roc.wrapping_sub(1) } else { roc }
+            if ahead > 0x8000 {
+                roc.wrapping_sub(1)
+            } else {
+                roc
+            }
         } else if ahead > 0x8000 {
             roc.wrapping_add(1)
         } else {
@@ -513,7 +524,10 @@ mod tests {
         mac.update(&packet);
         mac.update(&0u32.to_be_bytes());
         packet.extend_from_slice(&mac.finalize().into_bytes()[..10]);
-        assert_eq!(receiver.unprotect(&packet).unwrap().payload, [0x65, 1, 2, 3]);
+        assert_eq!(
+            receiver.unprotect(&packet).unwrap().payload,
+            [0x65, 1, 2, 3]
+        );
         packet[12] ^= 1;
         assert!(receiver.unprotect(&packet).is_none());
     }
@@ -521,13 +535,20 @@ mod tests {
     #[test]
     fn an_encrypted_feedback_packet_carries_its_index_and_tag() {
         let mut encryptor = SrtcpEncryptor::from_blob(&[7; 46]).unwrap();
-        let packet = crate::rtcp::compound(0x1122_3344, &crate::rtcp::full_intra_request(0x1122_3344, 0x2222_3333, 1));
+        let packet = crate::rtcp::compound(
+            0x1122_3344,
+            &crate::rtcp::full_intra_request(0x1122_3344, 0x2222_3333, 1),
+        );
         let protected = encryptor.protect(&packet).unwrap();
         // The header and the sender's SSRC travel in the clear.
         assert_eq!(&protected[..8], &packet[..8]);
         // The ciphertext, the index and the tag follow.
         assert_eq!(protected.len(), packet.len() + 4 + 10);
-        let index = u32::from_be_bytes(protected[packet.len()..packet.len() + 4].try_into().unwrap());
+        let index = u32::from_be_bytes(
+            protected[packet.len()..packet.len() + 4]
+                .try_into()
+                .unwrap(),
+        );
         assert_eq!(index, 0x8000_0000);
         // The second packet gets the next index.
         let second = encryptor.protect(&packet).unwrap();
@@ -602,10 +623,14 @@ mod tests {
     #[test]
     fn an_unseen_late_packet_from_the_previous_cycle_is_accepted() {
         let mut receiver = SrtpContext::from_blob(&[42; 46]).unwrap();
-        assert!(receiver.unprotect(&packet(&receiver, 65534, 0, 7)).is_some());
+        assert!(receiver
+            .unprotect(&packet(&receiver, 65534, 0, 7))
+            .is_some());
         assert!(receiver.unprotect(&packet(&receiver, 0, 1, 7)).is_some());
         assert!(
-            receiver.unprotect(&packet(&receiver, 65535, 0, 7)).is_some(),
+            receiver
+                .unprotect(&packet(&receiver, 65535, 0, 7))
+                .is_some(),
             "a valid packet from the previous rollover cycle was rejected"
         );
     }
@@ -615,7 +640,9 @@ mod tests {
         let mut receiver = SrtpContext::from_blob(&[42; 46]).unwrap();
         let old = packet(&receiver, 20000, 0, 7);
         assert!(receiver.unprotect(&old).is_some());
-        assert!(receiver.unprotect(&packet(&receiver, 65534, 0, 7)).is_some());
+        assert!(receiver
+            .unprotect(&packet(&receiver, 65534, 0, 7))
+            .is_some());
         // The replay is refused and must not rewind the rollover counter.
         assert!(receiver.unprotect(&old).is_none());
         assert!(

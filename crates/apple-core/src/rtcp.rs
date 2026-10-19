@@ -76,7 +76,7 @@ pub fn legacy_intra_request(target: Ssrc) -> Vec<u8> {
 /// Consecutive losses are coalesced into a Bitmask of Lost Packets, which
 /// is what the format is for.
 pub fn generic_nack(sender: Ssrc, media: Ssrc, lost: &[u16]) -> Vec<u8> {
-    let mut seqs: Vec<u16> = lost.iter().copied().map(|s| s & 0xffff).collect();
+    let mut seqs: Vec<u16> = lost.to_vec();
     seqs.sort_unstable();
     seqs.dedup();
     if seqs.is_empty() {
@@ -96,8 +96,8 @@ pub fn generic_nack(sender: Ssrc, media: Ssrc, lost: &[u16]) -> Vec<u8> {
     let mut out = Vec::with_capacity(12 + blocks.len() * 4);
     out.push(0x80 | 1); // version 2, format 1
     out.push(205); // transport-layer feedback
-    // The length counts 32 bit words after the length field: the two
-    // SSRCs and the feedback blocks.
+                   // The length counts 32 bit words after the length field: the two
+                   // SSRCs and the feedback blocks.
     out.extend_from_slice(&((2 + blocks.len()) as u16).to_be_bytes());
     out.extend_from_slice(&sender.to_be_bytes());
     out.extend_from_slice(&media.to_be_bytes());

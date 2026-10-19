@@ -252,7 +252,7 @@ fn plist_int(v: u64) -> Vec<u8> {
 }
 
 fn field_varint(field: u32, value: u64) -> Vec<u8> {
-    let mut o = varint((u64::from(field) << 3) | 0);
+    let mut o = varint(u64::from(field) << 3);
     o.extend(varint(value));
     o
 }
@@ -317,9 +317,15 @@ mod tests {
         assert_eq!(feedback_key.len(), 46);
         assert_ne!(key, feedback_key, "the two directions must not share a key");
         assert!(msg.len() < 60_000, "offer is {} bytes", msg.len());
-        let path = std::env::temp_dir().join(format!("apple-offer-test-{}.bin", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("apple-offer-test-{}.bin", std::process::id()));
         use std::os::unix::fs::OpenOptionsExt;
-        let mut file = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&path).unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .unwrap();
         file.write_all(&msg).unwrap();
         let check = std::process::Command::new("python3")
             .arg("-c")

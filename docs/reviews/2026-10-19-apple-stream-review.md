@@ -27,12 +27,13 @@ Three mechanisms in this code produce exactly that, and they compound:
 
 1. **Motion is the trigger, because motion is when the reference chain is exercised.** Scrolling produces many inter-coded pictures, a higher bitrate, and therefore the most packet loss and reordering. A static screen hides the same defects.
 2. **Nothing repairs the chain.** There is no reorder buffer, no gap detection, no NACK, no independent-picture request, and no decoder feedback to the driver (P0-3, P0-5). A picture lost once stays wrong until the next IDR, and the encoder's IDR interval is not under our control. That is the "hard to get rid of them" part.
-3. **An intra picture during motion wipes the decoder's references.** See P0-7. The picture after an unnecessary decoder reset references pictures the new decoder never had, so corruption persists — and a reconnect, which starts a clean IDR, appears to "fix" it.
+3. **An intra picture during motion wipes the decoder's references.** See P0-7. The picture after an unnecessary decoder reset references pictures the new decoder never had, so corruption persists, and a reconnect, which starts a clean IDR, appears to "fix" it.
 
 The reference implementation documents the same class of failure in this exact area, and it is the strongest available corroboration:
 
-> "Apple's 4-tile stream uses CROSS-TILE references (a tile's P-frames reference POCs owned by other tiles) … The AVC path decodes the four interleaved H.264 sub-streams in one shared libav context, which resolves the cross-tile references to the wrong tile's pictures — **no decode error, so the corrupted frame is published and drift/ghosting ('fleas') accumulates under motion.** Requesting a single self-contained picture per frame removes the cross-tile dimension."
-> — `iShareScreen/src/isharescreen/proxy/protocol/offers.py` (`tiles_per_frame`)
+The reference implementation documents the same class of failure in this exact area, and it is the strongest available corroboration. In its own words, paraphrased: Apple's four-tile AVC stream uses cross-tile references, so decoding the interleaved sub-streams in one shared decoder resolves those references to the wrong tile's pictures. No decode error is raised, the corrupted frame is published anyway, and drift (it calls them "fleas") accumulates under motion. Asking for one self-contained picture per frame removes the cross-tile dimension.
+
+Source: `iShareScreen/src/isharescreen/proxy/protocol/offers.py`, function `tiles_per_frame`. That project is AGPL-3.0-or-later; the protocol facts are used here, and none of its code is copied into this repository.
 
 Two consequences for this driver:
 
@@ -187,7 +188,7 @@ and it is still open.
 
 Here **P0** means fix before further unattended resize experiments, **P1** means required for a dependable driver, and **P2** means measurement, completeness, or performance work. This is project triage, not a CVSS security classification.
 
-### P0-1 — Finish the resize transaction through actual decoded output
+### P0-1: Finish the resize transaction through actual decoded output
 
 **Confirmed in code.** `crates/apple-core/src/session.rs:255-260,378-390,436-470`; `ui/src/screens/Session.tsx:426-428`.
 
@@ -196,11 +197,11 @@ Here **P0** means fix before further unattended resize experiments, **P1** means
 - A specific latest-intent bug: from native, request Low and then High before Low's layout arrives. High equals the *old current dimensions*, so the outer `target != current` check discards it. Low can then apply even though High is the latest selection.
 - Physical-mode requests and stream resizes use separate, overlapping sequencing.
 
-**Fix:** one coordinator with requested, pending, and effective states and a media generation. Model at least `requested → layout accepted → media offered/answered → authenticated new configuration → independent picture → decoded/presented → committed`. Queue the latest desired target even when it equals the pre-transition geometry. Add bounded timeouts and explicit rollback/recovery to a last verified setting. Wire a renderer acknowledgement back to the coordinator; UDP access-unit emission alone is insufficient. Do not invent an on-wire request ID if the server has none—use a local generation and validated transition expectations.
+**Fix:** one coordinator with requested, pending, and effective states and a media generation. Model at least `requested, then layout accepted, then media offered and answered, then an authenticated new configuration, then an independent picture, then decoded and presented, then committed`. Queue the latest desired target even when it equals the pre-transition geometry. Add bounded timeouts and explicit rollback/recovery to a last verified setting. Wire a renderer acknowledgement back to the coordinator; UDP access-unit emission alone is insufficient. Do not invent an on-wire request ID if the server has none, use a local generation and validated transition expectations.
 
-**Acceptance:** rapid Low→Medium→High and native→Low→High-before-layout both end at the final request with decoded output; stale layouts cannot complete a newer transaction; lost replies time out visibly and recover.
+**Acceptance:** rapid Low, Medium, High and native, Low, High-before-layout both end at the final request with decoded output; stale layouts cannot complete a newer transaction; lost replies time out visibly and recover.
 
-### P0-2 — Authenticate before SSRC adoption; never mix streams in one assembler
+### P0-2: Authenticate before SSRC adoption; never mix streams in one assembler
 
 **Confirmed in code.** `session.rs:269-325`.
 
@@ -210,7 +211,7 @@ Here **P0** means fix before further unattended resize experiments, **P1** means
 
 **Acceptance:** interleaved old/new SSRCs do not reset each other; random invalid packets cannot change active state or exhaust stream slots; more than 32 legitimate successive resizes remain usable.
 
-### P0-3 — Make H.264 assembly loss-, order-, and corruption-aware
+### P0-3: Make H.264 assembly loss-, order-, and corruption-aware
 
 **Reproduced.** `crates/apple-core/src/h264.rs:24-80,112-157`; `session.rs:325`.
 
@@ -223,7 +224,7 @@ Here **P0** means fix before further unattended resize experiments, **P1** means
 
 **Acceptance:** all four H.264 transport probes pass; reorder, duplicate, wrap, lost start/middle/end/marker, malformed lengths, missing configuration, and bounded-memory cases are covered.
 
-### P0-4 — Preserve the last good picture and make decoder failure recoverable
+### P0-4: Preserve the last good picture and make decoder failure recoverable
 
 **Reproduced in part; remaining behavior confirmed in code.** `ui/src/render/WebGLRenderer.ts:601,711-744,1038-1062,1150-1224,1273`; `Session.tsx:426-428,578-595`.
 
@@ -233,7 +234,7 @@ Here **P0** means fix before further unattended resize experiments, **P1** means
 
 **Acceptance:** missing configuration, unsupported hardware configuration, decoder error, and repeated resizes cannot permanently blank a previously usable pane; recovery preserves hardware-path reporting.
 
-### P0-5 — Add a real media recovery loop
+### P0-5: Add a real media recovery loop
 
 **Confirmed in code; exact server-compatible feedback needs verification.** `session.rs:266-297,368-377`; `h264.rs`.
 
@@ -243,7 +244,7 @@ The UDP task emits one-byte hole-punch packets, drains/discards control datagram
 
 **Acceptance:** deterministic packet-loss injection recovers without a manual quality toggle; dropping the first configuration/key picture of a resize produces bounded recovery, not permanent black.
 
-### P0-6 — Stop presenting a virtual-display operation as safe stream-only quality
+### P0-6: Stop presenting a virtual-display operation as safe stream-only quality
 
 **Confirmed descriptor/design conflict; actual current panel/curtain state needs live verification.** `session.rs:571-620`; `docs/plans/2026-10-19-apple-server-controls-design.md`.
 
@@ -251,9 +252,9 @@ The UDP task emits one-byte hole-punch packets, drains/discards control datagram
 
 **Fix:** capability-gate this experimental path and accurately label it. Verify physical/virtual/console behavior with explicit permission. If a panel-preserving encoder-scale/bitrate/FPS control cannot be established, say unsupported; do not silently substitute a private/curtained virtual display. Keep physical-panel changes separately authorized with independent restore state.
 
-**Acceptance:** before/after mode, logical geometry, physical visibility, selected display, and restoration are independently verified—not inferred from `0x451`.
+**Acceptance:** before/after mode, logical geometry, physical visibility, selected display, and restoration are independently verified, not inferred from `0x451`.
 
-### P0-7 — An intra picture must not wipe the decoder's reference pictures
+### P0-7: An intra picture must not wipe the decoder's reference pictures
 
 **Reproduced.** `crates/apple-core/src/h264.rs:160-198`; `session.rs:337`; `ui/src/render/WebGLRenderer.ts:1057-1062`.
 
@@ -265,13 +266,13 @@ if (r.h264Reset || !ctx) { if (ctx) this.closeH264(id); ctx = this.createH264(r,
 
 A new decoder starts with an empty reference picture buffer. The next inter-coded picture references pictures that no longer exist, so the picture is wrong, and it stays wrong until an IDR arrives. WebCodecs reports no error, so nothing surfaces the fault. This is the "artifacts during scrolling, hard to clear, reconnect fixes it" fingerprint: motion is when the encoder emits intra-coded pictures, and the corruption outlives them.
 
-Marking the chunk as a key chunk is legitimate — an intra picture is independently decodable. **Resetting the decoder is not.** The reference protocol states that only an IDR is a DPB reset ("treat any IDR as a DPB reset for all tiles"), so an intra refresh picture must be fed to the existing decoder.
+Marking the chunk as a key chunk is legitimate: an intra picture is independently decodable. **Resetting the decoder is not.** The reference protocol states that only an IDR is a DPB reset ("treat any IDR as a DPB reset for all tiles"), so an intra refresh picture must be fed to the existing decoder.
 
 **Fix:** distinguish three things on the wire: IDR (DPB reset), intra/non-IDR starting picture (independently decodable, decoder keeps its references), and ordinary delta. Feed an intra picture to the existing decoder as a key chunk without recreating the context. Recreate the decoder only for a genuine configuration change, a new media generation, or controlled recovery. Do not classify a mixed I/P access unit as independently decodable (see P1-8).
 
 **Acceptance:** an intra refresh picture does not recreate the decoder; the following delta pictures decode against the preserved references; artifacts do not appear after scrolling stops.
 
-### P0-8 — Scrolling must not be able to break the picture, and loss must be repairable
+### P0-8: Scrolling must not be able to break the picture, and loss must be repairable
 
 **Confirmed in code; symptom reported live.** `session.rs:266-297,325-337`; `h264.rs`.
 
@@ -285,11 +286,11 @@ During scrolling the encoder emits many inter-coded pictures at a higher bitrate
 
 **Acceptance:** a scripted scroll with injected loss produces no lasting artifacts; recovery is automatic and bounded; a deliberately dropped key picture self-heals without a reconnect.
 
-### P0-9 — Never merge two video SSRCs into one decoder
+### P0-9: Never merge two video SSRCs into one decoder
 
 **Confirmed in code; corroborating evidence in the reference.** `session.rs:269-325`; reference `offers.py` (`tiles_per_frame`).
 
-The reference states that Apple's stream uses cross-tile references, and that decoding interleaved H.264 sub-streams in one shared decoder "resolves the cross-tile references to the wrong tile's pictures — no decode error, so the corrupted frame is published and drift/ghosting ('fleas') accumulates under motion". Our driver currently resets its single assembler whenever the SSRC changes, which is the other half of the same hazard: it can only ever display one tile, and it destroys the other tile's assembly state each time it switches.
+The reference states that Apple's stream uses cross-tile references, and that decoding interleaved H.264 sub-streams in one shared decoder "resolves the cross-tile references to the wrong tile's pictures: no decode error, so the corrupted frame is published and drift/ghosting ('fleas') accumulates under motion". Our driver currently resets its single assembler whenever the SSRC changes, which is the other half of the same hazard: it can only ever display one tile, and it destroys the other tile's assembly state each time it switches.
 
 Our offer already requests `tilesPerFrame = 1` (media blob field 6), the same single-self-contained-picture workaround the reference uses for AVC. That is the right choice and should be kept.
 
@@ -297,7 +298,7 @@ Our offer already requests `tilesPerFrame = 1` (media blob field 6), the same si
 
 **Acceptance:** the negotiated tile count is reported; a second SSRC never corrupts the active picture; the artifact symptom cannot reappear through tile mixing.
 
-### P1-7 — Preserve logical points, backing pixels, and HiDPI ratio separately
+### P1-7: Preserve logical points, backing pixels, and HiDPI ratio separately
 
 **Confirmed in code.** `session.rs:449-452,609-619,651-674`; `ui/src/components/MacDisplayControls.tsx:43-45`.
 
@@ -305,7 +306,7 @@ The mode table writes equal pixel and scaled dimensions (flat 1×), and the rece
 
 **Fix:** carry display ID/origin, logical bounds, backing bounds, scale, and mode identity through negotiation, UI, and input. Restore the original mode/ratio rather than merely its pixel dimensions. Verify pointer wire coordinates for this Apple input path at center and edges; do not apply an arbitrary 50-pixel compensation that breaks fullscreen.
 
-### P1-8 — Do not equate one I slice with a key picture or every key picture with decoder reset
+### P1-8: Do not equate one I slice with a key picture or every key picture with decoder reset
 
 **Reproduced classification defect; the reset consequence is now P0-7.** `h264.rs:64,160-198`; `session.rs:337`; `WebGLRenderer.ts:1057-1062`.
 
@@ -313,7 +314,7 @@ The mode table writes equal pixel and scaled dimensions (flat 1×), and the rece
 
 **Fix:** classify the complete access unit, not any single slice. Distinguish IDR, intra-only, and mixed pictures; validate independence of the whole picture. Separate the `keyframe` flag (chunk type) from the `reset` flag (DPB reset), and carry them as different fields. Preserve the documented Apple non-IDR starting-picture behavior using a captured, decodable vector rather than a two-byte slice heuristic alone.
 
-### P1-9 — Implement SRTP anti-replay and correct rollover/reordering state
+### P1-9: Implement SRTP anti-replay and correct rollover/reordering state
 
 **Reproduced.** `crates/apple-core/src/srtp.rs:41-87`.
 
@@ -321,7 +322,7 @@ Authenticated duplicates are accepted, `last_seq` can move backward, an unseen l
 
 **Fix:** follow RFC 3711 packet-index estimation and an authenticated per-SSRC replay window; advance the high-water mark monotonically only after authentication. Allow valid unseen packets within the previous-cycle reorder window. Validate RTP header/version/extensions/padding without passing padding into H.264. Keep state tied to the correct key epoch.
 
-### P1-10 — Parse the control protocol as framed messages and rectangle sequences
+### P1-10: Parse the control protocol as framed messages and rectangle sequences
 
 **Confirmed in code.** `session.rs:436-470,651-674,731-785`; `Live::read_body()`.
 
@@ -331,7 +332,7 @@ The record transport is buffered correctly, but upper-level handling assumes a r
 
 **Acceptance:** cursor/layout/rekey rectangles in different orders, split/coalesced TCP delivery, multi-record payloads, malformed sizes, and unknown metadata are covered.
 
-### P1-11 — Rekey must not silently reset record sequence counters
+### P1-11: Rekey must not silently reset record sequence counters
 
 **Confirmed implementation/reference mismatch; second-rekey host behavior needs capture verification.** `session.rs:440-442`; `crates/apple-core/src/record.rs:33-40`; reference §6.4.4.
 
@@ -339,27 +340,29 @@ A steady-state rekey constructs a new `RecordLayer`, resetting both counters to 
 
 **Fix:** explicit key/IV rotation preserving verified counter semantics, generation validation, and independent direction state. Add synthetic multi-rekey vectors and a controlled-host capture before claiming this fixed.
 
-### P1-12 — Media-offer flags: no change needed, and the note in the reference document is a trap
+### P1-12: Media-offer flags: no change needed, and the note in the reference document is a trap
 
 **Resolved by evidence: the byte order in the code is right.** `crates/apple-core/src/offer.rs`; reference §10.3; `iShareScreen/src/isharescreen/proxy/protocol/negotiation.py`.
 
 This finding originally said the flags word had to be little-endian, because the reference document describes it as host-endian and shows `07 00 00 00`. That is the trap. The reference implementation says so in as many words, and records the experiment:
 
-> "BIG-endian u32. DO NOT 'correct' this to little-endian on the strength of the host's framebuffer-config read alone — that is a trap. … Empirically: big-endian `00 00 00 07` makes the host honor do_not_send_cursor; little-endian `07 00 00 00` leaves it clear and the host bakes the cursor into the video → the double-cursor regression returns. The runtime behavior is authoritative."
+The reference notes, paraphrased: the field is big-endian, and switching it to little-endian on the strength of a host-side read of the framebuffer configuration is a trap. The observed behaviour is that the big-endian value `00 00 00 07` makes the host honour `do_not_send_cursor`, while the little-endian `07 00 00 00` leaves the flag clear and the host bakes the cursor into the video, which brings the double-cursor regression back. The runtime behaviour is what counts.
+
+Source: `iShareScreen/src/isharescreen/proxy/protocol/negotiation.py`. That project is AGPL-3.0-or-later; the protocol facts are used here, and none of its code is copied into this repository.
 
 The code already writes big-endian `00 00 00 07`, which is the same value the reference sends on the standard path (`config_flags = 3` plus the cursor bit). **Nothing is changed.** A comment now says so at the line itself, so the next reader does not "fix" it.
 
 What is still worth doing: parse enough of the `0x1c` answer to know that the offer was accepted, and report the effective media state (cadence, tile count) rather than assuming it.
 
-### P1-13 — Model offer/answer and key epochs across encoder restarts
+### P1-13: Model offer/answer and key epochs across encoder restarts
 
 **Confirmed missing state; some server details remain unknown.** `session.rs:227-240,413,459`; `offer.rs`.
 
-The same serialized offer/IDs/keys are reused without parsing the media answer or synchronizing the UDP worker. Existing SSRC crypto state survives independently of resize state, and every outgoing picture is assigned the most recently stored geometry rather than its own stream generation. An old picture can consequently acquire new dimensions. Reusing SRTP keys is not itself a proven protocol violation—the reference explicitly permits it—but reset sequence spaces must never reuse a key/SSRC/packet-index nonce.
+The same serialized offer/IDs/keys are reused without parsing the media answer or synchronizing the UDP worker. Existing SSRC crypto state survives independently of resize state, and every outgoing picture is assigned the most recently stored geometry rather than its own stream generation. An old picture can consequently acquire new dimensions. Reusing SRTP keys is not itself a proven protocol violation (the reference explicitly permits it), but reset sequence spaces must never reuse a key/SSRC/packet-index nonce.
 
 **Fix:** represent negotiated offers, answers, stream identities, and key/media epochs explicitly. Coordinate old/new overlap and retire it safely. If rotating keys, authenticate into the intended candidate epoch before promotion. Tag IPC frames with epoch/geometry and fence stale frames at the renderer. Handle unsolicited geometry transitions and rejected/degenerate answers explicitly.
 
-### P1-14 — Reconnect and media-task failure need a session supervisor
+### P1-14: Reconnect and media-task failure need a session supervisor
 
 **Confirmed in code.** `crates/apple-core/src/lib.rs:61-63`; `session.rs:21-65,272-352,358-435`.
 
@@ -367,7 +370,7 @@ The Apple driver launches one `run()` and has no reconnect supervisor. `Reconnec
 
 **Fix:** supervise control and media together, implement reconnect/disconnect commands and cancellation across phases, join/observe worker results, and distinguish authenticated, negotiating, displaying, stalled, reconnecting, and disconnected states. Reset renderer/media generation on genuine session restart. Preserve the separate original physical-mode restore obligation across reconnects.
 
-### P1-15 — Move SSH display operations out of the input loop; make restoration orderly
+### P1-15: Move SSH display operations out of the input loop; make restoration orderly
 
 **Confirmed in code; no successful Mac mode apply/restore was verified.** `session.rs:393-417`; `crates/apple-core/src/macos.rs:12-41,60-132`; `mac_display.swift`.
 
@@ -378,15 +381,15 @@ The Apple driver launches one `run()` and has no reconnect supervisor. `Reconnec
 
 **Fix:** cancellable worker operations feeding the common transition coordinator; List must not mutate video geometry. Select/apply an exact display+mode ID and verify it. Await conditional restoration on ordinary disconnect within a bounded shutdown path; retain recovery state on failure. Keep the existing refusal to undo outside changes, and make inability to guarantee restoration on crash/app exit explicit. Consider an independently authorized server-side watchdog only if stronger restoration guarantees are required.
 
-### P1-16 — Finish authentication verification and handshake bounds
+### P1-16: Finish authentication verification and handshake bounds
 
 **Confirmed in code.** `session.rs:169-170`; `crates/apple-core/src/auth.rs:108-110,226,253`; handshake read helpers.
 
 The server proof is read and discarded; `m2_matches()` is unused. Received group/generator values are parsed but not validated against the supported constant group. The 15-second timeout bounds TCP connect, not every authentication/prelude read or total handshake; cancellation is also incomplete during these awaits.
 
-**Fix:** implement/verify the precise server-proof framing and mutual SRP proof against controlled vectors; do not merely switch on an unverified prefix comparison. Validate group, generator, lengths, iteration limits, public values, and RSA envelope bounds. Use phase/overall deadlines and cancellation. Reduce credential/key lifetime and use zeroizing containers where practical. Preserve the existing credential store and SSH host-key trust—never work around failures by logging secrets or trusting unknown keys.
+**Fix:** implement/verify the precise server-proof framing and mutual SRP proof against controlled vectors; do not merely switch on an unverified prefix comparison. Validate group, generator, lengths, iteration limits, public values, and RSA envelope bounds. Use phase/overall deadlines and cancellation. Reduce credential/key lifetime and use zeroizing containers where practical. Preserve the existing credential store and SSH host-key trust, and never work around failures by logging secrets or trusting unknown keys.
 
-### P1-17 — Honor input-release and view-only contracts
+### P1-17: Honor input-release and view-only contracts
 
 **Confirmed ignored commands.** `session.rs:358-435`; shared `ClientCommand` integration.
 
@@ -394,7 +397,7 @@ The server proof is read and discarded; `m2_matches()` is unused. Received group
 
 **Fix:** track keys/buttons; implement release-all, startup/runtime view-only, disconnect cleanup, and takeover-safe neutralization. Audit every shared command: support it, explicitly refuse it nonfatally, or remove the corresponding UI capability. The wildcard also ignores native `Agent` intents instead of settling/refusing them; preserve the control plane's exactly-one-result contract. Prefer exhaustive matching so new variants cannot silently disappear. Add takeover/focus-loss tests without bypassing the human's lease.
 
-### P1-18 — Unify valid sizes and honest native restoration
+### P1-18: Unify valid sizes and honest native restoration
 
 **Confirmed in code.** `session.rs:255,418-433,571-620`; `quality.rs`; `MacDisplayControls.tsx:43-45`; `Session.tsx:383-384`.
 
@@ -402,7 +405,7 @@ The manual path rejects heights over 2160, so Native cannot request 3600×2338, 
 
 **Fix:** one capability-driven size/mode validator for all entry points, with pixel/texture budgets, verified codec alignment, and negotiated caps. Preserve aspect within rounding tolerance; do not upscale a genuine baseline. Retain original logical/backing/mode identity independently of current or already-altered geometry. Expose requested/effective sizes and host clamping. Do not silently force 16:9 or claim an arbitrary pixel request restored the physical mode.
 
-### P2-19 — Replace optimistic health flags with end-to-end measurements
+### P2-19: Replace optimistic health flags with end-to-end measurements
 
 **First-frame defect reproduced; remaining missing instrumentation confirmed in code.** `WebGLRenderer.ts:952-958,1170-1198,1533-1542`; `session.rs:329-331`; `useSession.ts`.
 
@@ -410,7 +413,7 @@ The manual path rejects heights over 2160, so Native cannot request 3600×2338, 
 
 **Fix:** separate counters/timestamps for received, authenticated, reordered/lost, assembled, decoder-submitted, decoded, uploaded, and presented frames; selected SSRC/epoch, decode queue, bitrate, cadence, effective geometry, recovery events, and actual decoder implementation. Base displaying/resize success on a new presented output. Provide bounded transition traces without keys, passwords, or plaintext desktop content.
 
-### P2-20 — Improve UDP buffering, endpoint correctness, and backpressure
+### P2-20: Improve UDP buffering, endpoint correctness, and backpressure
 
 **Confirmed omissions; impact needs measurement.** `session.rs:266-353,523-550`.
 
@@ -418,15 +421,15 @@ UDP ports are fixed IPv4 5900/5901 regardless of configured control port; sends 
 
 **Fix:** explicitly negotiate/document endpoint constraints, bind before offering where compatible, resolve/check peers, report send/receive failures, size/measure socket buffers, and decouple bounded packet ingestion from frontend delivery. Support shared demultiplexing or clearly expose a one-Apple-session limitation. Do not silently switch to ephemeral ports: prior live tests established the server did not send there on this setup.
 
-### P2-21 — Bound WebCodecs work without breaking H.264 references
+### P2-21: Bound WebCodecs work without breaking H.264 references
 
 **Confirmed omissions; throughput comparison needs measurement.** `WebGLRenderer.ts:1038-1120,1170-1190,1533-1542`; `src-tauri/src/main.rs`.
 
 Latest-frame presentation bounds decoded pictures awaiting paint, but does not bound `VideoDecoder.decodeQueueSize` or encoded IPC pressure. The generic pruning helpers correctly preserve H.264 dependencies; dropping arbitrary deltas to reduce lag would introduce corruption. Resetting decoders on each key picture adds avoidable hardware initialization cost. NV12 mapping and WebGL uploads remain copies, not native zero-copy presentation.
 
-**Fix:** measure decoder backlog and stage latency. If saturated, reduce supported server cadence/bitrate, or perform a controlled drop-to-independent-picture recovery—not blind reference-frame dropping. Reuse healthy decoders. Validate hardware support and effective implementation per reconfiguration. Keep the linear-NV12 workaround overridable and test packaging against supported plugin/driver combinations; host-plugin discovery can expose ABI/version issues. Native iShareScreen performance parity remains unproven.
+**Fix:** measure decoder backlog and stage latency. If saturated, reduce supported server cadence/bitrate, or perform a controlled drop-to-independent-picture recovery, not blind reference-frame dropping. Reuse healthy decoders. Validate hardware support and effective implementation per reconfiguration. Keep the linear-NV12 workaround overridable and test packaging against supported plugin/driver combinations; host-plugin discovery can expose ABI/version issues. Native iShareScreen performance parity remains unproven.
 
-### P2-22 — Make Apple quality/control UI match implemented capabilities
+### P2-22: Make Apple quality/control UI match implemented capabilities
 
 **Confirmed in code.** `quality.rs`; `ui/src/components/SessionToolbar.tsx:925-1005`; `useSession.ts:857-885`; `Session.tsx:1075-1077,1689-1690`.
 
@@ -434,7 +437,7 @@ Auto maps to startup native; no Apple adaptation loop exists. Black & White maps
 
 **Fix:** protocol-specific capabilities and labels; hide unsupported controls or explain refusal. Distinguish resolution, encoder policy, local scaling, and physical mode. Confirm effective settings before persisting a successful default; show pending/failure/clamping states and cancel obsolete commands. Gate initial quality application on a ready media generation rather than TCP-connected alone.
 
-### P2-23 — Add regression coverage and simplify the state model before more patches
+### P2-23: Add regression coverage and simplify the state model before more patches
 
 The current 19 Apple tests and renderer coverage do not model a complete resize/video lifecycle. Encoding a happy-path message length or receiving a layout is not a successful-stream test.
 
@@ -444,7 +447,7 @@ The current 19 Apple tests and renderer coverage do not model a complete resize/
 
 1. **Observability and guardrails:** add media generations/counters, truthful pending/failure state, and gate the unverified virtual-display control. Do not clear the last good image while experimenting. Log the negotiated tile count, intra-picture frequency, and decoder recreation events: the scrolling-artifact chain is invisible without them.
 2. **Packet correctness:** P0-2/3 and P1-8/9, with all seven Rust probes passing; add configuration/loss recovery feedback (P0-8).
-3. **Reference-chain correctness:** P0-7 first — an intra picture must not recreate the decoder — then P0-4/P0-9, with all four renderer probes passing. This is the shortest path to the reported scrolling artifacts disappearing.
+3. **Reference-chain correctness:** P0-7 first (an intra picture must not recreate the decoder), then P0-4 and P0-9, with all four renderer probes passing. This is the shortest path to the reported scrolling artifacts disappearing.
 4. **One restart coordinator:** complete P0-1/P1-13/14, including latest-intent, deadlines, worker failure, rollback, and physical-operation serialization.
 5. **Protocol/geometry correctness:** flags, parser, rekey, mutual authentication, logical/backing geometry, unified bounds, and verified baseline restoration.
 6. **Physical controller and input safety:** nonblocking exact-mode apply/restore and release-all/view-only handling.

@@ -83,7 +83,8 @@ impl RecordLayer {
         let iv = cipher::generic_array::GenericArray::from(self.send_iv);
         let mut enc = Aes128CbcEnc::new(&key, &iv);
         let n = plain.len() / 16;
-        let mut blocks = vec![cipher::generic_array::GenericArray::<u8, cipher::consts::U16>::default(); n];
+        let mut blocks =
+            vec![cipher::generic_array::GenericArray::<u8, cipher::consts::U16>::default(); n];
         for (i, block) in blocks.iter_mut().enumerate() {
             block.copy_from_slice(&plain[i * 16..(i + 1) * 16]);
         }
@@ -102,14 +103,15 @@ impl RecordLayer {
 
     /// Decrypt one record. `packet` is the ciphertext only, not the length.
     pub fn open(&mut self, packet: &[u8]) -> Result<Vec<u8>, RecordError> {
-        if packet.is_empty() || packet.len() % 16 != 0 || packet.len() < TRAILER + 2 {
+        if packet.is_empty() || !packet.len().is_multiple_of(16) || packet.len() < TRAILER + 2 {
             return Err(RecordError::Length);
         }
         let key = cipher::generic_array::GenericArray::from(self.key);
         let iv = cipher::generic_array::GenericArray::from(self.recv_iv);
         let mut dec = Aes128CbcDec::new(&key, &iv);
         let n = packet.len() / 16;
-        let mut blocks = vec![cipher::generic_array::GenericArray::<u8, cipher::consts::U16>::default(); n];
+        let mut blocks =
+            vec![cipher::generic_array::GenericArray::<u8, cipher::consts::U16>::default(); n];
         for (i, block) in blocks.iter_mut().enumerate() {
             block.copy_from_slice(&packet[i * 16..(i + 1) * 16]);
         }
@@ -138,10 +140,20 @@ impl RecordLayer {
 }
 
 /// AES-128-ECB single-block decrypt of the two halves of a rekey body.
-pub fn unwrap_rekey(wrap_key: &[u8; 16], encrypted_key: &[u8; 16], encrypted_iv: &[u8; 16]) -> ([u8; 16], [u8; 16]) {
+pub fn unwrap_rekey(
+    wrap_key: &[u8; 16],
+    encrypted_key: &[u8; 16],
+    encrypted_iv: &[u8; 16],
+) -> ([u8; 16], [u8; 16]) {
     let key = cipher::generic_array::GenericArray::from(*wrap_key);
-    let mut key_block = cipher::generic_array::GenericArray::<u8, cipher::consts::U16>::clone_from_slice(encrypted_key);
-    let mut iv_block = cipher::generic_array::GenericArray::<u8, cipher::consts::U16>::clone_from_slice(encrypted_iv);
+    let mut key_block =
+        cipher::generic_array::GenericArray::<u8, cipher::consts::U16>::clone_from_slice(
+            encrypted_key,
+        );
+    let mut iv_block =
+        cipher::generic_array::GenericArray::<u8, cipher::consts::U16>::clone_from_slice(
+            encrypted_iv,
+        );
     // Independent blocks: a fresh ECB decryptor for each half.
     Aes128EcbDec::new(&key).decrypt_block_mut(&mut key_block);
     Aes128EcbDec::new(&key).decrypt_block_mut(&mut iv_block);
@@ -198,15 +210,24 @@ mod tests {
         assert_eq!(b.recv_sequence(), 1);
         a.rekey([0x33; 16], [0x44; 16]);
         b.rekey([0x33; 16], [0x44; 16]);
-        assert_eq!(a.send_sequence(), 1, "the send counter was reset by the rekey");
-        assert_eq!(b.recv_sequence(), 1, "the receive counter was reset by the rekey");
+        assert_eq!(
+            a.send_sequence(),
+            1,
+            "the send counter was reset by the rekey"
+        );
+        assert_eq!(
+            b.recv_sequence(),
+            1,
+            "the receive counter was reset by the rekey"
+        );
         // And the session carries on across the rekey.
         let packet = a.seal(b"after the rekey");
         assert_eq!(b.open(&packet[2..]).unwrap(), b"after the rekey");
     }
 
     #[test]
-    fn rekey_halves_decrypt_independently() {        let wrap = [3u8; 16];
+    fn rekey_halves_decrypt_independently() {
+        let wrap = [3u8; 16];
         let mut enc = ecb::Encryptor::<Aes128>::new((&wrap).into());
         let mut key = cipher::generic_array::GenericArray::clone_from_slice(&[1u8; 16]);
         let mut iv = cipher::generic_array::GenericArray::clone_from_slice(&[2u8; 16]);

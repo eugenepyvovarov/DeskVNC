@@ -20,10 +20,14 @@ pub struct MediaState {
     pub tiles: u32,
     /// Access units assembled by the backend, not decoded/presented frames.
     pub pictures: u64,
-    /// The number of packets that went missing.
+    /// The number of packets that went missing on the way.
     pub lost: u64,
-    /// The number of times the picture was asked for again.
+    /// The number of pictures dropped because the client could not keep up.
+    pub dropped: u64,
+    /// The number of times a fresh picture was asked for.
     pub recoveries: u64,
+    /// The number of feedback packets sent to the Mac.
+    pub requests: u64,
 }
 
 impl MediaState {

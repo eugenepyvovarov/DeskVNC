@@ -88,8 +88,11 @@ export function MacDisplayControls(props: {
           Media answer: {props.media.canvasWidth}×{props.media.canvasHeight} pixels
           {props.media.tiles > 0 && ` / ${props.media.tiles} tile(s)`}
         </p>}
-        <p>{props.media.pictures} assembled pictures, {props.media.lost} packets lost,
-          {" "}{props.media.recoveries} recovery attempts</p>
+        <p>
+          {props.media.pictures} assembled pictures, {props.media.lost} packets lost,{" "}
+          {props.media.dropped} dropped locally, {props.media.recoveries} recovery
+          attempts, {props.media.requests} feedback packets sent
+        </p>
       </div>}
       <div>
         <strong>Remote desktop size (experimental)</strong>

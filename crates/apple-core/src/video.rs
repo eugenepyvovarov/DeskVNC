@@ -27,19 +27,30 @@ pub(crate) struct VideoStreams {
 impl VideoStreams {
     pub(crate) fn new(keys: SrtpContext, now: Instant) -> Self {
         Self {
-            keys, streams: HashMap::new(), active: None, last_picture: now,
-            active_generation: 0, authenticated: 0, capacity_reported: false,
+            keys,
+            streams: HashMap::new(),
+            active: None,
+            last_picture: now,
+            active_generation: 0,
+            authenticated: 0,
+            capacity_reported: false,
         }
     }
 
-    pub(crate) fn active(&self) -> Option<u32> { self.active }
-    pub(crate) fn authenticated(&self) -> u64 { self.authenticated }
+    pub(crate) fn active(&self) -> Option<u32> {
+        self.active
+    }
+    pub(crate) fn authenticated(&self) -> u64 {
+        self.authenticated
+    }
     pub(crate) fn active_stats(&self) -> Option<&Stats> {
         self.streams.get(&self.active?).map(|s| &s.depay.stats)
     }
 
     pub(crate) fn push(&mut self, packet: &[u8], generation: u64, now: Instant) -> Vec<AccessUnit> {
-        if packet.len() < 12 || packet[1] & 0x7f != 123 { return Vec::new(); }
+        if packet.len() < 12 || packet[1] & 0x7f != 123 {
+            return Vec::new();
+        }
         let ssrc = u32::from_be_bytes(packet[8..12].try_into().unwrap());
         let rtp = if let Some(stream) = self.streams.get_mut(&ssrc) {
             stream.srtp.unprotect(packet)
@@ -47,28 +58,49 @@ impl VideoStreams {
             // Do not allocate a slot, evict streams, or reset replay windows
             // based on an unauthenticated SSRC from the clear RTP header.
             let mut srtp = self.keys.clone();
-            let Some(rtp) = srtp.unprotect(packet) else { return Vec::new() };
+            let Some(rtp) = srtp.unprotect(packet) else {
+                return Vec::new();
+            };
             if self.streams.len() >= MAX_STREAMS {
                 if !self.capacity_reported {
-                    tracing::warn!("Apple video stream limit reached; keeping existing replay state");
+                    tracing::warn!(
+                        "Apple video stream limit reached; keeping existing replay state"
+                    );
                     self.capacity_reported = true;
                 }
                 return Vec::new();
             }
-            self.streams.insert(ssrc, Stream { srtp, depay: Depacketizer::default(), retired: false });
+            self.streams.insert(
+                ssrc,
+                Stream {
+                    srtp,
+                    depay: Depacketizer::default(),
+                    retired: false,
+                },
+            );
             Some(rtp)
         };
         let Some(rtp) = rtp else { return Vec::new() };
         self.authenticated += 1;
         let stream = self.streams.get_mut(&ssrc).unwrap();
-        if stream.retired { return Vec::new(); }
+        if stream.retired {
+            return Vec::new();
+        }
         // Assemble candidates too: skipping their early packets discards
         // precisely the SPS/PPS and first key picture needed for a switch.
-        let units = stream.depay.push(rtp.seq, rtp.timestamp, rtp.marker, &rtp.payload);
+        let units = stream
+            .depay
+            .push(rtp.seq, rtp.timestamp, rtp.marker, &rtp.payload);
         self.select(ssrc, units, generation, now)
     }
 
-    fn select(&mut self, ssrc: u32, mut units: Vec<AccessUnit>, generation: u64, now: Instant) -> Vec<AccessUnit> {
+    fn select(
+        &mut self,
+        ssrc: u32,
+        mut units: Vec<AccessUnit>,
+        generation: u64,
+        now: Instant,
+    ) -> Vec<AccessUnit> {
         if self.active != Some(ssrc) {
             let may_replace = self.active.is_none()
                 || generation != self.active_generation
@@ -76,19 +108,33 @@ impl VideoStreams {
             if !may_replace || !self.streams[&ssrc].depay.has_configuration() {
                 return Vec::new();
             }
-            let Some(first) = units.iter().position(|u| u.keyframe) else { return Vec::new() };
+            let Some(first) = units.iter().position(|u| u.keyframe) else {
+                return Vec::new();
+            };
             units.drain(..first);
             // A new SSRC is a new decoder, including Apple's non-IDR intra
             // starting picture. Subsequent intra pictures do not reset it.
             units[0].reset = true;
             let previous = self.active.replace(ssrc);
             if let Some(previous) = previous {
-                self.streams.get_mut(&previous).unwrap().retired = true;
+                if let Some(stream) = self.streams.get_mut(&previous) {
+                    stream.retired = true;
+                    // The old stream's half-assembled picture belongs to a
+                    // decoder that is gone.
+                    stream.depay.reset();
+                }
             }
             self.active_generation = generation;
-            tracing::info!(ssrc, ?previous, generation, "Apple configured video stream adopted");
+            tracing::info!(
+                ssrc,
+                ?previous,
+                generation,
+                "Apple configured video stream adopted"
+            );
         }
-        if !units.is_empty() { self.last_picture = now; }
+        if !units.is_empty() {
+            self.last_picture = now;
+        }
         units
     }
 
@@ -101,7 +147,9 @@ impl VideoStreams {
         let mut output = Vec::new();
         for ssrc in ids {
             let stream = self.streams.get_mut(&ssrc).unwrap();
-            if stream.retired { continue; }
+            if stream.retired {
+                continue;
+            }
             let units = stream.depay.flush();
             output.extend(self.select(ssrc, units, generation, now));
         }
@@ -145,7 +193,10 @@ mod tests {
         let units = rx.push(&packet(20, 1, &key_picture()), 2, now);
         assert_eq!(rx.active(), Some(20));
         assert_eq!(units.len(), 1);
-        assert!(units[0].reset, "a new SSRC must replace the old decoder context");
+        assert!(
+            units[0].reset,
+            "a new SSRC must replace the old decoder context"
+        );
         assert_eq!(rx.push(&packet(20, 2, &[0x61, 0xe0]), 2, now).len(), 1);
     }
 
@@ -155,7 +206,11 @@ mod tests {
         let now = Instant::now();
         rx.push(&packet(10, 0, &key_picture()), 1, now);
         assert!(rx.push(&packet(20, 0, &key_picture()), 1, now).is_empty());
-        let units = rx.push(&packet(20, 1, &key_picture()), 1, now + Duration::from_secs(1));
+        let units = rx.push(
+            &packet(20, 1, &key_picture()),
+            1,
+            now + Duration::from_secs(1),
+        );
         assert_eq!(rx.active(), Some(20));
         assert_eq!(units.len(), 1);
     }
@@ -177,7 +232,13 @@ mod tests {
         rx.push(&packet(10, 0, &key_picture()), 1, now);
         rx.push(&packet(20, 0, &key_picture()), 2, now);
         assert_eq!(rx.active(), Some(20));
-        assert!(rx.push(&packet(10, 1, &key_picture()), 2, now + Duration::from_secs(2)).is_empty());
+        assert!(rx
+            .push(
+                &packet(10, 1, &key_picture()),
+                2,
+                now + Duration::from_secs(2)
+            )
+            .is_empty());
         assert_eq!(rx.active(), Some(20));
     }
 
@@ -186,7 +247,9 @@ mod tests {
         let mut rx = receiver();
         let now = Instant::now();
         rx.push(&packet(10, 0, &key_picture()), 1, now);
-        assert!(rx.push(&packet(20, 0, &[0x67, 0x64, 0, 0x34]), 2, now).is_empty());
+        assert!(rx
+            .push(&packet(20, 0, &[0x67, 0x64, 0, 0x34]), 2, now)
+            .is_empty());
         assert!(rx.push(&packet(20, 1, &[0x68, 0xee]), 2, now).is_empty());
         let units = rx.push(&packet(20, 2, &[0x65, 0xb8]), 2, now);
         assert_eq!(rx.active(), Some(20));
@@ -201,11 +264,17 @@ mod tests {
         let now = Instant::now();
         for generation in 1..=4 {
             let ssrc = generation as u32 * 10;
-            assert_eq!(rx.push(&packet(ssrc, 0, &key_picture()), generation, now).len(), 1);
+            assert_eq!(
+                rx.push(&packet(ssrc, 0, &key_picture()), generation, now)
+                    .len(),
+                1
+            );
             assert_eq!(rx.active(), Some(ssrc));
             // A second concurrent SSRC without a new re-offer must not
             // alternate pictures with the adopted encoder.
-            assert!(rx.push(&packet(ssrc + 1, 0, &key_picture()), generation, now).is_empty());
+            assert!(rx
+                .push(&packet(ssrc + 1, 0, &key_picture()), generation, now)
+                .is_empty());
             assert_eq!(rx.active(), Some(ssrc));
         }
     }
@@ -216,8 +285,16 @@ mod tests {
         let now = Instant::now();
         rx.push(&packet(10, 0, &key_picture()), 1, now);
         // FU start with no end: traffic is not proof of picture progress.
-        rx.push(&packet(10, 1, &[0x7c, 0x81, 0xaa]), 1, now + Duration::from_secs(1));
-        let units = rx.push(&packet(20, 0, &key_picture()), 1, now + Duration::from_secs(1));
+        rx.push(
+            &packet(10, 1, &[0x7c, 0x81, 0xaa]),
+            1,
+            now + Duration::from_secs(1),
+        );
+        let units = rx.push(
+            &packet(20, 0, &key_picture()),
+            1,
+            now + Duration::from_secs(1),
+        );
         assert_eq!(units.len(), 1);
         assert_eq!(rx.active(), Some(20));
     }
@@ -249,7 +326,10 @@ mod tests {
             assert!(rx.push(&forged, 2, now).is_empty());
         }
         assert_eq!(rx.streams.len(), 1);
-        assert!(rx.push(&original, 1, now).is_empty(), "replay must remain rejected");
+        assert!(
+            rx.push(&original, 1, now).is_empty(),
+            "replay must remain rejected"
+        );
         assert_eq!(rx.push(&packet(10, 1, &[0x61, 0xe0]), 1, now).len(), 1);
     }
 }

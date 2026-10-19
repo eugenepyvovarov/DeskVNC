@@ -32,7 +32,7 @@ it("keeps requested, layout, media-answer and decoded sizes separate", () => {
       desktopWidth: 1800, desktopHeight: 1169,
       layoutWidth: 2700, layoutHeight: 1754,
       canvasWidth: 2700, canvasHeight: 1754,
-      tiles: 1, pictures: 100, lost: 0, recoveries: 0,
+      tiles: 1, pictures: 100, lost: 0, dropped: 0, recoveries: 0, requests: 0,
     },
     stats: {
       pictureWidth: 3600, pictureHeight: 2338,
@@ -46,6 +46,8 @@ it("keeps requested, layout, media-answer and decoded sizes separate", () => {
   expect(text).toContain("Media answer: 2700×1754 pixels");
   expect(text).toContain("Decoded picture: 3600×2338 pixels");
   expect(text).toContain("100 assembled pictures");
+  expect(text).toContain("0 dropped locally");
+  expect(text).toContain("0 feedback packets sent");
   expect(text).not.toContain("Streaming at 2700×1754");
 });
 

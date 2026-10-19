@@ -21,6 +21,18 @@ use crate::h264::Depacketizer;
 use crate::record::{self, RecordLayer};
 use crate::srtp::{SrtcpEncryptor, SrtpContext};
 
+/// Whether a fresh picture should be asked for because the client is the
+/// one that is behind.
+///
+/// A client that cannot keep up must not be answered with a flood of full
+/// pictures. The flood costs the Mac work it cannot spare, and the flood
+/// is what turns a slow client into a stalled one. One request a second,
+/// and only while the chain is still broken, is enough: the Mac's next
+/// independent picture repairs the chain.
+fn should_ask_for_backlog_picture(chain_broken: bool, since_last: Duration) -> bool {
+    chain_broken && since_last >= BACKLOG_REQUEST_INTERVAL
+}
+
 /// How long a resize round may take before the session gives up on it and
 /// says so.
 const RESIZE_TIMEOUT: Duration = Duration::from_secs(8);
@@ -74,6 +86,7 @@ async fn request_keyframe(
     ctrl: Option<&UdpSocket>,
     ctrl_dest: &str,
     last: &mut Instant,
+    requests: &std::sync::atomic::AtomicU64,
 ) {
     // Requests are rate limited. A burst of loss would otherwise turn into
     // a burst of requests, which the Mac answers with a burst of full
@@ -102,6 +115,7 @@ async fn request_keyframe(
         tracing::warn!("the keyframe request could not be sent");
     } else {
         tracing::info!(media, "asked the Mac for a fresh picture");
+        requests.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -215,6 +229,12 @@ const MAX_OFFER_ATTEMPTS: u32 = 3;
 
 /// How often a fresh picture may be asked for.
 const KEYFRAME_REQUEST_INTERVAL: Duration = Duration::from_millis(500);
+
+/// How often a fresh picture may be asked for when the client is the one
+/// that is behind. A client that cannot keep up must not be answered with
+/// a flood of full pictures: the flood is what turns a slow client into a
+/// stalled one.
+const BACKLOG_REQUEST_INTERVAL: Duration = Duration::from_secs(1);
 
 /// A resize round.
 ///
@@ -429,8 +449,16 @@ impl RttEstimator {
 #[derive(Default)]
 struct MediaCounters {
     pictures: std::sync::atomic::AtomicU64,
+    /// Packets that went missing on the way. A network problem.
     lost: std::sync::atomic::AtomicU64,
+    /// Pictures dropped because the client could not keep up. A local
+    /// problem, and asking the Mac for more pictures does not fix it.
+    dropped: std::sync::atomic::AtomicU64,
+    /// Recovery attempts: a fresh picture was asked for.
     recoveries: std::sync::atomic::AtomicU64,
+    /// Feedback packets sent to the Mac. A number that grows on its own is
+    /// a number that is costing the Mac work.
+    requests: std::sync::atomic::AtomicU64,
 }
 
 /// Send assembled pictures to the shell. Returns false when the shell has
@@ -1071,6 +1099,8 @@ async fn connect(
             // Pictures the shell did not take in time.
             let mut dropped = 0u64;
             let mut chain_broken = false;
+            // When the last request for an independent picture went out.
+            let mut last_backlog_request = Instant::now() - BACKLOG_REQUEST_INTERVAL;
             // Packets from somewhere other than the Mac.
             let mut stray = 0u64;
             // The round trip to the Mac, measured on the RTCP path.
@@ -1102,6 +1132,33 @@ async fn connect(
                                         }
                                     }
                                 }
+                            }
+                        }
+                        // A client that cannot keep up has broken the
+                        // reference chain. The buffer waits for an
+                        // independent picture, and one is asked for at most
+                        // once a second: often enough to recover quickly,
+                        // rarely enough not to flood the Mac with work
+                        // while it is already busy.
+                        if should_ask_for_backlog_picture(
+                            chain_broken,
+                            last_backlog_request.elapsed(),
+                        ) {
+                            last_backlog_request = Instant::now();
+                            if let Some(ssrc) = streams.active() {
+                                video_counters
+                                    .recoveries
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                request_keyframe(
+                                    &mut feedback,
+                                    feedback_ssrc,
+                                    ssrc,
+                                    ctrl.as_ref(),
+                                    &ctrl_dest,
+                                    &mut last_request,
+                                    &video_counters.requests,
+                                )
+                                .await;
                             }
                         }
                         // Flush candidates as well as the active stream,
@@ -1180,6 +1237,7 @@ async fn connect(
                         ctrl.as_ref(),
                         &ctrl_dest,
                         &mut last_request,
+                        &video_counters.requests,
                     )
                     .await;
                 }
@@ -1207,21 +1265,13 @@ async fn connect(
                             // picture that did not fit is complete, so
                             // asking the Mac for another one adds work
                             // without fixing anything: it is what turned a
-                            // slow client into a stalled one. One request
-                            // per overflow, rate limited, is enough to get
-                            // an independent picture to restart from.
+                            // slow client into a stalled one. The chain is
+                            // broken and the buffer waits for an
+                            // independent picture; the tick asks for one,
+                            // at most once a second.
                             video_counters
-                                .recoveries
+                                .dropped
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            request_keyframe(
-                                &mut feedback,
-                                feedback_ssrc,
-                                ssrc,
-                                ctrl.as_ref(),
-                                &ctrl_dest,
-                                &mut last_request,
-                            )
-                            .await;
                         }
                         // Wake the consumer. A signal that is already
                         // waiting is enough: it re-checks the buffer.
@@ -1264,6 +1314,7 @@ async fn connect(
                         ctrl.as_ref(),
                         &ctrl_dest,
                         &mut last_request,
+                        &video_counters.requests,
                     )
                     .await;
                 }
@@ -1617,6 +1668,8 @@ async fn connect(
                 emit(events, SessionEvent::Stats(stats)).await.ok();
                 media_state.pictures = counters.pictures.load(std::sync::atomic::Ordering::Relaxed);
                 media_state.lost = counters.lost.load(std::sync::atomic::Ordering::Relaxed);
+                media_state.dropped = counters.dropped.load(std::sync::atomic::Ordering::Relaxed);
+                media_state.requests = counters.requests.load(std::sync::atomic::Ordering::Relaxed);
                 media_state.recoveries = counters.recoveries.load(std::sync::atomic::Ordering::Relaxed);
                 if last_media_report.elapsed() >= Duration::from_secs(1) {
                     last_media_report = Instant::now();
@@ -2363,6 +2416,32 @@ mod tests {
         assert_eq!(credentials, ("other".to_string(), "new".to_string()));
     }
 
+    #[test]
+    fn a_client_that_is_behind_is_not_answered_with_a_flood() {
+        // The storm: a client that cannot keep up drops a picture, asks
+        // the Mac for a fresh one, gets a full picture it cannot keep up
+        // with either, and the loop runs twice a second for ever. The
+        // control channel collapses under it and the session stops.
+        //
+        // One request a second, and only while the chain is broken, is the
+        // answer: the Mac's next independent picture repairs the chain.
+        assert!(!should_ask_for_backlog_picture(
+            false,
+            Duration::from_secs(10)
+        ));
+        // The chain is broken, but a request went out a moment ago.
+        assert!(!should_ask_for_backlog_picture(
+            true,
+            Duration::from_millis(100)
+        ));
+        // The chain has been broken for longer than the interval.
+        assert!(should_ask_for_backlog_picture(true, Duration::from_secs(1)));
+        assert!(should_ask_for_backlog_picture(
+            true,
+            Duration::from_secs(30)
+        ));
+    }
+
     #[tokio::test]
     async fn a_lost_picture_is_asked_for_again() {
         // The recovery path: a request for a fresh picture goes out on the
@@ -2372,6 +2451,7 @@ mod tests {
         let dest = format!("{}", socket.local_addr().unwrap());
         let encryptor = SrtcpEncryptor::from_blob(&[3; 46]).unwrap();
         let mut last = Instant::now() - Duration::from_secs(10);
+        let requests = std::sync::atomic::AtomicU64::new(0);
         request_keyframe(
             &mut Some(encryptor),
             0x1111_2222,
@@ -2379,8 +2459,14 @@ mod tests {
             Some(&socket),
             &dest,
             &mut last,
+            &requests,
         )
         .await;
+        assert_eq!(
+            requests.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the request that went out is counted"
+        );
         let mut buf = [0u8; 2048];
         let (n, _) = socket.recv_from(&mut buf).await.unwrap();
         assert!(n > 24);
@@ -2401,12 +2487,32 @@ mod tests {
         let dest = format!("{}", socket.local_addr().unwrap());
         let encryptor = SrtcpEncryptor::from_blob(&[3; 46]).unwrap();
         let mut last = Instant::now() - Duration::from_secs(10);
-        request_keyframe(&mut Some(encryptor), 1, 2, Some(&socket), &dest, &mut last).await;
+        let requests = std::sync::atomic::AtomicU64::new(0);
+        request_keyframe(
+            &mut Some(encryptor),
+            1,
+            2,
+            Some(&socket),
+            &dest,
+            &mut last,
+            &requests,
+        )
+        .await;
         let mut buf = [0u8; 2048];
         socket.recv_from(&mut buf).await.unwrap();
         // The second request is held back.
         let encryptor = SrtcpEncryptor::from_blob(&[3; 46]).unwrap();
-        request_keyframe(&mut Some(encryptor), 1, 2, Some(&socket), &dest, &mut last).await;
+        let requests = std::sync::atomic::AtomicU64::new(0);
+        request_keyframe(
+            &mut Some(encryptor),
+            1,
+            2,
+            Some(&socket),
+            &dest,
+            &mut last,
+            &requests,
+        )
+        .await;
         assert!(
             tokio::time::timeout(Duration::from_millis(50), socket.recv_from(&mut buf))
                 .await

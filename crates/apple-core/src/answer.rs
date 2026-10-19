@@ -48,9 +48,7 @@ pub fn parse(body: &[u8]) -> Option<MediaAnswer> {
     let value = crate::plist::parse(slice)?;
     let blob = crate::plist::value_for(&value, "avcMediaStreamNegotiatorMediaBlob")?.as_data()?;
     let mut decompressed = Vec::new();
-    ZlibDecoder::new(blob)
-        .read_to_end(&mut decompressed)
-        .ok()?;
+    ZlibDecoder::new(blob).read_to_end(&mut decompressed).ok()?;
     parse_description(&decompressed)
 }
 
@@ -93,13 +91,17 @@ fn parse_description(blob: &[u8]) -> Option<MediaAnswer> {
 fn read_video_config(bytes: &[u8], answer: &mut MediaAnswer) {
     let mut pos = 0usize;
     while pos < bytes.len() {
-        let Some((tag, next)) = read_varint(bytes, pos) else { break };
+        let Some((tag, next)) = read_varint(bytes, pos) else {
+            break;
+        };
         pos = next;
         let field = tag >> 3;
         let wire = tag & 7;
         match wire {
             0 => {
-                let Some((value, next)) = read_varint(bytes, pos) else { break };
+                let Some((value, next)) = read_varint(bytes, pos) else {
+                    break;
+                };
                 pos = next;
                 match field {
                     4 => answer.canvas_width = value as u32,
@@ -110,7 +112,9 @@ fn read_video_config(bytes: &[u8], answer: &mut MediaAnswer) {
             }
             1 => pos += 8,
             2 => {
-                let Some((len, next)) = read_varint(bytes, pos) else { break };
+                let Some((len, next)) = read_varint(bytes, pos) else {
+                    break;
+                };
                 pos = next + len as usize;
             }
             5 => pos += 4,
@@ -176,7 +180,8 @@ mod tests {
 
     #[test]
     fn the_canvas_and_the_tiles_are_read() {
-        let answer = parse_description(&description(2216, 1440, 1)).expect("the description parsed");
+        let answer =
+            parse_description(&description(2216, 1440, 1)).expect("the description parsed");
         assert_eq!(answer.canvas_width, 2216);
         assert_eq!(answer.canvas_height, 1440);
         assert_eq!(answer.tiles, 1);
