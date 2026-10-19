@@ -519,16 +519,16 @@ async fn connect(
         .map_err(|e| SessionError::new(e.to_string()))?;
     tcp.set_nodelay(true).ok();
 
-    let banner = read_exact(&mut tcp, 12).await?;
+    let banner = read_handshake(&mut tcp, 12).await?;
     if &banner != b"RFB 003.889\n" {
         return Err(SessionError::new("the server did not offer Apple Screen Sharing"));
     }
     tcp.write_all(b"RFB 003.889\n").await?;
-    let count = read_exact(&mut tcp, 1).await?[0] as usize;
+    let count = read_handshake(&mut tcp, 1).await?[0] as usize;
     if count == 0 {
         return Err(SessionError::new("the server refused the connection"));
     }
-    let types = read_exact(&mut tcp, count).await?;
+    let types = read_handshake(&mut tcp, count).await?;
     if !types.contains(&33) {
         return Err(SessionError::new("the server has no RSA-SRP sign-in"));
     }
@@ -546,11 +546,15 @@ async fn connect(
     let mut hello = vec![0x21];
     hello.extend(auth::rsa1_packet(0, 0, &[], 0));
     tcp.write_all(&hello).await?;
-    let der = read_rsa_key(&mut tcp).await?;
+    let der = tokio::time::timeout(HANDSHAKE_TIMEOUT, read_rsa_key(&mut tcp))
+        .await
+        .map_err(|_| SessionError::new("the Mac stopped answering during the sign-in"))??;
     let identity = auth::seal_identity(&der, username)?;
     tcp.write_all(&auth::rsa1_packet(2, 0x0100, &identity, 384)).await?;
 
-    let challenge_buf = read_counted(&mut tcp).await?;
+    let challenge_buf = tokio::time::timeout(HANDSHAKE_TIMEOUT, read_counted(&mut tcp))
+        .await
+        .map_err(|_| SessionError::new("the Mac stopped answering during the sign-in"))??;
     let challenge = auth::parse_challenge(&challenge_buf[4..])?;
     let secret = SrpSecret::client(
         password,
@@ -569,7 +573,9 @@ async fn connect(
     .await?;
 
     // The server proof is length-prefixed. Pass/fail is the u32 after it.
-    let proof_buf = read_counted(&mut tcp).await?;
+    let proof_buf = tokio::time::timeout(HANDSHAKE_TIMEOUT, read_counted(&mut tcp))
+        .await
+        .map_err(|_| SessionError::new("the Mac stopped answering during the sign-in"))??;
     // The server proves it knows the password, and the proof is checked.
     //
     // Our M1 was accepted by the server, and M1 is built from the session
@@ -596,13 +602,15 @@ async fn connect(
             "The Mac's identity proof did not match. Check that you are connected to the machine you meant.".into(),
         ))).await.ok();
     }
-    let result = read_exact(&mut tcp, 4).await?;
+    let result = read_handshake(&mut tcp, 4).await?;
     if result != [0, 0, 0, 0] {
         return Err(SessionError::new("the server rejected the password"));
     }
 
     tcp.write_all(&[0xc1]).await?;
-    let (server_w, server_h) = read_server_init(&mut tcp).await?;
+    let (server_w, server_h) = tokio::time::timeout(HANDSHAKE_TIMEOUT, read_server_init(&mut tcp))
+        .await
+        .map_err(|_| SessionError::new("the Mac stopped answering during the sign-in"))??;
     emit(
         events,
         SessionEvent::DesktopResize {
@@ -1357,7 +1365,14 @@ fn display_config(width: u16, height: u16, logical_width: u16, logical_height: u
     region[..b"DeskVNC".len()].copy_from_slice(b"DeskVNC");
     m.extend_from_slice(&region); // display_info_region, NUL-terminated name
     m.extend_from_slice(&1u32.to_be_bytes()); // display_flags: DYNAMIC_RESOLUTION
-    m.extend_from_slice(&4u32.to_be_bytes()); // display_type: virtual
+    // display_type 4. The value is required for a dynamic descriptor, and
+    // the native viewer sends the same descriptor for the physical console
+    // display, so it is not a request for a private display. The server
+    // also uses the field to choose between its display paths, and that is
+    // what the name "virtual" in the protocol notes comes from: the
+    // meaning of the field is not the same thing as what the session
+    // shows.
+    m.extend_from_slice(&4u32.to_be_bytes());
     m.extend_from_slice(&369.45f32.to_be_bytes()); // physical mm (native)
     m.extend_from_slice(&207.82f32.to_be_bytes());
     // max bounds MUST cover the request (native here is 3600×2338, taller
@@ -1510,6 +1525,24 @@ fn framebuffer_request(width: u16, height: u16) -> Vec<u8> {
     m.extend_from_slice(&width.to_be_bytes());
     m.extend_from_slice(&height.to_be_bytes());
     m
+}
+
+/// How long one step of the handshake may take.
+///
+/// The handshake is a short conversation. A Mac that has gone away, or a
+/// network that has stopped carrying, would otherwise leave the session
+/// waiting for ever, with the pane showing nothing and no way to tell
+/// that it is stuck.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Read one step of the handshake, with a deadline.
+async fn read_handshake(
+    tcp: &mut TcpStream,
+    n: usize,
+) -> Result<Vec<u8>, SessionError> {
+    tokio::time::timeout(HANDSHAKE_TIMEOUT, read_exact(tcp, n))
+        .await
+        .map_err(|_| SessionError::new("the Mac stopped answering during the sign-in"))?
 }
 
 async fn read_exact(tcp: &mut TcpStream, n: usize) -> Result<Vec<u8>, SessionError> {
