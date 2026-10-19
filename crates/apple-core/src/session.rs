@@ -301,6 +301,7 @@ async fn request_resize(
     round: &mut ResizeRound,
     target: (u16, u16),
     current: (u16, u16),
+    baseline: (u16, u16),
 ) -> Result<(), SessionError> {
     match plan_resize(round, target, current) {
         ResizeAction::Nothing => Ok(()),
@@ -310,7 +311,7 @@ async fn request_resize(
         }
         ResizeAction::Send((w, h)) => {
             let (lw, lh) = (session.logical_width, session.logical_height);
-            session.send_body(&display_config(w, h, lw, lh)).await?;
+            session.send_body(&display_config(w, h, lw, lh, baseline.0, baseline.1)).await?;
             tracing::info!(w, h, "Apple display resize requested");
             Ok(())
         }
@@ -820,7 +821,19 @@ async fn connect(
     // it is: reading the mode list says nothing about the desktop, and only
     // a change resizes the picture.
     let mut display_action: Option<remote_core::MacDisplayAction> = None;
-    let native = (width, height);
+    // The Mac's own geometry, learned from the first layout it sends.
+    //
+    // The options carry a canvas the caller asked for, which is not the
+    // same thing: the Mac has a panel of a size of its own, and that is
+    // what "native" means, what the quality presets are measured against,
+    // and what a restore has to put back.
+    let mut baseline: Option<(u16, u16)> = None;
+    let mut baseline_logical: Option<(u16, u16)> = None;
+    // Whether a resize has been asked for. The first layout after that is
+    // the answer to the resize, not the Mac's own geometry.
+    let mut resize_requested = false;
+    // A preset chosen before the Mac's geometry is known.
+    let mut pending_preset: Option<remote_core::QualityPreset> = None;
     // One resize round at a time (§10.9): 0x1d → 0x451 → re-offer → a picture
     // at the new size. A round is not over when the server answers it: the
     // encoder restarts after the answer, and a second request sent into
@@ -1163,9 +1176,19 @@ async fn connect(
                         // Apple Remote Desktop's lever: the preset picks the
                         // resolution the Mac renders and streams. `0x451`
                         // below confirms what the server actually chose.
-                        let target = crate::quality::resolution_for(preset, native);
+                        let Some(base) = baseline else {
+                            // The Mac has not said how big its screen is yet,
+                            // and the presets are measured against that. The
+                            // choice is remembered and applied when it does.
+                            pending_preset = Some(preset);
+                            tracing::info!("a quality preset was chosen before the Mac's geometry was known");
+                            continue;
+                        };
+                        let target = crate::quality::resolution_for(preset, base);
                         let current = (session.width, session.height);
-                        request_resize(&mut session, &mut round, target, current).await?;
+                        resize_requested = true;
+                        let base = baseline.unwrap_or(current);
+                        request_resize(&mut session, &mut round, target, current, base).await?;
                     }
                     Some(ClientCommand::MacDisplay(action)) => {
                         use remote_core::MacDisplayAction;
@@ -1200,7 +1223,9 @@ async fn connect(
                         // 3600x2338, and a bound of 2160 refused it.
                         if (640..=8192).contains(&width) && (480..=8192).contains(&height) {
                             let current = (session.width, session.height);
-                            request_resize(&mut session, &mut round, (width, height), current).await?;
+                            resize_requested = true;
+                            let base = baseline.unwrap_or(current);
+                            request_resize(&mut session, &mut round, (width, height), current, base).await?;
                         } else {
                             emit(events, SessionEvent::Protocol(remote_core::ProtocolEvent::AppleNotice("That size is outside the range the Mac can stream.".into()))).await.ok();
                         }
@@ -1294,6 +1319,26 @@ async fn connect(
                         session.logical_width = lw;
                         session.logical_height = lh;
                     }
+                    // The first layout, before anything was asked of the
+                    // Mac, is the Mac's own geometry.
+                    if baseline.is_none() && !resize_requested {
+                        baseline = Some((bw, bh));
+                        baseline_logical = Some((session.logical_width, session.logical_height));
+                        tracing::info!(
+                            width = bw, height = bh,
+                            logical_width = session.logical_width, logical_height = session.logical_height,
+                            "the Mac's own geometry"
+                        );
+                        // A preset chosen before this is applied now.
+                        if let Some(preset) = pending_preset.take() {
+                            let base = baseline.unwrap_or((bw, bh));
+                            let target = crate::quality::resolution_for(preset, base);
+                            let current = (session.width, session.height);
+                            resize_requested = true;
+                            let base = baseline.unwrap_or(current);
+                        request_resize(&mut session, &mut round, target, current, base).await?;
+                        }
+                    }
                     media_dimensions.store((u32::from(bw) << 16) | u32::from(bh), std::sync::atomic::Ordering::Relaxed);
                     if changed {
                         emit(events, SessionEvent::DesktopResize { width: bw, height: bh }).await.ok();
@@ -1352,7 +1397,8 @@ async fn connect(
                             RoundEnd::Send((w, h)) => {
                                 tracing::info!(w, h, "Apple queued resize sent");
                                 let (lw, lh) = (session.logical_width, session.logical_height);
-                                session.send_body(&display_config(w, h, lw, lh)).await?;
+                                let (mw, mh) = baseline.unwrap_or((session.width, session.height));
+                                session.send_body(&display_config(w, h, lw, lh, mw, mh)).await?;
                             }
                             RoundEnd::Done(clamped) => {
                                 tracing::info!("Apple resize round complete");
@@ -1541,7 +1587,14 @@ fn viewer_info() -> Vec<u8> {
 /// arrive changes. A table that scaled the logical size with the pixel
 /// size would resize the desktop, and a window the person had arranged
 /// would move.
-fn display_config(width: u16, height: u16, logical_width: u16, logical_height: u16) -> Vec<u8> {
+fn display_config(
+    width: u16,
+    height: u16,
+    logical_width: u16,
+    logical_height: u16,
+    max_width: u16,
+    max_height: u16,
+) -> Vec<u8> {
     const MODE_COUNT: usize = 5;
     let di_size = 0x9c + 28 * MODE_COUNT;
     // message_size counts from AFTER the size field (RFC §7.1): the front
@@ -1569,10 +1622,12 @@ fn display_config(width: u16, height: u16, logical_width: u16, logical_height: u
     m.extend_from_slice(&4u32.to_be_bytes());
     m.extend_from_slice(&369.45f32.to_be_bytes()); // physical mm (native)
     m.extend_from_slice(&207.82f32.to_be_bytes());
-    // max bounds MUST cover the request (native here is 3600×2338, taller
-    // than the 2160 the native templates assume) or the server clamps.
-    m.extend_from_slice(&u32::from(width).max(3840).to_be_bytes()); // max_width
-    m.extend_from_slice(&u32::from(height).max(2160).to_be_bytes()); // max_height
+    // The maximum bounds are the Mac's own panel, so the server knows what
+    // the screen really is. They must cover the request as well, or the
+    // server clamps it: the native panel here is 3600x2338, taller than the
+    // 2160 the native templates assume.
+    m.extend_from_slice(&u32::from(width).max(u32::from(max_width)).to_be_bytes()); // max_width
+    m.extend_from_slice(&u32::from(height).max(u32::from(max_height)).to_be_bytes()); // max_height
     m.extend_from_slice(&0u16.to_be_bytes()); // current_mode_index
     m.extend_from_slice(&0u16.to_be_bytes()); // preferred_mode_index
     m.extend_from_slice(&7u32.to_be_bytes()); // rotations — native sends 7
@@ -2045,7 +2100,7 @@ mod tests {
 
     #[test]
     fn dynamic_display_config_matches_the_native_shape() {
-        let m = display_config(1920, 1080, 1800, 1169);
+        let m = display_config(1920, 1080, 1800, 1169, 3600, 2338);
         assert_eq!(m[0], 0x1d);
         let message_size = u16::from_be_bytes([m[2], m[3]]) as usize;
         assert_eq!(message_size, m.len() - 4);
@@ -2056,8 +2111,9 @@ mod tests {
         assert_eq!(di_size, 0x9c + 5 * 28);
         assert_eq!(u32::from_be_bytes(m[d + 0x7a..d + 0x7e].try_into().unwrap()), 1); // dynamic flag
         assert_eq!(u32::from_be_bytes(m[d + 0x7e..d + 0x82].try_into().unwrap()), 4); // display_type
-        assert_eq!(u32::from_be_bytes(m[d + 0x8a..d + 0x8e].try_into().unwrap()), 3840);
-        assert_eq!(u32::from_be_bytes(m[d + 0x8e..d + 0x92].try_into().unwrap()), 2160);
+        // The maximum bounds are the Mac's own panel.
+        assert_eq!(u32::from_be_bytes(m[d + 0x8a..d + 0x8e].try_into().unwrap()), 3600);
+        assert_eq!(u32::from_be_bytes(m[d + 0x8e..d + 0x92].try_into().unwrap()), 2338);
         assert_eq!(u16::from_be_bytes(m[d + 0x92..d + 0x94].try_into().unwrap()), 0); // mode index < count
         assert_eq!(u32::from_be_bytes(m[d + 0x96..d + 0x9a].try_into().unwrap()), 7);
         assert_eq!(u16::from_be_bytes(m[d + 0x9a..d + 0x9c].try_into().unwrap()), 5);
@@ -2128,7 +2184,7 @@ mod tests {
         // pixels it is encoded at. A quality change must change the pixels
         // and leave the points alone: a window the person arranged would
         // otherwise move.
-        let m = display_config(2216, 1440, 1800, 1169);
+        let m = display_config(2216, 1440, 1800, 1169, 3600, 2338);
         let d = 12;
         let mode = d + 0x9c;
         for entry in 0..5 {
