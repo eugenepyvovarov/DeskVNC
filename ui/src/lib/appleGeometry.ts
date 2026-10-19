@@ -48,20 +48,33 @@ export function readAppleGeometry(hostId: string | null | undefined): AppleGeome
     ) {
       return null;
     }
-    return {
+    const geometry = {
       pixelWidth: pixelWidth as number,
       pixelHeight: pixelHeight as number,
       pointWidth: pointWidth as number,
       pointHeight: pointHeight as number,
     };
+    return isPanelGeometry(geometry) ? geometry : null;
   } catch {
     return null;
   }
 }
 
+/** A desktop large enough to be the Mac's panel rather than the viewer window. */
+export function isPanelGeometry(geometry: AppleGeometry | null): geometry is AppleGeometry {
+  return !!geometry
+    && geometry.pixelWidth >= 1280 && geometry.pixelHeight >= 800
+    && geometry.pointWidth >= 1280 && geometry.pointHeight >= 800
+    && geometry.pointWidth <= geometry.pixelWidth
+    && geometry.pointHeight <= geometry.pixelHeight;
+}
+
 /** Remember the geometry a session confirmed. */
 export function writeAppleGeometry(hostId: string | null | undefined, geometry: AppleGeometry | null): void {
-  if (!hostId || !geometry) return;
+  if (!hostId || !isPanelGeometry(geometry)) return;
+  const existing = readAppleGeometry(hostId);
+  // A later layout can be a shrunk window-sized desktop. Keep the panel.
+  if (existing && existing.pointWidth * existing.pointHeight > geometry.pointWidth * geometry.pointHeight) return;
   try {
     localStorage.setItem(
       key(hostId),

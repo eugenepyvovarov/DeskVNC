@@ -32,27 +32,42 @@ use crate::srtp::{SrtcpEncryptor, SrtpContext};
 /// login screen rather than the console the person is already using.
 fn first_records(geometry: Option<remote_core::options::AppleGeometry>) -> Vec<Vec<u8>> {
     let mut out = Vec::new();
-    if let Some(geometry) = geometry {
+    if let Some(geometry) = panel_geometry(geometry) {
         // Pixel and point dimensions are different coordinate spaces. On a
         // Retina panel, sending pixels where points belong doubles the
         // desktop and makes the decoded picture look zoomed.
-        if geometry.pixel_width > 0
-            && geometry.pixel_height > 0
-            && geometry.point_width > 0
-            && geometry.point_height > 0
-        {
-            out.push(display_config(
-                geometry.pixel_width,
-                geometry.pixel_height,
-                geometry.point_width,
-                geometry.point_height,
-                geometry.pixel_width,
-                geometry.pixel_height,
-            ));
-        }
+        out.push(display_config(
+            geometry.pixel_width,
+            geometry.pixel_height,
+            geometry.point_width,
+            geometry.point_height,
+            geometry.pixel_width,
+            geometry.pixel_height,
+        ));
     }
     out.push(set_encodings());
     out
+}
+
+/// A remembered desktop large enough to be the Mac's panel.
+///
+/// A viewer window is not a panel. Remembering that window and sending it
+/// on the next connection shrinks the Mac desktop to the window, and every
+/// later connection, whatever its protocol, then shows the same enlarged UI.
+fn panel_geometry(
+    geometry: Option<remote_core::options::AppleGeometry>,
+) -> Option<remote_core::options::AppleGeometry> {
+    let geometry = geometry?;
+    if geometry.pixel_width < 1280
+        || geometry.pixel_height < 800
+        || geometry.point_width < 1280
+        || geometry.point_height < 800
+        || geometry.point_width > geometry.pixel_width
+        || geometry.point_height > geometry.pixel_height
+    {
+        return None;
+    }
+    Some(geometry)
 }
 
 /// Whether a fresh picture should be asked for because the client is the
@@ -239,6 +254,7 @@ impl Peer {
 /// size in pixels is half that size in points on the Mac's screen. The
 /// ratio comes from the Mac's own geometry, which is the only place it is
 /// written down.
+#[allow(dead_code)]
 fn desktop_points(
     pixels: (u16, u16),
     baseline_pixels: (u16, u16),
@@ -863,13 +879,8 @@ async fn connect(
         }
     };
 
-    let remembered_points = geometry.and_then(|geometry| {
-        if geometry.point_width > 0 && geometry.point_height > 0 {
-            Some((geometry.point_width, geometry.point_height))
-        } else {
-            None
-        }
-    });
+    let remembered_points =
+        panel_geometry(geometry).map(|geometry| (geometry.point_width, geometry.point_height));
     let mut session = Live {
         tcp,
         layer,
@@ -1011,13 +1022,7 @@ async fn connect(
     let mut baseline: Option<(u16, u16)> = None;
     // The same, in points: a retina panel is twice the points of its pixels,
     // and the difference is what turns a window's size into a desktop's size.
-    let mut baseline_points: Option<(u16, u16)> = geometry.and_then(|geometry| {
-        if geometry.point_width > 0 && geometry.point_height > 0 {
-            Some((geometry.point_width, geometry.point_height))
-        } else {
-            None
-        }
-    });
+    let mut baseline_points: Option<(u16, u16)> = remembered_points;
     // Whether a resize has been asked for. The first layout after that is
     // the answer to the resize, not the Mac's own geometry.
     let mut resize_requested = false;
@@ -1568,14 +1573,14 @@ async fn connect(
                             let current = (session.width, session.height);
                             resize_requested = true;
                             let base = baseline.unwrap_or(current);
-                            // The size asked for is the size of the remote
-                            // desktop, in the units the desktop uses. On a
-                            // retina panel that is points, and the picture
-                            // that arrives is twice as many pixels.
-                            let points = match (baseline, baseline_points) {
-                                (Some(px), Some(points)) => desktop_points((width, height), px, points),
-                                _ => (width, height),
-                            };
+                            // The requested size is the picture size. The
+                            // desktop's point size stays what the Mac is
+                            // already using: deriving a new point size from
+                            // the local window is what shrank a Retina
+                            // desktop to 800x600 points and made its windows
+                            // look twice as large.
+                            let points = baseline_points
+                                .unwrap_or((session.logical_width, session.logical_height));
                             media_state.requested_width = u32::from(width);
                             media_state.requested_height = u32::from(height);
                             request_resize(
@@ -2547,6 +2552,22 @@ mod tests {
                 1169
             );
         }
+    }
+
+    #[test]
+    fn a_window_sized_desktop_is_not_reapplied() {
+        // 1600x1200 pixels and 800x600 points is the local viewer window,
+        // not the Mac panel. Sending it again shrinks the desktop and makes
+        // every connection look zoomed to twice the size.
+        let geometry = remote_core::options::AppleGeometry {
+            pixel_width: 1600,
+            pixel_height: 1200,
+            point_width: 800,
+            point_height: 600,
+        };
+        let records = first_records(Some(geometry));
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0][0], 0x02);
     }
 
     #[test]

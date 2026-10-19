@@ -45,6 +45,31 @@ it("ignores nonsense that is not a geometry", () => {
   expect(readAppleGeometry("host-1")).toBeNull();
 });
 
+it("ignores a viewer window that was remembered before", () => {
+  localStorage.setItem(
+    "deskvnc.apple.geometry.host-1",
+    JSON.stringify({ pixelWidth: 1600, pixelHeight: 1200, pointWidth: 800, pointHeight: 600 }),
+  );
+  expect(readAppleGeometry("host-1")).toBeNull();
+});
+
+it("does not remember a viewer window as the Mac panel", () => {
+  writeAppleGeometry("host-1", {
+    pixelWidth: 1600, pixelHeight: 1200, pointWidth: 800, pointHeight: 600,
+  });
+  expect(readAppleGeometry("host-1")).toBeNull();
+});
+
+it("keeps the larger panel when a later layout is smaller", () => {
+  writeAppleGeometry("host-1", {
+    pixelWidth: 3600, pixelHeight: 2338, pointWidth: 1800, pointHeight: 1169,
+  });
+  writeAppleGeometry("host-1", {
+    pixelWidth: 1920, pixelHeight: 1080, pointWidth: 1920, pointHeight: 1080,
+  });
+  expect(readAppleGeometry("host-1")?.pointWidth).toBe(1800);
+});
+
 it("turns the geometry into the four numbers the connect command takes", () => {
   expect(
     appleGeometryArguments({
