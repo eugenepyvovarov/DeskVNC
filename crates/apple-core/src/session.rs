@@ -329,8 +329,11 @@ pub async fn run(
     cancel: tokio_util::sync::CancellationToken,
     host_keys: Option<crate::macos::Verifier>,
 ) {
-    let mut username = options.credentials.username.clone().unwrap_or_default();
-    let mut password = options.credentials.password.clone().unwrap_or_default();
+    let mut credentials = (
+        options.credentials.username.clone().unwrap_or_default(),
+        options.credentials.password.clone().unwrap_or_default(),
+    );
+    let (mut username, mut password) = (credentials.0.clone(), credentials.1.clone());
     if username.is_empty() || password.is_empty() {
         let _ = emit(
             &events,
@@ -361,11 +364,107 @@ pub async fn run(
         remote_core::ProtocolOptions::Apple(o) => (o.width, o.height),
         _ => (1920, 1080),
     };
-    let result = connect(&options.host, options.port, &username, &password, width, height, &events, &mut commands, &cancel, host_keys).await;
-    // Also stop the UDP task if the control loop exits through an error.
-    cancel.cancel();
-    if let Err(err) = result {
-        let _ = fail(&events, &err.to_string()).await;
+    // The session is supervised. A connection that ends is not the end of
+    // the session: the driver tries again, and the person watching sees a
+    // reconnect rather than a dead pane. The wait between attempts grows,
+    // and "Reconnect now" makes it immediate.
+    let mut attempt = 0u32;
+    // Set when the session is asked to reconnect. The connection ends and
+    // the supervisor starts a new one at once, with no wait.
+    let reconnect = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    loop {
+        if cancel.is_cancelled() {
+            break;
+        }
+        let result = connect(
+            &options.host,
+            options.port,
+            &username,
+            &password,
+            width,
+            height,
+            &events,
+            &mut commands,
+            &cancel,
+            host_keys.clone(),
+            &reconnect,
+        )
+        .await;
+        let reason = match result {
+            Ok(()) => {
+                if !reconnect.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                    // The session ended on request. Nothing to retry.
+                    return;
+                }
+                // The session was asked to reconnect. Start a new one at
+                // once, with no wait and no failure to report.
+                attempt = 0;
+                username = credentials.0.clone();
+                password = credentials.1.clone();
+                continue;
+            }
+            Err(err) => err.to_string(),
+        };
+        if cancel.is_cancelled() {
+            break;
+        }
+        let _ = fail(&events, &reason).await;
+        let wait = Duration::from_millis(500u64 << attempt.min(4));
+        attempt = attempt.saturating_add(1);
+        let _ = emit_state(
+            &events,
+            SessionState::Reconnecting {
+                attempt,
+                next_retry_ms: wait.as_millis() as u64,
+                reason: reason.clone(),
+            },
+        )
+        .await;
+        if wait_for_retry(&mut commands, &cancel, wait, &mut credentials).await {
+            // The session was asked to stop.
+            return;
+        }
+        // A new attempt starts from a clean slate: the session is a new
+        // one, and the old backoff does not apply to it.
+        attempt = 0;
+        username = credentials.0.clone();
+        password = credentials.1.clone();
+    }
+}
+
+/// Wait before the next attempt. Returns true when the session should end.
+async fn wait_for_retry(
+    commands: &mut mpsc::Receiver<ClientCommand>,
+    cancel: &tokio_util::sync::CancellationToken,
+    wait: Duration,
+    credentials: &mut (String, String),
+) -> bool {
+    let deadline = Instant::now() + wait;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        tokio::select! {
+            _ = cancel.cancelled() => return true,
+            cmd = commands.recv() => match cmd {
+                None | Some(ClientCommand::Disconnect) => return true,
+                Some(ClientCommand::ReconnectNow) => return false,
+                Some(ClientCommand::ProvideCredentials { username: user, password: pass, .. }) => {
+                    // A new password is for the next attempt.
+                    if let Some(user) = user {
+                        if !user.is_empty() {
+                            credentials.0 = user;
+                        }
+                    }
+                    if !pass.is_empty() {
+                        credentials.1 = pass;
+                    }
+                }
+                _ => {}
+            },
+            _ = tokio::time::sleep(remaining) => return false,
+        }
     }
 }
 
@@ -410,6 +509,7 @@ async fn connect(
     commands: &mut mpsc::Receiver<ClientCommand>,
     cancel: &tokio_util::sync::CancellationToken,
     host_keys: Option<crate::macos::Verifier>,
+    reconnect: &std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<(), SessionError> {
     emit_state(events, SessionState::Connecting).await.ok();
     let mut tcp = tokio::time::timeout(Duration::from_secs(15), TcpStream::connect((host, port)))
@@ -580,7 +680,10 @@ async fn connect(
     let width = session.width;
     let height = session.height;
     let events2 = events.clone();
-    let cancel2 = cancel.clone();
+    // The video receiver has its own lifetime: it ends with the control
+    // loop, not with the session. The session's token belongs to the
+    // session, and a session that is being retried is not over.
+    let cancel2 = cancel.child_token();
     let video_dest = format!("{host}:5901");
     let ctrl_dest = format!("{host}:5900");
     let media_dimensions = std::sync::Arc::new(std::sync::atomic::AtomicU32::new((u32::from(width) << 16) | u32::from(height)));
@@ -866,6 +969,13 @@ async fn connect(
                             held.keys.remove(&keysym);
                         }
                     }
+                    Some(ClientCommand::ReconnectNow) => {
+                        // End the session so a new one can start. The
+                        // supervisor notices the flag and starts it at
+                        // once.
+                        reconnect.store(true, std::sync::atomic::Ordering::SeqCst);
+                        break;
+                    }
                     Some(ClientCommand::ReleaseAllKeys) => {
                         // Let go of everything that is held. This is what a
                         // focus loss, a takeover or a disconnect needs, and
@@ -1036,6 +1146,13 @@ async fn connect(
                 }
             }
             _ = tick.tick() => {
+                // A video receiver that died leaves a session that reports
+                // itself connected and shows nothing. The supervisor
+                // restarts it.
+                if video_task.is_finished() {
+                    tracing::warn!("the video receiver stopped; the session will be restarted");
+                    break;
+                }
                 if always_refresh {
                     // The escape hatch for a server that does not report
                     // what changed. It costs the whole desktop in bandwidth
@@ -1433,6 +1550,43 @@ impl From<std::io::Error> for SessionError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn the_retry_wait_ends_when_the_session_is_told_to_stop() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut credentials = ("user".to_string(), "pass".to_string());
+        tx.send(ClientCommand::Disconnect).await.unwrap();
+        assert!(wait_for_retry(&mut rx, &cancel, Duration::from_secs(5), &mut credentials).await);
+    }
+
+    #[tokio::test]
+    async fn the_retry_wait_ends_at_once_when_a_reconnect_is_asked_for() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut credentials = ("user".to_string(), "pass".to_string());
+        tx.send(ClientCommand::ReconnectNow).await.unwrap();
+        let start = Instant::now();
+        assert!(!wait_for_retry(&mut rx, &cancel, Duration::from_secs(30), &mut credentials).await);
+        assert!(start.elapsed() < Duration::from_secs(1), "the retry waited anyway");
+    }
+
+    #[tokio::test]
+    async fn the_retry_wait_takes_a_new_password_for_the_next_attempt() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut credentials = ("user".to_string(), "old".to_string());
+        tx.send(ClientCommand::ProvideCredentials {
+            username: Some("other".to_string()),
+            password: "new".to_string(),
+            save: false,
+        })
+        .await
+        .unwrap();
+        tx.send(ClientCommand::ReconnectNow).await.unwrap();
+        assert!(!wait_for_retry(&mut rx, &cancel, Duration::from_secs(30), &mut credentials).await);
+        assert_eq!(credentials, ("other".to_string(), "new".to_string()));
+    }
 
     #[tokio::test]
     async fn a_lost_picture_is_asked_for_again() {
