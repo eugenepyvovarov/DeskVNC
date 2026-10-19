@@ -716,6 +716,22 @@ function SessionView({
     };
   }, [params.sessionId]);
 
+  // The video path's own numbers, so a picture that is going wrong can be
+  // read rather than guessed at: how much is queued at the decoder, and how
+  // long a picture takes to come back.
+  const [mediaStats, setMediaStats] = useState<{
+    queued: number;
+    submitted: number;
+    decoded: number;
+    latencyMs: number;
+  } | null>(null);
+  useEffect(() => {
+    const renderer = rendererRef.current;
+    if (!renderer) return;
+    const timer = window.setInterval(() => setMediaStats(renderer.getMediaStats()), 1000);
+    return () => window.clearInterval(timer);
+  }, [rendererRef.current]);
+
   // A capture helper can exit without a window event. Refresh the indicator
   // while it claims to be active so a dead helper cannot leave it stuck there.
   useEffect(() => {
@@ -1961,7 +1977,7 @@ function SessionView({
       {params.protocol === "apple" && owns && <MacDisplayControls
         info={session.macDisplayInfo} notice={session.macDisplayNotice}
         busy={session.macDisplayBusy} size={remoteSize} native={nativeSizeRef.current}
-        media={session.appleMedia}
+        media={session.appleMedia} stats={mediaStats}
         onStreamResize={(w, h) => session.requestResize(w, h)}
         onPanelMode={session.requestMacDisplay}
       />}

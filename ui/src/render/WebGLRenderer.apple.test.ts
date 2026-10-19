@@ -41,7 +41,7 @@ it("feeds continuous AVC without waiting for output and converts Annex-B lengths
   const renderer = Object.assign(Object.create(WebGLRenderer.prototype), {
     h264Failed: false,
     continuousH264: true,
-    h264: new Map([[0, { avc: true, timestamp: 0, decoder: { state: "configured", decode } }]]),
+    h264: new Map([[0, { avc: true, timestamp: 0, submitted: new Map(), decoder: { state: "configured", decode } }]]),
     awaitH264Frame: wait,
   });
   const rect = {
@@ -79,7 +79,7 @@ it("does not rebuild the decoder for a key picture that is not a reset", async (
     constructor(public init: unknown) { Object.assign(this, init); }
   });
   const existing = {
-    avc: true, timestamp: 0, generation: 1, waiters: new Map(),
+    avc: true, timestamp: 0, generation: 1, waiters: new Map(), submitted: new Map(),
     decoder: { state: "configured", decode: vi.fn() },
   };
   const closeH264 = vi.fn();
@@ -95,6 +95,23 @@ it("does not rebuild the decoder for a key picture that is not a reset", async (
   expect(closeH264).not.toHaveBeenCalled();
   expect(createH264).not.toHaveBeenCalled();
   expect(existing.decoder.decode).toHaveBeenCalledOnce();
+});
+
+it("reports what the decoder is doing", () => {
+  // The queue is how much the decoder has been given and has not finished,
+  // and the delay is how old the picture on screen is.
+  const renderer = Object.assign(Object.create(WebGLRenderer.prototype), {
+    h264: new Map([[0, { decoder: { decodeQueueSize: 3 } }]]),
+    mediaSubmitted: 10,
+    mediaDecoded: 8,
+    mediaLatencyMs: 42.4,
+  });
+  expect(renderer.getMediaStats()).toEqual({
+    queued: 3,
+    submitted: 10,
+    decoded: 8,
+    latencyMs: 42,
+  });
 });
 
 it("does not latch a decoder failure across a resize", () => {
@@ -167,7 +184,7 @@ it("does not count an accepted compressed chunk as a presented frame", async () 
   const renderer = Object.assign(Object.create(WebGLRenderer.prototype), {
     h264Failed: false, continuousH264: true, sawFrame: false, disposed: false,
     generation: 1, latestVideo: null, gl: {}, notices: new Set(),
-    h264: new Map([[0, { avc: false, timestamp: 0, generation: 1, decoder: { state: "configured", decode: vi.fn() } }]]),
+    h264: new Map([[0, { avc: false, timestamp: 0, generation: 1, submitted: new Map(), decoder: { state: "configured", decode: vi.fn() } }]]),
     onFirstFrame: firstFrame, markDirty: vi.fn(),
   });
   await renderer.applyFrameOrdered(

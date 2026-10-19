@@ -135,6 +135,11 @@ interface H264Context {
    */
   waiters: Map<number, (frame: VideoFrame | null) => void>;
   /**
+   * When each submitted chunk was handed to the decoder, so the time from
+   * the wire to the picture can be measured.
+   */
+  submitted: Map<number, number>;
+  /**
    * The acceleration this decoder was configured with. A decoder that
    * fails to configure reports the failure asynchronously, so the retry
    * needs to know what it was trying first.
@@ -639,6 +644,11 @@ export class WebGLRenderer {
    * hardware path is refused, and the change is reported.
    */
   private h264Acceleration: VideoDecoderConfig["hardwareAcceleration"] = "prefer-hardware";
+  /** Pictures handed to the decoder, and pictures that came out of it. */
+  private mediaSubmitted = 0;
+  private mediaDecoded = 0;
+  /** A running average of the time from the wire to the picture. */
+  private mediaLatencyMs = 0;
   private continuousH264 = false;
   private latestVideo: { frame: VideoFrame; ctx: H264Context } | null = null;
 
@@ -925,6 +935,32 @@ export class WebGLRenderer {
   }
 
   /**
+   * What the video path is doing, for the panel that shows it.
+   *
+   * The queue is the number of chunks the decoder has been given and has
+   * not finished. A queue that grows is a decoder that cannot keep up with
+   * the stream, and the picture on screen gets older every second until
+   * the delay is visible.
+   */
+  getMediaStats(): {
+    queued: number;
+    submitted: number;
+    decoded: number;
+    latencyMs: number;
+  } {
+    let queued = 0;
+    for (const ctx of this.h264.values()) {
+      queued += ctx.decoder.decodeQueueSize ?? 0;
+    }
+    return {
+      queued,
+      submitted: this.mediaSubmitted,
+      decoded: this.mediaDecoded,
+      latencyMs: Math.round(this.mediaLatencyMs),
+    };
+  }
+
+  /**
    * Queue depth and the shed-work counters, so the drop behaviour can be
    * observed from a debug overlay or a test without instrumenting the hot
    * path itself.
@@ -1139,6 +1175,8 @@ export class WebGLRenderer {
 
     ctx.timestamp += 1000; // 1 ms apart: monotonic is all the decoder needs
     const ts = ctx.timestamp;
+    ctx.submitted.set(ts, performance.now());
+    this.mediaSubmitted += 1;
     const wait = this.continuousH264 ? null : this.awaitH264Frame(ctx, ts);
     try {
       ctx.decoder.decode(
@@ -1243,6 +1281,7 @@ export class WebGLRenderer {
       generation,
       timestamp: 0,
       waiters: new Map(),
+      submitted: new Map(),
       acceleration: this.h264Acceleration,
       outputSeen: false,
     };
@@ -1254,6 +1293,18 @@ export class WebGLRenderer {
             return;
           }
           ctx.outputSeen = true;
+          this.mediaDecoded += 1;
+          // How long the picture took to come back. This is the number that
+          // says whether the decoder is keeping up: a queue that grows is
+          // a decoder that cannot keep up, and the picture is older than
+          // the screen by the time it is shown.
+          const sentAt = ctx.submitted.get(frame.timestamp);
+          if (sentAt !== undefined) {
+            ctx.submitted.delete(frame.timestamp);
+            const delay = performance.now() - sentAt;
+            this.mediaLatencyMs =
+              this.mediaLatencyMs === 0 ? delay : this.mediaLatencyMs * 0.8 + delay * 0.2;
+          }
           // Not uploaded here: `decodeH264` uploads it at the rect's own
           // position in the ordered apply loop.
           if (this.continuousH264) {

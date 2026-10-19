@@ -43,6 +43,13 @@ export function MacDisplayControls(props: {
     lost: number;
     recoveries: number;
   } | null;
+  /** What the video path is doing: the decoder's queue and its delay. */
+  stats?: {
+    queued: number;
+    submitted: number;
+    decoded: number;
+    latencyMs: number;
+  } | null;
   onStreamResize: (w: number, h: number) => void;
   onPanelMode: (action: MacDisplayAction) => void;
 }) {
@@ -55,6 +62,12 @@ export function MacDisplayControls(props: {
     <button className="rounded-md border border-subtle bg-raised px-3 py-2" onClick={() => setOpen(!open)}>Mac</button>
     {open && <div className="absolute bottom-full right-0 mb-2 w-80 space-y-3 rounded-lg border border-subtle bg-raised p-4 shadow-lg">
       <p className="text-secondary">Streaming at {streamSize} pixels</p>
+      {props.stats && props.stats.submitted > 0 && (
+        <p className="text-tertiary">
+          Decoder: {props.stats.queued} queued, {props.stats.decoded} of {props.stats.submitted}{" "}
+          decoded, {props.stats.latencyMs} ms behind
+        </p>
+      )}
       {props.media && (props.media.pictures > 0 || props.media.canvasWidth > 0) && (
         <p className="text-tertiary">
           {props.media.canvasWidth > 0
