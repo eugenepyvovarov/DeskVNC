@@ -28,6 +28,133 @@ const MAX_STREAMS: usize = 32;
 /// to be the live one.
 const STREAM_STALL: Duration = Duration::from_millis(750);
 
+/// How long a resize round may take before the session gives up on it and
+/// says so.
+const RESIZE_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// A resize round.
+///
+/// A round is: ask the Mac for a size, get the layout that answers it, let
+/// the encoder restart, and see a picture at the new size. It is not over
+/// when the Mac answers, because the encoder restarts after the answer and a
+/// second request sent into that restart races it.
+///
+/// The newest request always wins. A request that arrives while a round is
+/// running is remembered and sent when the round ends, even when it asks
+/// for the size the session had before the round started: that is a real
+/// request, and dropping it is how a quality change used to disappear.
+#[derive(Default)]
+struct ResizeRound {
+    /// The newest size the user asked for.
+    requested: Option<(u16, u16)>,
+    /// The size the request that is running asked for.
+    sent: Option<(u16, u16)>,
+    /// The size the server confirmed in the layout that answered it.
+    confirmed: Option<(u16, u16)>,
+    /// A request is with the server.
+    in_flight: bool,
+    /// When the request was sent.
+    sent_at: Option<Instant>,
+    /// The round has to wait for a picture at the new size before it ends.
+    /// A layout that did not change the geometry needs no new picture.
+    needs_picture: bool,
+    /// The request has been sent and the layout that answers it has not
+    /// arrived yet. A picture from the old encoder says nothing about the
+    /// new size, so the round waits for the layout first.
+    awaiting_layout: bool,
+}
+
+/// What asking for a size means.
+#[derive(Debug, PartialEq, Eq)]
+enum ResizeAction {
+    /// The picture is already that size. Nothing to ask for.
+    Nothing,
+    /// Send the request now.
+    Send((u16, u16)),
+    /// A round is running. The request goes out when that round ends.
+    Wait,
+}
+
+/// Decide what an ask for a size means, and record it.
+fn plan_resize(round: &mut ResizeRound, target: (u16, u16), current: (u16, u16)) -> ResizeAction {
+    round.requested = Some(target);
+    if round.in_flight {
+        // A round is running. The request goes out when it finishes, even
+        // when it asks for the size the session had before the round
+        // started: it is a real request, and dropping it is how a quality
+        // change used to disappear.
+        return ResizeAction::Wait;
+    }
+    if target == current {
+        round.requested = None;
+        return ResizeAction::Nothing;
+    }
+    round.sent = Some(target);
+    round.sent_at = Some(Instant::now());
+    round.in_flight = true;
+    round.needs_picture = true;
+    round.awaiting_layout = true;
+    ResizeAction::Send(target)
+}
+
+/// What the end of a round means.
+#[derive(Debug, PartialEq, Eq)]
+enum RoundEnd {
+    /// The round is over. The pair is the size that was asked for and the
+    /// size the server chose, when they differ.
+    Done(Option<((u16, u16), (u16, u16))>),
+    /// Another request goes out, because a newer one arrived while this
+    /// round was running.
+    Send((u16, u16)),
+}
+
+/// Close a round that has been answered and has produced its picture.
+fn finish_round(round: &mut ResizeRound) -> RoundEnd {
+    round.in_flight = false;
+    round.sent_at = None;
+    let sent = round.sent;
+    match round.requested {
+        Some(target) if Some(target) != sent => {
+            // A newer request arrived while this round was running. It wins.
+            round.sent = Some(target);
+            round.sent_at = Some(Instant::now());
+            round.in_flight = true;
+            round.needs_picture = true;
+            round.awaiting_layout = true;
+            RoundEnd::Send(target)
+        }
+        _ => {
+            round.requested = None;
+            let clamped = match (sent, round.confirmed) {
+                (Some(sent), Some(confirmed)) if sent != confirmed => Some((sent, confirmed)),
+                _ => None,
+            };
+            RoundEnd::Done(clamped)
+        }
+    }
+}
+
+/// Ask for a size, or remember the ask until the running round is over.
+async fn request_resize(
+    session: &mut Live,
+    round: &mut ResizeRound,
+    target: (u16, u16),
+    current: (u16, u16),
+) -> Result<(), SessionError> {
+    match plan_resize(round, target, current) {
+        ResizeAction::Nothing => Ok(()),
+        ResizeAction::Wait => {
+            tracing::debug!(w = target.0, h = target.1, "Apple resize request queued");
+            Ok(())
+        }
+        ResizeAction::Send((w, h)) => {
+            session.send_body(&display_config(w, h)).await?;
+            tracing::info!(w, h, "Apple display resize requested");
+            Ok(())
+        }
+    }
+}
+
 /// One video stream: its own SRTP state and its own assembler.
 struct Stream {
     srtp: SrtpContext,
@@ -321,11 +448,21 @@ async fn connect(
     let video_dimensions = media_dimensions.clone();
     let mut display: Option<crate::macos::DisplayController> = None;
     let native = (width, height);
-    // One resize round in flight at a time (§10.9): 0x1d → 0x451 → re-offer.
-    // A second 0x1d sent mid-round races the encoder restart and stalls the
-    // stream (observed live); later requests queue behind the current one.
-    let mut resize_in_flight = false;
-    let mut queued_resize: Option<(u16, u16)> = None;
+    // One resize round at a time (§10.9): 0x1d → 0x451 → re-offer → a picture
+    // at the new size. A round is not over when the server answers it: the
+    // encoder restarts after the answer, and a second request sent into
+    // that restart races it (observed live as a black screen).
+    let mut round = ResizeRound::default();
+    // The media generation. Every re-offer starts a new one, and a picture
+    // carries the generation it belongs to, so "the new picture has arrived"
+    // is a fact rather than a guess.
+    let generation = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1));
+    let picture_generation = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let video_generation = generation.clone();
+    let video_picture_generation = picture_generation.clone();
+    // A periodic tick, so a round can be finished, timed out or reported
+    // without waiting for the next thing to happen on the wire.
+    let mut tick = tokio::time::interval(Duration::from_millis(250));
     let video_task = tokio::spawn(async move {
         if let (Some(sock), Some(ctx)) = (udp, srtp.as_mut()) {
             let mut buf = vec![0u8; 65535];
@@ -438,6 +575,11 @@ async fn connect(
                 }
                 last_published = Instant::now();
                 let units = stream.depay.push(rtp.seq, rtp.timestamp, rtp.marker, &rtp.payload);
+                if !units.is_empty() {
+                    // A picture belongs to the media generation that was
+                    // running when it was decoded.
+                    video_picture_generation.store(video_generation.load(std::sync::atomic::Ordering::SeqCst), std::sync::atomic::Ordering::SeqCst);
+                }
                 if !publish(&events2, units, &video_dimensions, &mut pictures).await {
                     break;
                 }
@@ -487,15 +629,8 @@ async fn connect(
                         // resolution the Mac renders and streams. `0x451`
                         // below confirms what the server actually chose.
                         let target = crate::quality::resolution_for(preset, native);
-                        if target != (session.width, session.height) {
-                            if resize_in_flight {
-                                queued_resize = Some(target);
-                            } else {
-                                session.send_body(&display_config(target.0, target.1)).await?;
-                                resize_in_flight = true;
-                                tracing::info!(w = target.0, h = target.1, "Apple quality preset: resize requested");
-                            }
-                        }
+                        let current = (session.width, session.height);
+                        request_resize(&mut session, &mut round, target, current).await?;
                     }
                     Some(ClientCommand::MacDisplay(action)) => {
                         use remote_core::{MacDisplayAction, ProtocolEvent};
@@ -505,7 +640,13 @@ async fn connect(
                                 let verifier = host_keys.clone().ok_or_else(|| "Mac display controls require the application's SSH host-key store".to_owned())?;
                                 display = Some(crate::macos::DisplayController::connect(host, username, password, verifier).await?);
                             }
-                            if changes_mode { queued_resize = None; }
+                            if changes_mode {
+                                // A pending stream resize was made for the
+                                // old desktop, so it no longer means what it
+                                // meant. A round that is already running is
+                                // left to finish.
+                                round.requested = None;
+                            }
                             display.as_mut().unwrap().request(action).await
                         }.await;
                         if let Ok(info) = &result {
@@ -518,6 +659,7 @@ async fn connect(
                             // Keep the SRTP keys, but re-offer after a physical
                             // mode change so the HP encoder starts its new canvas.
                             session.send_body(&offer).await?;
+                            generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                             session.send_body(&framebuffer_request(session.width, session.height)).await?;
                         }
                         emit(events, SessionEvent::Protocol(ProtocolEvent::AppleDisplay(result))).await.ok();
@@ -525,14 +667,14 @@ async fn connect(
                     Some(ClientCommand::RequestResize { width, height }) => {
                         // In-band dynamic resize (RFC §10.9): 0x1d now, and the
                         // 0x451 that answers it drives the media re-offer.
-                        if (640..=3840).contains(&width) && (480..=2160).contains(&height) {
-                            if resize_in_flight {
-                                queued_resize = Some((width, height));
-                            } else {
-                                session.send_body(&display_config(width, height)).await?;
-                                resize_in_flight = true;
-                                tracing::info!(width, height, "Apple display resize requested");
-                            }
+                        //
+                        // The bound is the size a Mac can display, not the
+                        // size of a 4K television: the native button asks
+                        // for the panel's own geometry, which on this Mac is
+                        // 3600x2338, and a bound of 2160 refused it.
+                        if (640..=8192).contains(&width) && (480..=8192).contains(&height) {
+                            let current = (session.width, session.height);
+                            request_resize(&mut session, &mut round, (width, height), current).await?;
                         } else {
                             emit(events, SessionEvent::Protocol(remote_core::ProtocolEvent::AppleNotice("That size is outside the range the Mac can stream.".into()))).await.ok();
                         }
@@ -559,20 +701,60 @@ async fn connect(
                     // R-A16b: re-arm the sender on every layout, geometry or not.
                     session.send_body(&auto_framebuffer(bw, bh)).await?;
                     session.send_body(&framebuffer_request(bw, bh)).await?;
-                    if resize_in_flight {
+                    if round.in_flight {
                         // §10.9 step 3: the re-offer is what restarts the
                         // encoder at the new canvas. Keys are reused.
-                        resize_in_flight = false;
+                        //
+                        // The round is NOT over yet. The encoder restarts
+                        // after this answer, and a request sent into that
+                        // restart races it. The round ends when a picture at
+                        // the new size has been decoded.
                         session.send_body(&offer).await?;
+                        generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        round.confirmed = Some((bw, bh));
+                        round.needs_picture = changed;
+                        round.awaiting_layout = false;
                         tracing::info!(bw, bh, "Apple display layout applied; media re-offered");
-                        // The newest request wins; send it now that the round
-                        // that was in flight has completed.
-                        if let Some((w, h)) = queued_resize.take() {
-                            if (w, h) != (session.width, session.height) {
-                                session.send_body(&display_config(w, h)).await?;
-                                resize_in_flight = true;
+                    }
+                }
+            }
+            _ = tick.tick() => {
+                // Finish, report or time out a resize round.
+                if round.in_flight {
+                    let picture_arrived = picture_generation.load(std::sync::atomic::Ordering::SeqCst)
+                        >= generation.load(std::sync::atomic::Ordering::SeqCst);
+                    // The layout has to come first: a picture from the old
+                    // encoder says nothing about the size that was asked for.
+                    if !round.awaiting_layout && (!round.needs_picture || picture_arrived) {
+                        match finish_round(&mut round) {
+                            RoundEnd::Send((w, h)) => {
                                 tracing::info!(w, h, "Apple queued resize sent");
+                                session.send_body(&display_config(w, h)).await?;
                             }
+                            RoundEnd::Done(clamped) => {
+                                tracing::info!("Apple resize round complete");
+                                // The server may choose a different size when
+                                // the request is more than it can do. Say so
+                                // rather than leaving the user to guess.
+                                if let Some((sent, confirmed)) = clamped {
+                                    emit(events, SessionEvent::Protocol(remote_core::ProtocolEvent::AppleNotice(
+                                        format!("The Mac streams at {}x{}, not the {}x{} that was asked for.", confirmed.0, confirmed.1, sent.0, sent.1),
+                                    ))).await.ok();
+                                }
+                            }
+                        }
+                    } else if let Some(sent_at) = round.sent_at {
+                        if sent_at.elapsed() > RESIZE_TIMEOUT {
+                            // The Mac did not answer in time. Say so, and
+                            // leave the session where it was rather than
+                            // waiting for ever.
+                            round.in_flight = false;
+                            round.sent_at = None;
+                            round.requested = None;
+                            tracing::warn!("Apple resize round timed out");
+                            emit(events, SessionEvent::Protocol(remote_core::ProtocolEvent::AppleNotice(
+                                "The Mac did not answer the resize request. The picture is unchanged.".into(),
+                            ))).await.ok();
                         }
                     }
                 }
@@ -995,6 +1177,91 @@ mod tests {
         let msg = viewer_info();
         assert_eq!(msg[0], 0x21);
         assert_eq!(u16::from_be_bytes([msg[2], msg[3]]) as usize, msg.len() - 4);
+    }
+
+    #[test]
+    fn a_resize_request_for_the_size_already_shown_does_nothing() {
+        let mut round = ResizeRound::default();
+        assert_eq!(plan_resize(&mut round, (1920, 1080), (1920, 1080)), ResizeAction::Nothing);
+        assert!(!round.in_flight);
+    }
+
+    #[test]
+    fn a_resize_request_starts_a_round() {
+        let mut round = ResizeRound::default();
+        assert_eq!(plan_resize(&mut round, (1663, 1080), (1920, 1080)), ResizeAction::Send((1663, 1080)));
+        assert!(round.in_flight);
+        assert_eq!(round.sent, Some((1663, 1080)));
+    }
+
+    #[test]
+    fn a_request_during_a_round_is_remembered_and_sent_when_the_round_ends() {
+        let mut round = ResizeRound::default();
+        plan_resize(&mut round, (1663, 1080), (1920, 1080));
+        // A second request arrives while the first is still running.
+        assert_eq!(plan_resize(&mut round, (2560, 1440), (1920, 1080)), ResizeAction::Wait);
+        // The round ends: the newer request goes out.
+        assert_eq!(finish_round(&mut round), RoundEnd::Send((2560, 1440)));
+        assert!(round.in_flight);
+        assert_eq!(round.sent, Some((2560, 1440)));
+    }
+
+    #[test]
+    fn a_request_for_the_size_before_the_round_is_not_lost() {
+        // The user asks for Low, then for the size the session had before.
+        // The second request asks for the CURRENT size, so a check against
+        // the current size would drop it, and the session would end up at
+        // the size the user asked for first.
+        let mut round = ResizeRound::default();
+        plan_resize(&mut round, (1663, 1080), (1920, 1080));
+        assert_eq!(plan_resize(&mut round, (1920, 1080), (1920, 1080)), ResizeAction::Wait);
+        assert_eq!(finish_round(&mut round), RoundEnd::Send((1920, 1080)));
+    }
+
+    #[test]
+    fn a_round_ends_with_the_size_the_server_chose_when_it_differs() {
+        let mut round = ResizeRound::default();
+        plan_resize(&mut round, (3000, 2000), (1920, 1080));
+        // The server answered with a different size.
+        round.confirmed = Some((2560, 1440));
+        assert_eq!(finish_round(&mut round), RoundEnd::Done(Some(((3000, 2000), (2560, 1440)))));
+        assert!(!round.in_flight);
+    }
+
+    #[test]
+    fn a_round_ends_quietly_when_the_server_chose_what_was_asked() {
+        let mut round = ResizeRound::default();
+        plan_resize(&mut round, (1663, 1080), (1920, 1080));
+        round.confirmed = Some((1663, 1080));
+        assert_eq!(finish_round(&mut round), RoundEnd::Done(None));
+    }
+
+    #[test]
+    fn a_round_waits_for_the_layout_before_the_picture() {
+        let mut round = ResizeRound::default();
+        plan_resize(&mut round, (1663, 1080), (1920, 1080));
+        // A picture from the old encoder must not end the round: the layout
+        // that answers the request has not arrived yet.
+        assert!(round.awaiting_layout);
+        round.confirmed = Some((1663, 1080));
+        round.needs_picture = true;
+        round.awaiting_layout = false;
+        assert!(round.in_flight);
+    }
+
+    #[test]
+    fn a_round_waits_for_a_picture_at_the_new_size() {
+        let mut round = ResizeRound::default();
+        plan_resize(&mut round, (1663, 1080), (1920, 1080));
+        // The layout arrived: the round is not over, the encoder restarts
+        // and the new picture has to arrive.
+        round.confirmed = Some((1663, 1080));
+        round.needs_picture = true;
+        assert!(round.in_flight);
+        // Only a layout that did not change the geometry ends the round
+        // straight away.
+        round.needs_picture = false;
+        assert_eq!(finish_round(&mut round), RoundEnd::Done(None));
     }
 }
 

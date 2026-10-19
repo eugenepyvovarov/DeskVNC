@@ -24,9 +24,20 @@ pub fn resolution_for(preset: QualityPreset, native: (u16, u16)) -> (u16, u16) {
         return native; // native already fits the cap: never upscale
     }
     (
-        ((f64::from(nw) * scale).round() as u32).clamp(640, 3840) as u16,
-        ((f64::from(nh) * scale).round() as u32).clamp(480, 2160) as u16,
+        even((f64::from(nw) * scale).round() as u32).clamp(640, 3840) as u16,
+        even((f64::from(nh) * scale).round() as u32).clamp(480, 2160) as u16,
     )
+}
+
+/// Round a dimension down to an even number.
+///
+/// H.264 4:2:0 samples chroma at half resolution in both directions, so an
+/// odd width or height leaves a chroma sample that belongs to no pixel. The
+/// encoder pads the picture to a whole macroblock, and the viewer then has
+/// to crop it back to a size the chroma plane divides evenly. Asking for an
+/// even size in the first place avoids the crop.
+fn even(value: u32) -> u32 {
+    value & !1
 }
 
 #[cfg(test)]
@@ -43,8 +54,11 @@ mod tests {
         let low = resolution_for(QualityPreset::Low, native);
         assert!(low.0 <= medium.0 && medium.0 <= native.0, "{low:?} {medium:?}");
         assert!(low.1 <= medium.1 && medium.1 <= native.1, "{low:?} {medium:?}");
-        assert_eq!(medium, (2217, 1440));
-        assert_eq!(low, (1663, 1080));
+        assert_eq!(medium, (2216, 1440));
+        assert_eq!(low, (1662, 1080));
+        // Even dimensions, so the chroma plane divides evenly.
+        assert_eq!(medium.0 % 2, 0);
+        assert_eq!(low.0 % 2, 0);
     }
 
     #[test]
