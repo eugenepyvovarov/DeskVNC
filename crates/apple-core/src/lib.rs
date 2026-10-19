@@ -6,11 +6,13 @@
 
 #![forbid(unsafe_code)]
 
+mod answer;
 mod auth;
 mod h264;
 mod input;
 mod macos;
 mod offer;
+mod plist;
 mod quality;
 mod record;
 mod rtcp;

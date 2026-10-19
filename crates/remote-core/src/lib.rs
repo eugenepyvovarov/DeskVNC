@@ -32,6 +32,7 @@
 // exception.
 #![forbid(unsafe_code)]
 
+pub mod apple_media;
 pub mod commands;
 pub mod credentials;
 pub mod driver;

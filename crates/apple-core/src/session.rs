@@ -185,6 +185,11 @@ impl Peer {
 /// decoder that misses a picture needs an independent one to recover.
 const PICTURE_QUEUE: usize = 8;
 
+/// How many times the offer is asked again when the Mac answers with an
+/// empty canvas. The Mac does that while its encoder is warming up, and
+/// the answer that follows is the one that counts.
+const MAX_OFFER_ATTEMPTS: u32 = 3;
+
 /// How often a fresh picture may be asked for.
 const KEYFRAME_REQUEST_INTERVAL: Duration = Duration::from_millis(500);
 
@@ -310,6 +315,19 @@ async fn request_resize(
             Ok(())
         }
     }
+}
+
+/// The counters the video receiver keeps and the control loop reads.
+///
+/// The receiver and the control loop are different tasks, and the numbers
+/// are about the media: how many pictures have been decoded, how many
+/// packets went missing, and how many times the picture was asked for
+/// again.
+#[derive(Default)]
+struct MediaCounters {
+    pictures: std::sync::atomic::AtomicU64,
+    lost: std::sync::atomic::AtomicU64,
+    recoveries: std::sync::atomic::AtomicU64,
 }
 
 /// One video stream: its own SRTP state and its own assembler.
@@ -827,6 +845,14 @@ async fn connect(
     // A periodic tick, so a round can be finished, timed out or reported
     // without waiting for the next thing to happen on the wire.
     let mut tick = tokio::time::interval(Duration::from_millis(250));
+    // What the Mac's media path is doing, as its answer says.
+    let mut media_state = remote_core::apple_media::MediaState::default();
+    // The counters the video receiver keeps.
+    let counters = std::sync::Arc::new(MediaCounters::default());
+    let video_counters = counters.clone();
+    // How many times the offer has been asked again because the answer was
+    // empty.
+    let mut offer_attempts = 0u32;
     // The feedback state travels with the video task: the requests are
     // about the video, and the video task is what notices that a picture
     // was lost.
@@ -997,12 +1023,16 @@ async fn connect(
                     // running when it was decoded.
                     video_picture_generation.store(video_generation.load(std::sync::atomic::Ordering::SeqCst), std::sync::atomic::Ordering::SeqCst);
                     pictures += units.len() as u32;
+                    video_counters
+                        .pictures
+                        .fetch_add(units.len() as u64, std::sync::atomic::Ordering::Relaxed);
                     for unit in units {
                         // The queue never blocks the receiver. A picture that
                         // does not fit is dropped, and the decoder is given a
                         // fresh independent picture to recover with.
                         if picture_tx.try_send(unit).is_err() {
                             dropped += 1;
+                            video_counters.recoveries.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             request_keyframe(&mut feedback, feedback_ssrc, ssrc, ctrl.as_ref(), &ctrl_dest, &mut last_request).await;
                         }
                     }
@@ -1013,6 +1043,8 @@ async fn connect(
                 // one.
                 if stream.depay.stats.gaps > gaps_seen {
                     gaps_seen = stream.depay.stats.gaps;
+                    video_counters.lost.store(stream.depay.stats.lost_packets, std::sync::atomic::Ordering::Relaxed);
+                    video_counters.recoveries.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     // Ask for the packets that went missing, and for a
                     // fresh picture: the missing ones may come back, and
                     // the fresh one is what repairs the reference chain
@@ -1221,6 +1253,35 @@ async fn connect(
                     session.layer.rekey(key, iv);
                     tracing::info!(send_seq, recv_seq, "Apple control layer rekeyed");
                 }
+                // The Mac's answer to the media offer: what the encoder
+                // settled on, and how many tile streams it is using.
+                if body.first() == Some(&0) {
+                    if let Some(answer) = crate::answer::parse(&body) {
+                        media_state.canvas_width = answer.canvas_width;
+                        media_state.canvas_height = answer.canvas_height;
+                        media_state.tiles = answer.tiles;
+                        tracing::info!(
+                            canvas_width = answer.canvas_width,
+                            canvas_height = answer.canvas_height,
+                            tiles = answer.tiles,
+                            "the Mac answered the media offer"
+                        );
+                        if !answer.is_usable() {
+                            // The Mac answered with an empty canvas, which
+                            // it does while its encoder is still warming up.
+                            // The offer is asked again.
+                            if offer_attempts < MAX_OFFER_ATTEMPTS {
+                                offer_attempts += 1;
+                                tracing::info!(attempt = offer_attempts, "the Mac's answer was empty; asking again");
+                                session.send_body(&offer).await?;
+                            } else {
+                                tracing::warn!("the Mac's answer was empty after several attempts");
+                            }
+                        } else {
+                            emit(events, SessionEvent::Protocol(remote_core::ProtocolEvent::AppleMedia(media_state))).await.ok();
+                        }
+                    }
+                }
                 // AppleDisplayLayout (0x451): authoritative geometry (R-A15).
                 if let Some(((lw, lh), (bw, bh))) = find_display_layout(&body) {
                     let changed = (bw, bh) != (session.width, session.height);
@@ -1258,6 +1319,15 @@ async fn connect(
                 }
             }
             _ = tick.tick() => {
+                // The media state is reported every few seconds: how many
+                // pictures have been decoded, how many packets went missing,
+                // and how many times the picture was asked for again.
+                media_state.pictures = counters.pictures.load(std::sync::atomic::Ordering::Relaxed);
+                media_state.lost = counters.lost.load(std::sync::atomic::Ordering::Relaxed);
+                media_state.recoveries = counters.recoveries.load(std::sync::atomic::Ordering::Relaxed);
+                if media_state.pictures % 120 < 1 {
+                    emit(events, SessionEvent::Protocol(remote_core::ProtocolEvent::AppleMedia(media_state))).await.ok();
+                }
                 // A video receiver that died leaves a session that reports
                 // itself connected and shows nothing. The supervisor
                 // restarts it.

@@ -137,6 +137,9 @@ fn event_json(session_id: &str, event: &SessionEvent) -> Option<serde_json::Valu
         // asked for none of it (PRDAgentPlug/00 R51b).
         SessionEvent::AgentRefused(_) | SessionEvent::AgentServed(_) => return None,
         SessionEvent::Protocol(ProtocolEvent::AppleNotice(message)) => json!({ "type": "apple-notice", "message": message }),
+        SessionEvent::Protocol(ProtocolEvent::AppleMedia(state)) => {
+            json!({ "type": "apple-media", "state": state })
+        }
         SessionEvent::Protocol(ProtocolEvent::AppleDisplay(result)) => match result {
             Ok(info) => json!({ "type": "apple-display", "info": info, "error": null }),
             Err(error) => json!({ "type": "apple-display", "info": null, "error": error }),

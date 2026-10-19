@@ -1961,6 +1961,7 @@ function SessionView({
       {params.protocol === "apple" && owns && <MacDisplayControls
         info={session.macDisplayInfo} notice={session.macDisplayNotice}
         busy={session.macDisplayBusy} size={remoteSize} native={nativeSizeRef.current}
+        media={session.appleMedia}
         onStreamResize={(w, h) => session.requestResize(w, h)}
         onPanelMode={session.requestMacDisplay}
       />}

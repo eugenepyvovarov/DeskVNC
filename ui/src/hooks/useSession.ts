@@ -73,7 +73,19 @@ type SshOnlyEvent =
 /** `SessionEventPayload`, widened by `SshOnlyEvent` for the listener below. */
 type SessionOrSshEventPayload = SessionEventPayload | (SshOnlyEvent & { sessionId: string })
   | { type: "apple-display"; sessionId: string; info: MacDisplayInfo | null; error: string | null }
-  | { type: "apple-notice"; sessionId: string; message: string }; 
+  | { type: "apple-notice"; sessionId: string; message: string }
+  | {
+      type: "apple-media";
+      sessionId: string;
+      state: {
+        canvasWidth: number;
+        canvasHeight: number;
+        tiles: number;
+        pictures: number;
+        lost: number;
+        recoveries: number;
+      };
+    };
 
 export interface CertPromptState {
   fingerprint: string;
@@ -124,6 +136,15 @@ export interface SessionApi {
   macDisplayInfo: MacDisplayInfo | null;
   macDisplayNotice: string | null;
   macDisplayBusy: boolean;
+  /** What the Mac's media path is doing, as its answer says. */
+  appleMedia: {
+    canvasWidth: number;
+    canvasHeight: number;
+    tiles: number;
+    pictures: number;
+    lost: number;
+    recoveries: number;
+  } | null;
   requestMacDisplay: (action: MacDisplayAction) => void;
   boundaryControl: boolean | null;
   state: SessionState;
@@ -343,6 +364,7 @@ export function useSession(
   const [macDisplayInfo, setMacDisplayInfo] = useState<MacDisplayInfo | null>(null);
   const [macDisplayNotice, setMacDisplayNotice] = useState<string | null>(null);
   const [macDisplayBusy, setMacDisplayBusy] = useState(false);
+  const [appleMedia, setAppleMedia] = useState<SessionApi["appleMedia"]>(null);
   const [certPrompt, setCertPrompt] = useState<CertPromptState | null>(null);
   const [sshHostKeyPrompt, setSshHostKeyPrompt] = useState<SshHostKeyPromptState | null>(null);
   const [credentialRequest, setCredentialRequest] = useState<CredentialRequest | null>(null);
@@ -514,6 +536,9 @@ export function useSession(
           setMacDisplayBusy(false);
           if (ev.info) setMacDisplayInfo(ev.info);
           setMacDisplayNotice(ev.error ?? "Physical display mode confirmed by macOS.");
+          break;
+        case "apple-media":
+          setAppleMedia(ev.state);
           break;
         case "apple-notice":
           setMacDisplayNotice(ev.message);
@@ -1031,7 +1056,7 @@ export function useSession(
   }, []);
 
   return {
-    macDisplayInfo, macDisplayNotice, macDisplayBusy, requestMacDisplay,
+    macDisplayInfo, macDisplayNotice, macDisplayBusy, requestMacDisplay, appleMedia,
     state, desktopName, boundaryControl, screens, stats, certPrompt, sshHostKeyPrompt, credentialRequest, lastCredentialAnswer, remoteClipboard, bellTick,
     sshAttached, sshNotice,
     sendInput, sendTerminalInput, sendTerminalResize, disconnect, reconnectNow, setQuality, setViewOnly, refreshScreen,

@@ -34,6 +34,15 @@ export function MacDisplayControls(props: {
   busy: boolean;
   size: { w: number; h: number } | null;
   native: { w: number; h: number } | null;
+  /** What the Mac's media path is doing, as its answer says. */
+  media?: {
+    canvasWidth: number;
+    canvasHeight: number;
+    tiles: number;
+    pictures: number;
+    lost: number;
+    recoveries: number;
+  } | null;
   onStreamResize: (w: number, h: number) => void;
   onPanelMode: (action: MacDisplayAction) => void;
 }) {
@@ -46,6 +55,17 @@ export function MacDisplayControls(props: {
     <button className="rounded-md border border-subtle bg-raised px-3 py-2" onClick={() => setOpen(!open)}>Mac</button>
     {open && <div className="absolute bottom-full right-0 mb-2 w-80 space-y-3 rounded-lg border border-subtle bg-raised p-4 shadow-lg">
       <p className="text-secondary">Streaming at {streamSize} pixels</p>
+      {props.media && (props.media.pictures > 0 || props.media.canvasWidth > 0) && (
+        <p className="text-tertiary">
+          {props.media.canvasWidth > 0
+            ? `The Mac is sending ${props.media.canvasWidth}×${props.media.canvasHeight}`
+            : "The Mac has not answered the offer yet"}
+          {props.media.tiles > 1 ? ` in ${props.media.tiles} tiles` : ""}.
+          {props.media.pictures > 0 && ` ${props.media.pictures} pictures`}
+          {props.media.lost > 0 && `, ${props.media.lost} packets lost`}
+          {props.media.recoveries > 0 && `, ${props.media.recoveries} recoveries`}
+        </p>
+      )}
       <div>
         <strong>Stream size</strong>
         <p className="mt-1 text-secondary">Ask the Mac to render and stream at a smaller resolution, over the live session. This is the Apple Remote Desktop approach; the layout the Mac confirms is what you get.</p>
