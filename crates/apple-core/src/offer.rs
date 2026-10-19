@@ -34,6 +34,15 @@ pub fn media_offer() -> (Vec<u8>, [u8; 46], [u8; 46]) {
     buf[2..4].copy_from_slice(&ms.to_be_bytes());
     buf[4..6].copy_from_slice(&3u16.to_be_bytes());
     // 60 fps on both tiers, and do not bake the cursor into the picture.
+    //
+    // BIG ENDIAN, and that is deliberate. The protocol notes describe this
+    // word as host-endian, and "correcting" it to little-endian is a trap
+    // that has been walked into before: the host loads the word
+    // un-byteswapped and hands it to the streaming agent, where the byte
+    // order is the other way round. Big-endian `00 00 00 07` is what makes
+    // the host honour "do not send the cursor in the picture". With
+    // little-endian the cursor is baked into the video and the viewer
+    // draws a second one on top of it.
     buf[6..10].copy_from_slice(&7u32.to_be_bytes());
     buf[10..12].copy_from_slice(&(audio.len() as u16).to_be_bytes());
     buf[12..14].copy_from_slice(&(video.len() as u16).to_be_bytes());

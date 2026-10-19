@@ -226,13 +226,17 @@ A steady-state rekey constructs a new `RecordLayer`, resetting both counters to 
 
 **Fix:** explicit key/IV rotation preserving verified counter semantics, generation validation, and independent direction state. Add synthetic multi-rekey vectors and a controlled-host capture before claiming this fixed.
 
-### P1-12 — Correct the media-offer flags byte order and verify effective negotiation
+### P1-12 — Media-offer flags: no change needed, and the note in the reference document is a trap
 
-**Confirmed against documented field layout.** `crates/apple-core/src/offer.rs:32-33`; reference §10.3.
+**Resolved by evidence: the byte order in the code is right.** `crates/apple-core/src/offer.rs`; reference §10.3; `iShareScreen/src/isharescreen/proxy/protocol/negotiation.py`.
 
-The flags word is serialized with `7u32.to_be_bytes()`. The documented host/little-endian flags are `07 00 00 00`, not `00 00 00 07`. The meaningful 60-fps/cursor bits are therefore not where the server expects them. Comments claiming 60 fps and cursor suppression are not evidence those options took effect.
+This finding originally said the flags word had to be little-endian, because the reference document describes it as host-endian and shows `07 00 00 00`. That is the trap. The reference implementation says so in as many words, and records the experiment:
 
-**Fix:** named field-specific serialization and byte-level vectors, with flags appropriate to the actual one-video offer. Parse/validate enough of the answer and effective media state to establish acceptance. Verify cadence and cursor behavior after the fix; do not claim all intended flags already work.
+> "BIG-endian u32. DO NOT 'correct' this to little-endian on the strength of the host's framebuffer-config read alone — that is a trap. … Empirically: big-endian `00 00 00 07` makes the host honor do_not_send_cursor; little-endian `07 00 00 00` leaves it clear and the host bakes the cursor into the video → the double-cursor regression returns. The runtime behavior is authoritative."
+
+The code already writes big-endian `00 00 00 07`, which is the same value the reference sends on the standard path (`config_flags = 3` plus the cursor bit). **Nothing is changed.** A comment now says so at the line itself, so the next reader does not "fix" it.
+
+What is still worth doing: parse enough of the `0x1c` answer to know that the offer was accepted, and report the effective media state (cadence, tile count) rather than assuming it.
 
 ### P1-13 — Model offer/answer and key epochs across encoder restarts
 
