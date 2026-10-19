@@ -96,7 +96,7 @@ export function MacDisplayControls(props: {
       </div>}
       <div>
         <strong>Remote desktop size (experimental)</strong>
-        <p className="mt-1 text-secondary">These manual requests can change the desktop&apos;s logical size and rearrange windows. They are not physical-panel mode controls.</p>
+        <p className="mt-1 text-secondary">These requests change how many pixels are streamed. They keep the Mac desktop&apos;s point size, so windows stay where they are. They are not physical-panel mode controls.</p>
         <div className="mt-2 flex flex-wrap gap-2">
           {native && <>
             <button className="rounded border border-subtle px-2 py-1" onClick={() => props.onStreamResize(native.w, native.h)}>Native ({native.w}×{native.h})</button>
