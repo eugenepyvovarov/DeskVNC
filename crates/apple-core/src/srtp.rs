@@ -247,6 +247,9 @@ pub struct Rtp {
 /// The mirror of [`SrtpContext`], and the reason the media path can be
 /// tested end to end: a packet that goes out of here is a packet the
 /// receiver can authenticate and decrypt.
+// The sending half of the media path. The viewer only receives media, so
+// this is here for the tests that drive a whole stream through the wire.
+#[allow(dead_code)]
 #[derive(Clone)]
 pub struct SrtpEncryptor {
     cipher_key: [u8; 32],
@@ -256,6 +259,7 @@ pub struct SrtpEncryptor {
     index: u64,
 }
 
+#[allow(dead_code)]
 impl SrtpEncryptor {
     pub fn from_blob(blob: &[u8]) -> Option<Self> {
         if blob.len() != 46 {

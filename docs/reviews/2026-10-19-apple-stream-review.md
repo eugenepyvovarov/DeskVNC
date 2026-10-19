@@ -91,17 +91,27 @@ done since, and what still needs a live Mac to settle.
 | P1-10 control parsing | **Fixed.** The rectangles are walked, and the layout and the rekey are found wherever they are. |
 | P1-11 rekey counters | **Fixed.** A rekey changes the key and the IV; the counters belong to the session. |
 | P1-12 offer flags | **No change needed.** The code was already right, and the note in the protocol document is a trap. |
-| P1-13 offer and answer | **Partly.** The offer and answer still share one key pair, and the answer is still not parsed. |
+| P1-13 offer and answer | **Done.** The answer is read: a binary property list with the media description in it, and the description says the canvas the encoder settled on and how many tiles it is using. An answer with an empty canvas means the Mac's encoder is still warming up, and the offer is asked again. |
 | P1-14 supervisor | **Fixed.** A dropped connection comes back, "reconnect now" works, and a dead video receiver ends the session instead of hiding it. |
 | P1-15 display controls | **Fixed.** The work is off the input path, listing modes no longer resizes the picture, and an orderly disconnect restores the panel. |
 | P1-16 authentication | **Partly.** The server's proof is now checked, the sign-in has a deadline, and the group is checked. The proof's exact shape is still unconfirmed against a live Mac, so a mismatch is reported rather than fatal. |
 | P1-17 input contracts | **Fixed.** Held keys and buttons are released, view-only sends nothing, and the agent's intents are refused with a reason. |
-| P1-18 sizes and baselines | **Partly.** The bounds are one rule for every entry point, and the presets ask for even dimensions. The original mode is still the session's first geometry rather than a saved mode. |
-| P2-19 measurement | **Partly.** The stream's health is counted and logged. The counts are not on the screen yet. |
-| P2-20 UDP buffers | **Open.** |
-| P2-21 decoder backlog | **Open.** |
-| P2-22 the interface | **Partly.** The Mac's quality menu says what it does. The statistics are not on the screen yet. |
-| P2-23 regression coverage | **Partly.** The protocol, the renderer and the session rules have tests. There is still no fake server to drive a whole session. |
+| P1-18 sizes and baselines | **Done.** The bounds are one rule for every entry point, the presets ask for even dimensions, and the baseline is the Mac's own geometry from its first layout rather than the canvas the caller asked for. The presets are measured against it. |
+| P2-19 measurement | **Done.** The stream's health is counted, logged, and on the screen: the canvas the Mac is sending, the pictures decoded, the packets lost, the recoveries, the decoder's queue and how far behind it is. |
+| P2-20 UDP buffers | **Done.** The sockets are bound before the offer goes out, they ask for a four megabyte receive buffer and say what they got, only the Mac's own packets are read, the pictures go through a queue so the receiver never stops reading the socket, and the ports are options with a clear error when they are taken. |
+| P2-21 decoder backlog | **Partly.** The decoder's queue and the delay from the wire to the picture are measured and shown. The NV12 upload is still a copy rather than a zero-copy path, which WebKit does not offer. |
+| P2-22 the interface | **Done.** The Mac's quality menu says what it does, the stream size buttons keep the shape of the screen, and the media numbers are in the Mac panel. |
+| P2-23 regression coverage | **Partly.** The protocol, the renderer and the session rules have tests, and a whole media stream is driven through the real SRTP protection and the real assembler. A fake *server* is still missing: the sign-in needs a server side of the SRP exchange, and the two sides' key derivations do not agree in an independent implementation of the textbook formulas, so a fake server cannot be written from the specification alone. The live Mac's server does agree with our client, which is the only reason the sign-in works. |
+
+**Two things are worth knowing about the sign-in.** The server accepted our
+client proof, and that proof contains the session key, so the Mac's key and
+ours are the same. The Mac's proof is therefore checked against ours, and a
+mismatch is reported rather than fatal until a live session has confirmed
+the framing. Separately, an independent implementation of the textbook
+server formula does not produce the same key as our client, so the two
+sides' derivations do not agree in the abstract: the live Mac is the
+authority here, and a fake server cannot be written from the specification
+alone.
 
 **The mouse offset in a scaled window is explained.** The pointer mapping
 is the exact inverse of the drawing: a new test puts points on the screen,
