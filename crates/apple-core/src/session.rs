@@ -112,18 +112,18 @@ async fn request_keyframe(
     ctrl_dest: &str,
     last: &mut Instant,
     requests: &std::sync::atomic::AtomicU64,
-) {
+) -> bool {
     // Requests are rate limited. A burst of loss would otherwise turn into
     // a burst of requests, which the Mac answers with a burst of full
     // pictures.
     if last.elapsed() < KEYFRAME_REQUEST_INTERVAL {
-        return;
+        return false;
     }
     *last = Instant::now();
     let Some(encryptor) = feedback.as_mut() else {
-        return;
+        return false;
     };
-    let Some(socket) = ctrl else { return };
+    let Some(socket) = ctrl else { return false };
     let packet = crate::rtcp::compound(
         sender,
         &[
@@ -134,13 +134,15 @@ async fn request_keyframe(
         .concat(),
     );
     let Some(protected) = encryptor.protect(&packet) else {
-        return;
+        return false;
     };
     if socket.send_to(&protected, ctrl_dest).await.is_err() {
         tracing::warn!("the keyframe request could not be sent");
+        false
     } else {
         tracing::info!(media, "asked the Mac for a fresh picture");
         requests.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        true
     }
 }
 
@@ -260,6 +262,19 @@ const KEYFRAME_REQUEST_INTERVAL: Duration = Duration::from_millis(500);
 /// a flood of full pictures: the flood is what turns a slow client into a
 /// stalled one.
 const BACKLOG_REQUEST_INTERVAL: Duration = Duration::from_secs(1);
+/// When the toolbar's continuous recovery option is enabled, ask the Mac for
+/// an independent picture at this interval rather than polling framebuffer
+/// updates over the control connection.
+const ALWAYS_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
+/// A quiet video stream needs recovery even when no later packet arrives to
+/// report a sequence gap.
+const SILENT_STREAM_TIMEOUT: Duration = Duration::from_secs(2);
+
+#[derive(Debug, Clone, Copy)]
+enum VideoRequest {
+    FreshPicture,
+    AlwaysRefresh(bool),
+}
 
 /// A resize round.
 ///
@@ -415,54 +430,22 @@ async fn request_resize(
     }
 }
 
-/// The round trip to the Mac, measured on the RTCP path.
-///
-/// The Mac sends its own RTCP on a schedule of its own, so a sample taken
-/// between one of our packets and the next of the Mac's is the round trip
-/// plus the gap until its next report. The smallest sample in a window is
-/// the closest to the truth, and it is the one that is reported.
-#[derive(Default)]
-struct RttEstimator {
-    /// When we last sent a packet, if we are waiting for the Mac's answer.
-    waiting: Option<Instant>,
-    /// The samples in the window, oldest first.
-    samples: std::collections::VecDeque<f32>,
-}
-
-impl RttEstimator {
-    /// We have sent a packet; the Mac's next one ends the wait.
-    fn sent(&mut self, now: Instant) {
-        self.waiting = Some(now);
+/// Take the next queued picture, or sleep until the producer has one.
+/// The lock is released before waiting, so the producer can queue and wake.
+async fn next_picture(
+    buffer: &tokio::sync::Mutex<crate::pictures::PictureBuffer>,
+    wake: &mut mpsc::Receiver<()>,
+) -> Option<crate::h264::AccessUnit> {
+    let mut buffer_guard = buffer.lock().await;
+    if let Some(unit) = buffer_guard.pop() {
+        return Some(unit);
     }
-
-    /// The Mac answered. The sample is recorded; the estimate is
-    /// [`RttEstimator::best`].
-    fn answered(&mut self, now: Instant) -> Option<f32> {
-        let sent = self.waiting.take()?;
-        let sample = now.duration_since(sent).as_secs_f32() * 1000.0;
-        if sample > 0.0 && sample < 10_000.0 {
-            self.samples.push_back(sample);
-            while self.samples.len() > 32 {
-                self.samples.pop_front();
-            }
-            Some(sample)
-        } else {
-            None
-        }
+    if buffer_guard.is_broken() && buffer_guard.len() > 0 {
+        tracing::info!("the picture chain was broken; waiting for an independent picture");
     }
-
-    /// The best estimate so far: the smallest sample in the window.
-    fn best(&self) -> Option<f32> {
-        self.samples
-            .iter()
-            .copied()
-            .fold(None, |best: Option<f32>, sample| {
-                Some(match best {
-                    None => sample,
-                    Some(current) => current.min(sample),
-                })
-            })
-    }
+    drop(buffer_guard);
+    wake.recv().await?;
+    None
 }
 
 /// The counters the video receiver keeps and the control loop reads.
@@ -1029,17 +1012,12 @@ async fn connect(
     let mut held: Held = Held::default();
     // A view-only session sends no input at all.
     let mut view_only = false;
-    // Ask for a fresh frame every tick, for servers whose damage tracking
-    // cannot be trusted.
-    let mut always_refresh = false;
     // Re-offer counter and assembly-progress signal. This is NOT an
     // authenticated encoder epoch or a renderer presentation acknowledgement.
     let generation = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1));
     let picture_generation = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let video_generation = generation.clone();
     // The round trip to the Mac, in milliseconds, measured on the RTCP path.
-    let video_rtt = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
-    let rtt_value = video_rtt.clone();
     let video_picture_generation = picture_generation.clone();
     // A periodic tick, so a round can be finished, timed out or reported
     // without waiting for the next thing to happen on the wire.
@@ -1075,27 +1053,15 @@ async fn connect(
     // holding the lock the producer needs, and without missing one that
     // arrives between the check and the wait.
     let (picture_wake_tx, mut picture_wake_rx) = mpsc::channel::<()>(1);
+    let (video_request_tx, mut video_request_rx) = mpsc::unbounded_channel::<VideoRequest>();
     let picture_events = events.clone();
     let picture_dimensions = video_dimensions.clone();
     let consumer_buffer = picture_buffer.clone();
     let picture_task = tokio::spawn(async move {
         let mut pictures = 0u32;
         loop {
-            let unit = {
-                let mut buffer = consumer_buffer.lock().await;
-                buffer.pop()
-            };
-            let Some(unit) = unit else {
-                // Nothing to hand over: either the buffer is empty or the
-                // chain is broken and an independent picture has not arrived
-                // yet. Wait for the next one.
-                let buffer = consumer_buffer.lock().await;
-                if buffer.is_broken() && buffer.len() > 0 {
-                    tracing::info!(
-                        "the picture chain was broken; waiting for an independent picture"
-                    );
-                }
-                if picture_wake_rx.recv().await.is_none() {
+            let Some(unit) = next_picture(&consumer_buffer, &mut picture_wake_rx).await else {
+                if picture_wake_rx.is_closed() {
                     break;
                 }
                 continue;
@@ -1138,10 +1104,12 @@ async fn connect(
             let mut chain_broken = false;
             // When the last request for an independent picture went out.
             let mut last_backlog_request = Instant::now() - BACKLOG_REQUEST_INTERVAL;
+            let mut always_refresh = false;
+            let mut last_always_refresh = Instant::now() - ALWAYS_REFRESH_INTERVAL;
+            let mut last_silence_request = Instant::now() - SILENT_STREAM_TIMEOUT;
             // Packets from somewhere other than the Mac.
             let mut stray = 0u64;
             // The round trip to the Mac, measured on the RTCP path.
-            let mut rtt = RttEstimator::default();
             // When the last report went out.
             let mut last_report = Instant::now() - Duration::from_secs(2);
             loop {
@@ -1154,39 +1122,88 @@ async fn connect(
                         }
                         continue;
                     }
+                    request = video_request_rx.recv() => {
+                        match request {
+                            Some(VideoRequest::FreshPicture) => {
+                                if let Some(ssrc) = streams.active() {
+                                    request_keyframe(
+                                        &mut feedback,
+                                        feedback_ssrc,
+                                        ssrc,
+                                        ctrl.as_ref(),
+                                        &ctrl_dest,
+                                        &mut last_request,
+                                        &video_counters.requests,
+                                    ).await;
+                                } else {
+                                    tracing::debug!("fresh-picture request ignored before a video stream is active");
+                                }
+                            }
+                            Some(VideoRequest::AlwaysRefresh(enabled)) => {
+                                always_refresh = enabled;
+                                last_always_refresh = Instant::now() - ALWAYS_REFRESH_INTERVAL;
+                                tracing::info!(enabled, "periodic fresh-picture requests toggled");
+                            }
+                            None => break,
+                        }
+                        continue;
+                    }
                     _ = flush_tick.tick() => {
-                        // The Mac wants to hear from us, and its answer is
-                        // how the round trip is measured. A report goes out
-                        // every second.
+                        // Keep sending receiver reports so the Mac has
+                        // feedback on the media stream.
                         if last_report.elapsed() >= Duration::from_secs(1) {
                             last_report = Instant::now();
-                            if let Some(encryptor) = feedback.as_mut() {
+                            if let (Some(encryptor), Some(socket)) = (feedback.as_mut(), ctrl.as_ref()) {
                                 let packet = crate::rtcp::compound(feedback_ssrc, &[]);
                                 if let Some(protected) = encryptor.protect(&packet) {
-                                    if let Some(socket) = ctrl.as_ref() {
-                                        if socket.send_to(&protected, &ctrl_dest).await.is_ok() {
-                                            rtt.sent(Instant::now());
-                                        }
-                                    }
+                                    let _ = socket.send_to(&protected, &ctrl_dest).await;
                                 }
                             }
                         }
-                        // A client that cannot keep up has broken the
-                        // reference chain. The buffer waits for an
-                        // independent picture, and one is asked for at most
-                        // once a second: often enough to recover quickly,
-                        // rarely enough not to flood the Mac with work
-                        // while it is already busy.
+                        // A silent stream is also recoverable: unlike a
+                        // sequence gap, it may never send another packet to
+                        // trigger the loss path. Ask for an independent
+                        // picture after two seconds without a complete one.
+                        let now = Instant::now();
+                        if streams.active_picture_stalled(now, SILENT_STREAM_TIMEOUT)
+                            && last_silence_request.elapsed() >= SILENT_STREAM_TIMEOUT
+                        {
+                            last_silence_request = now;
+                            if let Some(ssrc) = streams.active() {
+                                if request_keyframe(
+                                    &mut feedback,
+                                    feedback_ssrc,
+                                    ssrc,
+                                    ctrl.as_ref(),
+                                    &ctrl_dest,
+                                    &mut last_request,
+                                    &video_counters.requests,
+                                ).await {
+                                    video_counters.recoveries.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                }
+                            }
+                        }
+                        if always_refresh && last_always_refresh.elapsed() >= ALWAYS_REFRESH_INTERVAL {
+                            last_always_refresh = now;
+                            if let Some(ssrc) = streams.active() {
+                                request_keyframe(
+                                    &mut feedback,
+                                    feedback_ssrc,
+                                    ssrc,
+                                    ctrl.as_ref(),
+                                    &ctrl_dest,
+                                    &mut last_request,
+                                    &video_counters.requests,
+                                ).await;
+                            }
+                        }
                         if should_ask_for_backlog_picture(
                             chain_broken,
                             last_backlog_request.elapsed(),
                         ) {
                             last_backlog_request = Instant::now();
                             if let Some(ssrc) = streams.active() {
-                                video_counters
-                                    .recoveries
-                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                request_keyframe(
+                                let requested = request_keyframe(
                                     &mut feedback,
                                     feedback_ssrc,
                                     ssrc,
@@ -1196,6 +1213,9 @@ async fn connect(
                                     &video_counters.requests,
                                 )
                                 .await;
+                                if requested {
+                                    video_counters.recoveries.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                }
                             }
                         }
                         // Flush candidates as well as the active stream,
@@ -1225,14 +1245,12 @@ async fn connect(
                             None => std::future::pending().await,
                         }
                     } => {
-                        // The Mac's RTCP is the answer to our last report,
-                        // and the gap between the two is the round trip.
+                        // RTCP traffic is not a correlated reply to our
+                        // report. Consume it, but do not present its arrival
+                        // delay as network RTT.
                         if let Ok(n) = r {
-                            if crate::rtcp::is_rtcp(&cbuf[..n]) {
-                                rtt.answered(Instant::now());
-                                if let Some(best) = rtt.best() {
-                                    rtt_value.store(best.to_bits(), std::sync::atomic::Ordering::Relaxed);
-                                }
+                            if !crate::rtcp::is_rtcp(&cbuf[..n]) {
+                                tracing::debug!("a non-RTCP datagram arrived on the feedback socket");
                             }
                         }
                         continue;
@@ -1334,9 +1352,6 @@ async fn connect(
                     video_counters
                         .lost
                         .store(stats.lost_packets, std::sync::atomic::Ordering::Relaxed);
-                    video_counters
-                        .recoveries
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     // Ask for the packets that went missing, and for a
                     // fresh picture: the missing ones may come back, and
                     // the fresh one is what repairs the reference chain
@@ -1351,7 +1366,7 @@ async fn connect(
                         &ctrl_dest,
                     )
                     .await;
-                    request_keyframe(
+                    if request_keyframe(
                         &mut feedback,
                         feedback_ssrc,
                         ssrc,
@@ -1360,7 +1375,12 @@ async fn connect(
                         &mut last_request,
                         &video_counters.requests,
                     )
-                    .await;
+                    .await
+                    {
+                        video_counters
+                            .recoveries
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
                 }
                 // Report on the stream's health, so a picture that is going
                 // wrong is visible in the log instead of being guessed at.
@@ -1439,8 +1459,7 @@ async fn connect(
                         tracing::info!(enabled = on, "view-only toggled");
                     }
                     Some(ClientCommand::SetAlwaysRefresh(on)) => {
-                        always_refresh = on;
-                        tracing::info!(enabled = on, "always-refresh toggled");
+                        let _ = video_request_tx.send(VideoRequest::AlwaysRefresh(on));
                     }
                     Some(ClientCommand::SetPreferScancodes(_)) => {
                         // The Apple path always sends keysyms, so the remote
@@ -1466,7 +1485,10 @@ async fn connect(
                         .await.ok();
                     }
                     Some(ClientCommand::Refresh) => {
-                        session.send_body(&framebuffer_request(session.width, session.height)).await?;
+                        // The Apple picture is an H.264 stream over UDP. A
+                        // framebuffer request over TCP does not ask that
+                        // encoder for a clean independent picture.
+                        let _ = video_request_tx.send(VideoRequest::FreshPicture);
                     }
                     Some(ClientCommand::SetQuality(preset)) => {
                         // Apple Remote Desktop's lever: the preset picks the
@@ -1697,18 +1719,9 @@ async fn connect(
                 // The media state is reported every few seconds: how many
                 // access units have been assembled, how many packets went missing,
                 // and how many times the picture was asked for again.
-                // The statistics the status panel shows. The round trip is
-                // the one the Mac's own RTCP gives us.
-                let rtt_ms = f32::from_bits(video_rtt.load(std::sync::atomic::Ordering::Relaxed));
-                let stats = remote_core::SessionStats {
-                    rtt_ms,
-                    rtt_source: if rtt_ms > 0.0 {
-                        remote_core::stats::RttSource::Rtcp
-                    } else {
-                        remote_core::stats::RttSource::None
-                    },
-                    ..Default::default()
-                };
+                // Apple SRTP does not yet give us a correlated RTT sample.
+                // Do not report an RTCP arrival delay as network RTT.
+                let stats = remote_core::SessionStats::default();
                 emit(events, SessionEvent::Stats(stats)).await.ok();
                 media_state.pictures = counters.pictures.load(std::sync::atomic::Ordering::Relaxed);
                 media_state.lost = counters.lost.load(std::sync::atomic::Ordering::Relaxed);
@@ -1725,12 +1738,6 @@ async fn connect(
                 if video_task.is_finished() {
                     tracing::warn!("the video receiver stopped; the session will be restarted");
                     break;
-                }
-                if always_refresh {
-                    // The escape hatch for a server that does not report
-                    // what changed. It costs the whole desktop in bandwidth
-                    // every second, so it is off unless it is asked for.
-                    session.send_body(&framebuffer_request(session.width, session.height)).await?;
                 }
                 // Finish, report or time out a resize round.
                 if round.in_flight {
@@ -2297,30 +2304,36 @@ mod tests {
     use super::*;
     use crate::srtp::SrtpEncryptor;
 
-    #[test]
-    fn the_round_trip_is_the_smallest_sample_in_the_window() {
-        // The Mac reports on a schedule of its own, so a sample is the round
-        // trip plus the gap until its next report. The smallest sample is
-        // the one closest to the truth.
-        let start = Instant::now();
-        let mut rtt = RttEstimator::default();
-        // A report goes out, and the Mac answers 40 ms later: the link is
-        // slow.
-        rtt.sent(start);
-        assert_eq!(rtt.answered(start + Duration::from_millis(40)), Some(40.0));
-        // The next report is answered 120 ms later, because the Mac's
-        // reporting gap was long that time.
-        rtt.sent(start);
-        assert_eq!(
-            rtt.answered(start + Duration::from_millis(120)),
-            Some(120.0)
-        );
-        // The best estimate is the smallest of them.
-        assert_eq!(rtt.best(), Some(40.0));
-        // And an answer with no report to answer is not a sample.
-        let mut fresh = RttEstimator::default();
-        assert_eq!(fresh.answered(start), None);
-        assert_eq!(fresh.best(), None);
+    #[tokio::test]
+    async fn picture_consumer_releases_buffer_lock_while_waiting_for_wakeup() {
+        let buffer = std::sync::Arc::new(tokio::sync::Mutex::new(
+            crate::pictures::PictureBuffer::default(),
+        ));
+        let (wake_tx, mut wake_rx) = mpsc::channel(1);
+        let consumer_buffer = buffer.clone();
+        let consumer = tokio::spawn(async move {
+            loop {
+                if let Some(unit) = next_picture(&consumer_buffer, &mut wake_rx).await {
+                    break unit;
+                }
+            }
+        });
+        tokio::task::yield_now().await;
+
+        // A producer must be able to acquire the lock while the consumer is
+        // asleep, queue a frame, and wake it.
+        {
+            let mut queued = tokio::time::timeout(Duration::from_millis(100), buffer.lock())
+                .await
+                .expect("the sleeping consumer held the buffer lock");
+            queued.push(crate::h264::AccessUnit {
+                annex_b: vec![0, 0, 0, 1, 0x65],
+                keyframe: true,
+                reset: true,
+            });
+        }
+        wake_tx.send(()).await.expect("the consumer is waiting");
+        assert!(consumer.await.unwrap().keyframe);
     }
 
     #[test]

@@ -746,7 +746,10 @@ export function SessionToolbar(props: SessionToolbarProps): ReactNode {
           <IconCamera size={15} />
         </ToolButton>
 
-        <ToolButton label="Request full screen refresh" onClick={props.onRefresh}>
+        <ToolButton
+          label={props.protocol === "apple" ? "Request a clean picture" : "Request full screen refresh"}
+          onClick={props.onRefresh}
+        >
           <IconRefresh size={15} />
         </ToolButton>
 
@@ -1013,12 +1016,12 @@ export function SessionToolbar(props: SessionToolbarProps): ReactNode {
                     selected={props.alwaysRefresh}
                     onClick={() => props.onAlwaysRefresh(!props.alwaysRefresh)}
                   >
-                    Always request fresh frames
+                    {props.protocol === "apple" ? "Keep requesting clean pictures" : "Always request fresh frames"}
                   </MenuRow>
                   <p className="px-2.5 pb-1 text-2xs text-tertiary">
-                    Re-fetches the whole screen every second instead of trusting the
-                    server to report what changed. Fixes a picture that stays stale
-                    or smeared; uses more bandwidth.
+                    {props.protocol === "apple"
+                      ? "Asks the Mac for an independent H.264 picture every few seconds. Can clear persistent artifacts, but uses more bandwidth."
+                      : "Re-fetches the whole screen every second instead of trusting the server to report what changed. Fixes a picture that stays stale or smeared; uses more bandwidth."}
                   </p>
                 </div>
               )}

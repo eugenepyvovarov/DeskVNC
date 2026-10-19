@@ -53,6 +53,12 @@ impl VideoStreams {
     pub(crate) fn active(&self) -> Option<u32> {
         self.active
     }
+
+    /// Whether the active stream has stopped producing complete pictures.
+    pub(crate) fn active_picture_stalled(&self, now: Instant, threshold: Duration) -> bool {
+        self.active.is_some() && now.duration_since(self.last_picture) >= threshold
+    }
+
     pub(crate) fn authenticated(&self) -> u64 {
         self.authenticated
     }
@@ -194,6 +200,16 @@ mod tests {
             stap.extend_from_slice(nal);
         }
         stap
+    }
+
+    #[test]
+    fn an_active_stream_can_be_detected_as_stalled_without_new_packets() {
+        let now = Instant::now();
+        let mut rx = receiver();
+        assert!(!rx.active_picture_stalled(now, Duration::from_secs(2)));
+        assert_eq!(rx.push(&packet(10, 0, &key_picture()), 1, now).len(), 1);
+        assert!(!rx.active_picture_stalled(now, Duration::from_secs(2)));
+        assert!(rx.active_picture_stalled(now + Duration::from_secs(3), Duration::from_secs(2)));
     }
 
     #[test]
