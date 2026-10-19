@@ -2,6 +2,10 @@
 //!
 //! The 46-byte key blob is 32 bytes of master key and 14 bytes of master
 //! salt. Labels 0, 1 and 2 derive the SRTP cipher key, auth key and salt.
+//!
+//! One context holds the state of ONE SSRC. The rollover counter and the
+//! sequence space are per SSRC (RFC 3711 §3.3.1), so the driver keeps one
+//! context per stream and never mixes them.
 
 use aes::Aes256;
 use cipher::{BlockEncrypt, KeyInit};
@@ -10,13 +14,77 @@ use sha1::Sha1;
 
 type HmacSha1 = Hmac<Sha1>;
 
+/// How many packets the replay window remembers. RFC 3711 recommends 64.
+const REPLAY_WINDOW: u64 = 64;
+
+/// What the receiver has seen. Read by the session for reporting.
+#[derive(Default, Debug, Clone, Copy)]
+pub struct SrtpStats {
+    /// Packets that authenticated and were accepted.
+    pub accepted: u64,
+    /// Packets whose authentication tag did not verify.
+    pub rejected: u64,
+    /// Authenticated packets that had already been received.
+    pub replayed: u64,
+    /// Authenticated packets too old to be inside the replay window.
+    pub too_old: u64,
+    /// Packets that were not a well formed RTP packet.
+    pub malformed: u64,
+}
+
+/// The window of recently received packet indices.
+///
+/// A packet index is the 48 bit value RFC 3711 builds from the rollover
+/// counter and the 16 bit sequence number. The window remembers the last
+/// [`REPLAY_WINDOW`] indices, so a packet that arrives twice is refused the
+/// second time, and a packet that is too old to be new is refused as well.
+#[derive(Clone, Default)]
+struct ReplayWindow {
+    highest: Option<u64>,
+    seen: u64,
+}
+
+impl ReplayWindow {
+    /// Whether `index` is new. Records it when it is.
+    fn accept(&mut self, index: u64) -> bool {
+        match self.highest {
+            None => {
+                self.highest = Some(index);
+                self.seen = 1;
+                true
+            }
+            Some(high) if index > high => {
+                let shift = index - high;
+                self.seen = if shift >= REPLAY_WINDOW { 1 } else { (self.seen << shift) | 1 };
+                self.highest = Some(index);
+                true
+            }
+            Some(high) => {
+                let behind = high - index;
+                if behind >= REPLAY_WINDOW {
+                    return false;
+                }
+                let bit = 1u64 << behind;
+                if self.seen & bit != 0 {
+                    return false;
+                }
+                self.seen |= bit;
+                true
+            }
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct SrtpContext {
     cipher_key: [u8; 32],
     auth_key: [u8; 20],
     salt: [u8; 14],
-    roc: u32,
-    last_seq: Option<u16>,
+    /// The highest packet index accepted so far. It carries the rollover
+    /// counter in its top bits, so the state can only ever move forward.
+    highest: Option<u64>,
+    replay: ReplayWindow,
+    pub stats: SrtpStats,
 }
 
 impl SrtpContext {
@@ -32,59 +100,132 @@ impl SrtpContext {
             cipher_key: derive(&master_key, &master_salt, 0, 32).try_into().ok()?,
             auth_key: derive(&master_key, &master_salt, 1, 20).try_into().ok()?,
             salt: derive(&master_key, &master_salt, 2, 14).try_into().ok()?,
-            roc: 0,
-            last_seq: None,
+            highest: None,
+            replay: ReplayWindow::default(),
+            stats: SrtpStats::default(),
         })
     }
 
-    /// Decrypt an SRTP packet in place's payload and return `(header+payload without tag, marker, seq, timestamp, ssrc, payload)`.
+    /// Verify and decrypt one SRTP packet.
+    ///
+    /// The authentication tag is checked before anything else is believed,
+    /// and the packet only touches the replay window once it has
+    /// authenticated. A forged packet therefore cannot make the receiver
+    /// treat a genuine packet as a replay.
     pub fn unprotect(&mut self, packet: &[u8]) -> Option<Rtp> {
         if packet.len() < 12 + 10 {
+            self.stats.malformed += 1;
+            return None;
+        }
+        if packet[0] >> 6 != 2 {
+            // Not RTP version 2.
+            self.stats.malformed += 1;
             return None;
         }
         let tag_at = packet.len() - 10;
+        let Some(header_len) = rtp_header_len(packet) else {
+            self.stats.malformed += 1;
+            return None;
+        };
+        if header_len > tag_at {
+            self.stats.malformed += 1;
+            return None;
+        }
+        let mut payload_end = tag_at;
+        if packet[0] & 0x20 != 0 {
+            // Padding: the last byte before the tag counts it.
+            let pad = packet[tag_at - 1] as usize;
+            if pad == 0 || pad > tag_at - header_len {
+                self.stats.malformed += 1;
+                return None;
+            }
+            payload_end -= pad;
+        }
         let seq = u16::from_be_bytes([packet[2], packet[3]]);
-        let roc = self.roc_for(seq);
-        let index = ((roc as u64) << 16) | (seq as u64);
-        let mut mac = <HmacSha1 as Mac>::new_from_slice(&self.auth_key).ok()?;
+        let ssrc = u32::from_be_bytes(packet[8..12].try_into().ok()?);
+        for roc in self.candidate_rocs(seq) {
+            let index = (u64::from(roc) << 16) | u64::from(seq);
+            if !self.authenticates(packet, tag_at, roc) {
+                continue;
+            }
+            // The packet is genuine. Now decide whether it is new.
+            if !self.replay.accept(index) {
+                if self.highest.is_some_and(|high| index + REPLAY_WINDOW <= high) {
+                    self.stats.too_old += 1;
+                } else {
+                    self.stats.replayed += 1;
+                }
+                return None;
+            }
+            let mut payload = packet[header_len..payload_end].to_vec();
+            let iv = packet_iv(&self.salt, ssrc, index);
+            apply_keystream(&self.cipher_key, &iv, &mut payload);
+            // The state only ever moves forward, so a packet that arrives
+            // late cannot rewind the rollover counter.
+            if self.highest.is_none_or(|high| index > high) {
+                self.highest = Some(index);
+            }
+            self.stats.accepted += 1;
+            return Some(Rtp {
+                marker: packet[1] & 0x80 != 0,
+                payload_type: packet[1] & 0x7f,
+                seq,
+                timestamp: u32::from_be_bytes(packet[4..8].try_into().ok()?),
+                ssrc,
+                payload,
+            });
+        }
+        self.stats.rejected += 1;
+        None
+    }
+
+    fn authenticates(&self, packet: &[u8], tag_at: usize, roc: u32) -> bool {
+        let mut mac = match <HmacSha1 as Mac>::new_from_slice(&self.auth_key) {
+            Ok(mac) => mac,
+            Err(_) => return false,
+        };
         mac.update(&packet[..tag_at]);
         mac.update(&roc.to_be_bytes());
         // SRTP authenticates with the LEFTMOST 80 bits, not the full SHA-1.
-        mac.verify_truncated_left(&packet[tag_at..]).ok()?;
-
-        let header_len = rtp_header_len(packet)?;
-        if header_len > tag_at {
-            return None;
-        }
-        let ssrc = u32::from_be_bytes(packet[8..12].try_into().ok()?);
-        let mut payload = packet[header_len..tag_at].to_vec();
-        let iv = packet_iv(&self.salt, ssrc, index);
-        apply_keystream(&self.cipher_key, &iv, &mut payload);
-        self.observe(seq);
-        Some(Rtp {
-            marker: packet[1] & 0x80 != 0,
-            payload_type: packet[1] & 0x7f,
-            seq,
-            timestamp: u32::from_be_bytes(packet[4..8].try_into().ok()?),
-            ssrc,
-            payload,
-        })
+        mac.verify_truncated_left(&packet[tag_at..]).is_ok()
     }
 
-    fn roc_for(&self, seq: u16) -> u32 {
-        match self.last_seq {
-            Some(prev) if prev > 0xc000 && seq < 0x4000 => self.roc.wrapping_add(1),
-            _ => self.roc,
-        }
-    }
-
-    fn observe(&mut self, seq: u16) {
-        if let Some(prev) = self.last_seq {
-            if prev > 0xc000 && seq < 0x4000 {
-                self.roc = self.roc.wrapping_add(1);
+    /// The rollover counters a packet could belong to.
+    ///
+    /// The receiver cannot know the rollover counter of a packet it has not
+    /// seen: a packet may be the first of the next cycle, or a late one from
+    /// the cycle before. The tag settles it, because the counter is part of
+    /// what is authenticated, so each candidate is tried in turn.
+    fn candidate_rocs(&self, seq: u16) -> Vec<u32> {
+        let (roc, s_l) = self.roc_and_seq();
+        let mut out = Vec::with_capacity(4);
+        for candidate in [roc, roc.wrapping_add(1), roc.wrapping_sub(1)] {
+            if !out.contains(&candidate) {
+                out.push(candidate);
             }
         }
-        self.last_seq = Some(seq);
+        // The RFC 3711 §3.3.1 estimate, offered first so the common case
+        // costs one authentication.
+        let ahead = seq.wrapping_sub(s_l);
+        let estimate = if s_l < 0x8000 {
+            if ahead > 0x8000 { roc.wrapping_sub(1) } else { roc }
+        } else if ahead > 0x8000 {
+            roc.wrapping_add(1)
+        } else {
+            roc
+        };
+        if !out.contains(&estimate) {
+            out.insert(0, estimate);
+        }
+        out
+    }
+
+    /// The rollover counter and highest sequence number seen so far.
+    fn roc_and_seq(&self) -> (u32, u16) {
+        match self.highest {
+            None => (0, 0),
+            Some(index) => ((index >> 16) as u32, (index & 0xffff) as u16),
+        }
     }
 }
 
@@ -93,7 +234,7 @@ pub struct Rtp {
     /// RTP payload type. Kept so a later pass can tell video from RTCP.
     #[allow(dead_code)]
     pub payload_type: u8,
-    #[allow(dead_code)]
+    /// The 16 bit sequence number. The depacketizer needs it to see a hole.
     pub seq: u16,
     pub timestamp: u32,
     #[allow(dead_code)]
@@ -104,6 +245,9 @@ pub struct Rtp {
 fn rtp_header_len(packet: &[u8]) -> Option<usize> {
     let cc = (packet[0] & 0x0f) as usize;
     let mut len = 12 + 4 * cc;
+    if len > packet.len() {
+        return None;
+    }
     if packet[0] & 0x10 != 0 {
         if packet.len() < len + 4 {
             return None;
@@ -177,6 +321,24 @@ fn apply_keystream(key: &[u8; 32], iv: &[u8; 16], payload: &mut [u8]) {
 mod tests {
     use super::*;
 
+    /// Build a genuine SRTP packet for a sequence number and rollover count.
+    fn packet(receiver: &SrtpContext, seq: u16, roc: u32, ssrc: u32) -> Vec<u8> {
+        let index = (u64::from(roc) << 16) | u64::from(seq);
+        let mut payload = vec![0x65, 1, 2, 3];
+        let iv = packet_iv(&receiver.salt, ssrc, index);
+        apply_keystream(&receiver.cipher_key, &iv, &mut payload);
+        let mut packet = vec![0x80, 0xe4];
+        packet.extend_from_slice(&seq.to_be_bytes());
+        packet.extend_from_slice(&9u32.to_be_bytes());
+        packet.extend_from_slice(&ssrc.to_be_bytes());
+        packet.extend(payload);
+        let mut mac = <HmacSha1 as Mac>::new_from_slice(&receiver.auth_key).unwrap();
+        mac.update(&packet);
+        mac.update(&roc.to_be_bytes());
+        packet.extend_from_slice(&mac.finalize().into_bytes()[..10]);
+        packet
+    }
+
     #[test]
     fn accepts_80_bit_tag_and_rejects_tampering() {
         let mut receiver = SrtpContext::from_blob(&[42; 46]).unwrap();
@@ -203,5 +365,82 @@ mod tests {
         assert_eq!(a.len(), 32);
         assert_eq!(b.len(), 20);
         assert_ne!(&a[..20], b.as_slice());
+    }
+
+    #[test]
+    fn an_authenticated_duplicate_is_rejected() {
+        let mut receiver = SrtpContext::from_blob(&[42; 46]).unwrap();
+        let p = packet(&receiver, 100, 0, 7);
+        assert!(receiver.unprotect(&p).is_some());
+        assert!(receiver.unprotect(&p).is_none(), "a duplicate was accepted");
+        assert_eq!(receiver.stats.replayed, 1);
+    }
+
+    #[test]
+    fn an_unseen_late_packet_from_the_previous_cycle_is_accepted() {
+        let mut receiver = SrtpContext::from_blob(&[42; 46]).unwrap();
+        assert!(receiver.unprotect(&packet(&receiver, 65534, 0, 7)).is_some());
+        assert!(receiver.unprotect(&packet(&receiver, 0, 1, 7)).is_some());
+        assert!(
+            receiver.unprotect(&packet(&receiver, 65535, 0, 7)).is_some(),
+            "a valid packet from the previous rollover cycle was rejected"
+        );
+    }
+
+    #[test]
+    fn an_old_replay_does_not_move_the_state_backwards() {
+        let mut receiver = SrtpContext::from_blob(&[42; 46]).unwrap();
+        let old = packet(&receiver, 20000, 0, 7);
+        assert!(receiver.unprotect(&old).is_some());
+        assert!(receiver.unprotect(&packet(&receiver, 65534, 0, 7)).is_some());
+        // The replay is refused and must not rewind the rollover counter.
+        assert!(receiver.unprotect(&old).is_none());
+        assert!(
+            receiver.unprotect(&packet(&receiver, 0, 1, 7)).is_some(),
+            "an old replay rewound the state and the next rollover failed"
+        );
+    }
+
+    #[test]
+    fn a_forged_packet_does_not_consume_a_replay_slot() {
+        let mut receiver = SrtpContext::from_blob(&[42; 46]).unwrap();
+        let genuine = packet(&receiver, 500, 0, 7);
+        let mut forged = genuine.clone();
+        forged[12] ^= 0xff;
+        assert!(receiver.unprotect(&forged).is_none());
+        // The genuine packet must still be accepted: a forged packet may not
+        // mark a sequence number as seen.
+        assert!(receiver.unprotect(&genuine).is_some());
+    }
+
+    #[test]
+    fn a_packet_that_is_not_rtp_version_two_is_rejected() {
+        let mut receiver = SrtpContext::from_blob(&[42; 46]).unwrap();
+        let mut p = packet(&receiver, 1, 0, 7);
+        p[0] = 0x40;
+        assert!(receiver.unprotect(&p).is_none());
+        assert_eq!(receiver.stats.malformed, 1);
+    }
+
+    #[test]
+    fn padding_is_removed_from_the_payload() {
+        let mut receiver = SrtpContext::from_blob(&[42; 46]).unwrap();
+        let index = 1u64;
+        let mut payload = vec![0x65, 1, 2, 3];
+        let iv = packet_iv(&receiver.salt, 7, index);
+        apply_keystream(&receiver.cipher_key, &iv, &mut payload);
+        // Three padding bytes, counted by the last one.
+        payload.extend([0xaa, 0xbb, 0x03]);
+        let mut p = vec![0x80 | 0x20, 0xe4];
+        p.extend_from_slice(&1u16.to_be_bytes());
+        p.extend_from_slice(&9u32.to_be_bytes());
+        p.extend_from_slice(&7u32.to_be_bytes());
+        p.extend(payload);
+        let mut mac = <HmacSha1 as Mac>::new_from_slice(&receiver.auth_key).unwrap();
+        mac.update(&p);
+        mac.update(&0u32.to_be_bytes());
+        p.extend_from_slice(&mac.finalize().into_bytes()[..10]);
+        let rtp = receiver.unprotect(&p).unwrap();
+        assert_eq!(rtp.payload, [0x65, 1, 2, 3]);
     }
 }

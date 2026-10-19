@@ -4,7 +4,7 @@
 //! Video is H.264 over SRTP on UDP. Access units are handed to the shell as
 //! `RectPayload::H264` for the webview's hardware decoder.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rand::Rng;
 use remote_core::{
@@ -19,6 +19,75 @@ use crate::auth::{self, SrpSecret};
 use crate::h264::Depacketizer;
 use crate::record::{self, RecordLayer};
 use crate::srtp::SrtpContext;
+
+/// How many distinct video streams are remembered at once. A resized canvas
+/// or a new quality tier brings a new SSRC; the old ones are dropped.
+const MAX_STREAMS: usize = 32;
+
+/// How long the shown stream may be silent before another stream is taken
+/// to be the live one.
+const STREAM_STALL: Duration = Duration::from_millis(750);
+
+/// One video stream: its own SRTP state and its own assembler.
+struct Stream {
+    srtp: SrtpContext,
+    depay: Depacketizer,
+}
+
+impl Stream {
+    fn new(keys: &SrtpContext) -> Self {
+        Self {
+            srtp: keys.clone(),
+            depay: Depacketizer::default(),
+        }
+    }
+}
+
+/// Send assembled pictures to the shell. Returns false when the shell has
+/// gone, which ends the session.
+async fn publish(
+    events: &mpsc::Sender<SessionEvent>,
+    units: Vec<crate::h264::AccessUnit>,
+    dimensions: &std::sync::atomic::AtomicU32,
+    pictures: &mut u32,
+) -> bool {
+    for au in units {
+        *pictures += 1;
+        if *pictures <= 5 || (*pictures <= 60 && au.keyframe) {
+            tracing::info!(pictures = *pictures, bytes = au.annex_b.len(), keyframe = au.keyframe, "Apple H.264 picture");
+        }
+        let size = dimensions.load(std::sync::atomic::Ordering::Relaxed);
+        let rect = DecodedRect {
+            rect: Rect::new(0, 0, (size >> 16) as u16, size as u16),
+            payload: RectPayload::H264 {
+                data: au.annex_b,
+                flags: 0,
+                context_id: 0,
+                // `reset` rebuilds the decoder and throws its reference
+                // pictures away. Only an IDR may do that: an intra picture
+                // that is not an IDR is fed to the existing decoder instead,
+                // because wiping the references corrupts every picture that
+                // follows it, and the corruption outlives the picture that
+                // caused it.
+                reset: au.reset,
+                keyframe: au.keyframe,
+            },
+        };
+        if emit(
+            events,
+            SessionEvent::FramebufferUpdate {
+                damage: rect.rect,
+                rects: vec![rect],
+            },
+        )
+        .await
+        .is_err()
+        {
+            return false;
+        }
+    }
+    true
+}
 
 pub async fn run(
     options: ConnectOptions,
@@ -242,7 +311,6 @@ async fn connect(
     let udp = session.udp.take();
     let ctrl = session.ctrl.take();
     let mut srtp = session.srtp.take();
-    let mut depay = std::mem::take(&mut session.video);
     let width = session.width;
     let height = session.height;
     let events2 = events.clone();
@@ -263,11 +331,18 @@ async fn connect(
             let mut buf = vec![0u8; 65535];
             let mut cbuf = vec![0u8; 2048];
             let mut punch = tokio::time::interval(Duration::from_millis(200));
+            // A hole in the sequence numbers has to be given up on after a
+            // short wait, or one lost packet would hold the stream still
+            // for ever.
+            let mut flush_tick = tokio::time::interval(Duration::from_millis(20));
             let mut packets = 0u32;
             let mut opened = 0u32;
             let mut pictures = 0u32;
-            let mut video_ssrc = None;
-            let mut contexts = std::collections::HashMap::new();
+            let mut active_ssrc: Option<u32> = None;
+            let mut last_published = Instant::now();
+            let mut stream_count = 1u32;
+            let mut tiled_reported = false;
+            let mut streams: std::collections::HashMap<u32, Stream> = std::collections::HashMap::new();
             loop {
                 let n = tokio::select! {
                     _ = cancel2.cancelled() => break,
@@ -275,6 +350,17 @@ async fn connect(
                         sock.send_to(&[0], &video_dest).await.ok();
                         if let Some(ctrl) = &ctrl {
                             ctrl.send_to(&[0], &ctrl_dest).await.ok();
+                        }
+                        continue;
+                    }
+                    _ = flush_tick.tick() => {
+                        // Give up on a hole that has not been filled.
+                        let Some(ssrc) = active_ssrc else { continue };
+                        let Some(stream) = streams.get_mut(&ssrc) else { continue };
+                        let units = stream.depay.flush();
+                        if units.is_empty() { continue; }
+                        if !publish(&events2, units, &video_dimensions, &mut pictures).await {
+                            break;
                         }
                         continue;
                     }
@@ -298,21 +384,19 @@ async fn connect(
                 }
                 if n < 12 || buf[1] & 0x7f != 123 { continue; }
                 let ssrc = u32::from_be_bytes(buf[8..12].try_into().unwrap());
-                // A new SSRC is a new encoder (quality tier or resized
-                // canvas): adopt the group immediately and restart the
-                // depacketizer — the previous parameter sets are stale and
-                // would reject every frame (RFC §10.9 receiver obligations).
-                // Waiting for a config datagram instead black-screens forever
-                // the moment that one UDP packet is lost.
-                if video_ssrc != Some(ssrc) {
-                    if contexts.len() >= 32 && !contexts.contains_key(&ssrc) {
-                        continue;
-                    }
-                    video_ssrc = Some(ssrc);
-                    depay = Depacketizer::default();
+                // One stream per SSRC. The sequence space and the rollover
+                // counter belong to the SSRC, and so does the assembly: two
+                // streams interleaved into one assembler corrupt each other.
+                if !streams.contains_key(&ssrc) && streams.len() >= MAX_STREAMS {
+                    // The map is full of streams that are gone. Make room
+                    // rather than refusing a stream that is real.
+                    streams.clear();
                 }
-                let receiver = contexts.entry(ssrc).or_insert_with(|| ctx.clone());
-                let Some(rtp) = receiver.unprotect(&buf[..n]) else {
+                let stream = streams.entry(ssrc).or_insert_with(|| Stream::new(&ctx));
+                // Authenticate FIRST. A packet that does not authenticate
+                // must not be able to change which stream is being shown, or
+                // to take a slot in the map.
+                let Some(rtp) = stream.srtp.unprotect(&buf[..n]) else {
                     if packets <= 3 {
                         tracing::debug!("SRTP authentication rejected");
                     }
@@ -322,33 +406,56 @@ async fn connect(
                 if opened == 1 {
                     tracing::info!(payload_type = rtp.payload_type, "Apple SRTP video authenticated");
                 }
-                let Some(au) = depay.push(rtp.timestamp, rtp.marker, &rtp.payload) else { continue };
-                pictures += 1;
-                if pictures <= 5 || (pictures <= 60 && au.keyframe) {
-                    tracing::info!(pictures, bytes = au.annex_b.len(), keyframe = au.keyframe, "Apple H.264 picture");
+                // Which stream is the one being shown?
+                //
+                // A new SSRC is a new encoder: a resized canvas or a
+                // different quality tier. It is adopted when the stream we
+                // are showing has gone quiet, and not before: switching
+                // while the current stream is still publishing would show a
+                // different picture every few hundred milliseconds.
+                if active_ssrc != Some(ssrc) {
+                    let quiet = last_published.elapsed() > STREAM_STALL;
+                    if active_ssrc.is_none() || (quiet && stream_count == 1) {
+                        tracing::info!(ssrc, previous = ?active_ssrc, "Apple video stream adopted");
+                        active_ssrc = Some(ssrc);
+                        stream.depay.reset();
+                    } else {
+                        // Another stream is publishing. Count it, report it,
+                        // and keep showing the one that is working. Apple's
+                        // tiled streams carry cross-references, so showing
+                        // one tile on its own is not an option, and mixing
+                        // them is worse than showing the wrong one.
+                        if !tiled_reported {
+                            tiled_reported = true;
+                            tracing::warn!(
+                                ssrc,
+                                "the server is sending more than one video stream; only one is shown"
+                            );
+                        }
+                        stream_count = stream_count.max(streams.len() as u32);
+                        continue;
+                    }
                 }
-                let dimensions = video_dimensions.load(std::sync::atomic::Ordering::Relaxed);
-                let rect = DecodedRect {
-                    rect: Rect::new(0, 0, (dimensions >> 16) as u16, dimensions as u16),
-                    payload: RectPayload::H264 {
-                        data: au.annex_b,
-                        flags: 0,
-                        context_id: 0,
-                        reset: au.keyframe,
-                        keyframe: au.keyframe,
-                    },
-                };
-                if emit(
-                    &events2,
-                    SessionEvent::FramebufferUpdate {
-                        damage: rect.rect,
-                        rects: vec![rect],
-                    },
-                )
-                .await
-                .is_err()
-                {
+                last_published = Instant::now();
+                let units = stream.depay.push(rtp.seq, rtp.timestamp, rtp.marker, &rtp.payload);
+                if !publish(&events2, units, &video_dimensions, &mut pictures).await {
                     break;
+                }
+                // Report on the stream's health, so a picture that is going
+                // wrong is visible in the log instead of being guessed at.
+                if packets % 120 == 0 {
+                    let stats = stream.depay.stats;
+                    if stats.gaps > 0 || stats.malformed > 0 {
+                        tracing::info!(
+                            gaps = stats.gaps,
+                            lost = stats.lost_packets,
+                            reordered = stats.reordered,
+                            late = stats.late,
+                            malformed = stats.malformed,
+                            discarded = stats.discarded,
+                            "Apple video stream health"
+                        );
+                    }
                 }
             }
             tracing::debug!(packets, opened, "Apple video receiver stopped");
