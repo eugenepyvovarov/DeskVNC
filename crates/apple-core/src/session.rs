@@ -254,7 +254,8 @@ async fn request_resize(
             Ok(())
         }
         ResizeAction::Send((w, h)) => {
-            session.send_body(&display_config(w, h)).await?;
+            let (lw, lh) = (session.logical_width, session.logical_height);
+            session.send_body(&display_config(w, h, lw, lh)).await?;
             tracing::info!(w, h, "Apple display resize requested");
             Ok(())
         }
@@ -636,6 +637,8 @@ async fn connect(
         layer,
         width: server_w,
         height: server_h,
+        logical_width: server_w,
+        logical_height: server_h,
         srtp: None,
         feedback: None,
         feedback_ssrc: 0,
@@ -1117,10 +1120,17 @@ async fn connect(
                     tracing::info!(send_seq, recv_seq, "Apple control layer rekeyed");
                 }
                 // AppleDisplayLayout (0x451): authoritative geometry (R-A15).
-                if let Some((_, (bw, bh))) = find_display_layout(&body) {
+                if let Some(((lw, lh), (bw, bh))) = find_display_layout(&body) {
                     let changed = (bw, bh) != (session.width, session.height);
                     session.width = bw;
                     session.height = bh;
+                    // The layout also says how big the desktop is in points.
+                    // On a retina display that is half the pixel size, and
+                    // it is what a quality change must leave alone.
+                    if lw > 0 && lh > 0 {
+                        session.logical_width = lw;
+                        session.logical_height = lh;
+                    }
                     media_dimensions.store((u32::from(bw) << 16) | u32::from(bh), std::sync::atomic::Ordering::Relaxed);
                     if changed {
                         emit(events, SessionEvent::DesktopResize { width: bw, height: bh }).await.ok();
@@ -1169,7 +1179,8 @@ async fn connect(
                         match finish_round(&mut round) {
                             RoundEnd::Send((w, h)) => {
                                 tracing::info!(w, h, "Apple queued resize sent");
-                                session.send_body(&display_config(w, h)).await?;
+                                let (lw, lh) = (session.logical_width, session.logical_height);
+                                session.send_body(&display_config(w, h, lw, lh)).await?;
                             }
                             RoundEnd::Done(clamped) => {
                                 tracing::info!("Apple resize round complete");
@@ -1218,8 +1229,14 @@ async fn connect(
 struct Live {
     tcp: TcpStream,
     layer: RecordLayer,
+    /// The picture size in pixels. This is what the decoder works in.
     width: u16,
     height: u16,
+    /// The size of the desktop in points. On a retina display this is half
+    /// the pixel size, and it is the size the person arranged their
+    /// windows at, so a quality change must not change it.
+    logical_width: u16,
+    logical_height: u16,
     srtp: Option<SrtpContext>,
     /// Encrypts the RTCP feedback we send back to the Mac.
     feedback: Option<SrtcpEncryptor>,
@@ -1309,15 +1326,21 @@ fn viewer_info() -> Vec<u8> {
 /// a five-entry mode table scaled to the request, and a flat 1× HiDPI ratio
 /// so `width`/`height` are streamed as-is (~¼ the pixels of a Retina table).
 /// A mid-session request is answered with `0x451` + a re-offered encoder.
-fn display_config(width: u16, height: u16) -> Vec<u8> {
+/// A display configuration for the Mac.
+///
+/// `width` and `height` are the PIXEL size the picture should be encoded
+/// at, and `logical_width` and `logical_height` are the size of the desktop
+/// in points. The two are separate on a retina display: a 3600x2338 panel
+/// is 1800x1169 points.
+///
+/// The mode table keeps the logical size and changes the pixel size. That
+/// is what makes a quality change a quality change: the desktop stays the
+/// size the person arranged it at, and only the number of pixels that
+/// arrive changes. A table that scaled the logical size with the pixel
+/// size would resize the desktop, and a window the person had arranged
+/// would move.
+fn display_config(width: u16, height: u16, logical_width: u16, logical_height: u16) -> Vec<u8> {
     const MODE_COUNT: usize = 5;
-    const NATIVE_MODES: [(u32, u32, u32, u32); MODE_COUNT] = [
-        (3840, 2160, 1920, 1080),
-        (2880, 1800, 1440, 900),
-        (3840, 2160, 1920, 1080),
-        (2880, 1620, 1440, 810),
-        (2624, 1696, 1312, 848),
-    ];
     let di_size = 0x9c + 28 * MODE_COUNT;
     // message_size counts from AFTER the size field (RFC §7.1): the front
     // matter past the 4-byte prefix is 8 bytes, then the descriptor.
@@ -1345,15 +1368,25 @@ fn display_config(width: u16, height: u16) -> Vec<u8> {
     m.extend_from_slice(&0u16.to_be_bytes()); // preferred_mode_index
     m.extend_from_slice(&7u32.to_be_bytes()); // rotations — native sends 7
     m.extend_from_slice(&(MODE_COUNT as u16).to_be_bytes());
-    let sx = f64::from(width) / 1920.0;
-    let sy = f64::from(height) / 1080.0;
-    for (_, _, sw, sh) in NATIVE_MODES {
-        let msw = (f64::from(sw) * sx + 0.5) as u32;
-        let msh = (f64::from(sh) * sy + 0.5) as u32;
-        m.extend_from_slice(&msw.to_be_bytes()); // pixel width (flat 1×)
-        m.extend_from_slice(&msh.to_be_bytes());
-        m.extend_from_slice(&msw.to_be_bytes()); // scaled width
-        m.extend_from_slice(&msh.to_be_bytes());
+    // The mode table: the same desktop, at a different pixel size. The
+    // first entry is the mode that is asked for; the others are the same
+    // desktop at the sizes the server may prefer.
+    let logical = (u32::from(logical_width).max(1), u32::from(logical_height).max(1));
+    let mut modes: Vec<(u32, u32)> = vec![(width as u32, height as u32)];
+    // A few smaller steps, so the server has something to choose from if it
+    // does not want the size that was asked for.
+    for step in [3u32, 2, 1] {
+        let w = u32::from(width) * step / 4;
+        let h = u32::from(height) * step / 4;
+        modes.push((w.max(2), h.max(2)));
+    }
+    modes.push((width as u32, height as u32));
+    debug_assert_eq!(modes.len(), MODE_COUNT);
+    for (mw, mh) in modes {
+        m.extend_from_slice(&mw.to_be_bytes()); // pixel width
+        m.extend_from_slice(&mh.to_be_bytes()); // pixel height
+        m.extend_from_slice(&logical.0.to_be_bytes()); // scaled width (points)
+        m.extend_from_slice(&logical.1.to_be_bytes()); // scaled height (points)
         m.extend_from_slice(&60f64.to_be_bytes());
         m.extend_from_slice(&0u32.to_be_bytes()); // mode flags
     }
@@ -1640,7 +1673,7 @@ mod tests {
         let mut live = Live {
             tcp,
             layer: RecordLayer::new([1; 16], [2; 16]),
-            width: 1, height: 1,
+            width: 1, height: 1, logical_width: 1, logical_height: 1,
             srtp: None, feedback: None, feedback_ssrc: 0,
             udp: None, ctrl: None,
             incoming: Vec::with_capacity(8192),
@@ -1679,7 +1712,7 @@ mod tests {
         let mut live = Live {
             tcp,
             layer: RecordLayer::new([1; 16], [2; 16]),
-            width: 1, height: 1,
+            width: 1, height: 1, logical_width: 1, logical_height: 1,
             srtp: None, feedback: None, feedback_ssrc: 0,
             udp: None, ctrl: None,
             incoming: Vec::with_capacity(8192),
@@ -1705,7 +1738,7 @@ mod tests {
 
     #[test]
     fn dynamic_display_config_matches_the_native_shape() {
-        let m = display_config(1920, 1080);
+        let m = display_config(1920, 1080, 1800, 1169);
         assert_eq!(m[0], 0x1d);
         let message_size = u16::from_be_bytes([m[2], m[3]]) as usize;
         assert_eq!(message_size, m.len() - 4);
@@ -1725,6 +1758,30 @@ mod tests {
         assert_eq!(u32::from_be_bytes(m[mode..mode + 4].try_into().unwrap()), 1920);
         assert_eq!(u32::from_be_bytes(m[mode + 4..mode + 8].try_into().unwrap()), 1080);
         assert_eq!(f64::from_be_bytes(m[mode + 16..mode + 24].try_into().unwrap()), 60.0);
+    }
+
+    #[test]
+    fn a_quality_change_keeps_the_desktop_the_size_it_was() {
+        // The mode table says how big the desktop is in points and how many
+        // pixels it is encoded at. A quality change must change the pixels
+        // and leave the points alone: a window the person arranged would
+        // otherwise move.
+        let m = display_config(2216, 1440, 1800, 1169);
+        let d = 12;
+        let mode = d + 0x9c;
+        for entry in 0..5 {
+            let at = mode + entry * 28;
+            let pixel_w = u32::from_be_bytes(m[at..at + 4].try_into().unwrap());
+            let pixel_h = u32::from_be_bytes(m[at + 4..at + 8].try_into().unwrap());
+            let scaled_w = u32::from_be_bytes(m[at + 8..at + 12].try_into().unwrap());
+            let scaled_h = u32::from_be_bytes(m[at + 12..at + 16].try_into().unwrap());
+            assert_eq!(scaled_w, 1800, "the desktop width moved");
+            assert_eq!(scaled_h, 1169, "the desktop height moved");
+            assert!(pixel_w > 0 && pixel_h > 0);
+        }
+        // And the first entry is the size that was asked for.
+        assert_eq!(u32::from_be_bytes(m[mode..mode + 4].try_into().unwrap()), 2216);
+        assert_eq!(u32::from_be_bytes(m[mode + 4..mode + 8].try_into().unwrap()), 1440);
     }
 
     #[test]
