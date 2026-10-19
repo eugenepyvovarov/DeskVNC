@@ -649,6 +649,9 @@ export class WebGLRenderer {
   private mediaDecoded = 0;
   /** A running average of the time from the wire to the picture. */
   private mediaLatencyMs = 0;
+  /** The size of the picture that came out of the decoder. */
+  private mediaPictureWidth = 0;
+  private mediaPictureHeight = 0;
   private continuousH264 = false;
   private latestVideo: { frame: VideoFrame; ctx: H264Context } | null = null;
 
@@ -947,6 +950,12 @@ export class WebGLRenderer {
     submitted: number;
     decoded: number;
     latencyMs: number;
+    /** The size of the picture that came out of the decoder. */
+    pictureWidth: number;
+    pictureHeight: number;
+    /** The size of the framebuffer the picture is drawn into. */
+    frameWidth: number;
+    frameHeight: number;
   } {
     let queued = 0;
     for (const ctx of this.h264.values()) {
@@ -957,6 +966,10 @@ export class WebGLRenderer {
       submitted: this.mediaSubmitted,
       decoded: this.mediaDecoded,
       latencyMs: Math.round(this.mediaLatencyMs),
+      pictureWidth: this.mediaPictureWidth,
+      pictureHeight: this.mediaPictureHeight,
+      frameWidth: this.fbWidth,
+      frameHeight: this.fbHeight,
     };
   }
 
@@ -1294,6 +1307,15 @@ export class WebGLRenderer {
           }
           ctx.outputSeen = true;
           this.mediaDecoded += 1;
+          const pictureWidth = frame.displayWidth || frame.codedWidth;
+          const pictureHeight = frame.displayHeight || frame.codedHeight;
+          if (pictureWidth !== this.mediaPictureWidth || pictureHeight !== this.mediaPictureHeight) {
+            this.mediaPictureWidth = pictureWidth;
+            this.mediaPictureHeight = pictureHeight;
+            console.warn(
+              `[render] the picture is ${pictureWidth}x${pictureHeight} and the framebuffer is ${this.fbWidth}x${this.fbHeight}`,
+            );
+          }
           // How long the picture took to come back. This is the number that
           // says whether the decoder is keeping up: a queue that grows is
           // a decoder that cannot keep up, and the picture is older than
@@ -1432,7 +1454,12 @@ export class WebGLRenderer {
       const off = new OffscreenCanvas(w, h);
       const c2d = off.getContext("2d");
       if (!c2d) return;
-      c2d.drawImage(frame, 0, 0, w, h, 0, 0, w, h);
+      // The whole picture is drawn into the place it goes, scaled to fit.
+      c2d.drawImage(
+        frame,
+        0, 0, frame.displayWidth || frame.codedWidth, frame.displayHeight || frame.codedHeight,
+        0, 0, w, h,
+      );
       const gl = this.gl;
       gl.bindTexture(gl.TEXTURE_2D, this.frameTex);
       gl.texSubImage2D(gl.TEXTURE_2D, 0, ctx.x, ctx.y, gl.RGBA, gl.UNSIGNED_BYTE, off);

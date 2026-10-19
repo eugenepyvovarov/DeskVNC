@@ -49,6 +49,10 @@ export function MacDisplayControls(props: {
     submitted: number;
     decoded: number;
     latencyMs: number;
+    pictureWidth: number;
+    pictureHeight: number;
+    frameWidth: number;
+    frameHeight: number;
   } | null;
   onStreamResize: (w: number, h: number) => void;
   onPanelMode: (action: MacDisplayAction) => void;
@@ -66,6 +70,12 @@ export function MacDisplayControls(props: {
         <p className="text-tertiary">
           Decoder: {props.stats.queued} queued, {props.stats.decoded} of {props.stats.submitted}{" "}
           decoded, {props.stats.latencyMs} ms behind
+          {props.stats.pictureWidth > 0 && (
+            <>
+              {" "}· picture {props.stats.pictureWidth}×{props.stats.pictureHeight} in a{" "}
+              {props.stats.frameWidth}×{props.stats.frameHeight} frame
+            </>
+          )}
         </p>
       )}
       {props.media && (props.media.pictures > 0 || props.media.canvasWidth > 0) && (

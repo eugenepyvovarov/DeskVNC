@@ -724,6 +724,10 @@ function SessionView({
     submitted: number;
     decoded: number;
     latencyMs: number;
+    pictureWidth: number;
+    pictureHeight: number;
+    frameWidth: number;
+    frameHeight: number;
   } | null>(null);
   useEffect(() => {
     const renderer = rendererRef.current;
