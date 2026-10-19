@@ -492,6 +492,40 @@ struct MediaCounters {
     /// Feedback packets sent to the Mac. A number that grows on its own is
     /// a number that is costing the Mac work.
     requests: std::sync::atomic::AtomicU64,
+    /// Video datagrams read from the Mac.
+    packets: std::sync::atomic::AtomicU64,
+    /// Payload bytes of those datagrams, which is the stream's bandwidth.
+    bytes: std::sync::atomic::AtomicU64,
+    /// Times the stream went quiet for longer than the stall timeout.
+    stalls: std::sync::atomic::AtomicU64,
+    /// Variation in the spacing between pictures, in milliseconds. Steady
+    /// spacing is a steady picture; a link that queues and bursts shows up
+    /// here before it shows up anywhere else.
+    jitter_ms: std::sync::atomic::AtomicU32,
+}
+
+/// Timing between pictures, as the receiver sees it.
+#[derive(Default)]
+struct PictureCadence {
+    last: Option<Instant>,
+    /// Mean absolute change of the interval, in milliseconds.
+    jitter_ms: f32,
+}
+
+impl PictureCadence {
+    /// Record one picture and return the jitter in whole milliseconds.
+    fn picture(&mut self, now: Instant) -> u32 {
+        let Some(last) = self.last.replace(now) else {
+            return 0;
+        };
+        let interval = now.duration_since(last).as_secs_f32() * 1000.0;
+        if self.jitter_ms == 0.0 {
+            self.jitter_ms = interval;
+        } else {
+            self.jitter_ms = self.jitter_ms * 0.9 + interval * 0.1;
+        }
+        self.jitter_ms.round().min(60_000.0) as u32
+    }
 }
 
 /// Send assembled pictures to the shell. Returns false when the shell has
@@ -1052,6 +1086,11 @@ async fn connect(
     // What the Mac's media path is doing, as its answer says.
     let mut media_state = remote_core::apple_media::MediaState::default();
     let mut last_media_report = Instant::now() - Duration::from_secs(1);
+    // The previous tick's counters, so the rate between two ticks can be
+    // reported rather than a lifetime average that hides a collapse.
+    let mut last_stats_at = Instant::now();
+    let mut last_stats_bytes = 0u64;
+    let mut last_stats_pictures = 0u64;
     // The counters the video receiver keeps.
     let counters = std::sync::Arc::new(MediaCounters::default());
     let video_counters = counters.clone();
@@ -1131,6 +1170,9 @@ async fn connect(
             let mut chain_broken = false;
             // When the last request for an independent picture went out.
             let mut last_backlog_request = Instant::now() - BACKLOG_REQUEST_INTERVAL;
+            // The spacing between pictures, which says whether the stream
+            // arrives evenly or in bursts.
+            let mut cadence = PictureCadence::default();
             let mut always_refresh = false;
             let mut last_always_refresh = Instant::now() - ALWAYS_REFRESH_INTERVAL;
             let mut last_silence_request = Instant::now() - SILENT_STREAM_TIMEOUT;
@@ -1196,6 +1238,9 @@ async fn connect(
                             && last_silence_request.elapsed() >= SILENT_STREAM_TIMEOUT
                         {
                             last_silence_request = now;
+                            video_counters
+                                .stalls
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             if let Some(ssrc) = streams.active() {
                                 if request_keyframe(
                                     &mut feedback,
@@ -1287,6 +1332,12 @@ async fn connect(
                 let units = match n {
                     Some(n) => {
                         packets += 1;
+                        video_counters
+                            .packets
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        video_counters
+                            .bytes
+                            .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
                         if packets <= 3 {
                             tracing::debug!(bytes = n, "Apple video datagram");
                         }
@@ -1331,6 +1382,12 @@ async fn connect(
                     .await;
                 }
                 if !units.is_empty() {
+                    // The spacing between pictures is what a person feels as
+                    // smoothness, so it is measured where the pictures land.
+                    let jitter = cadence.picture(Instant::now());
+                    video_counters
+                        .jitter_ms
+                        .store(jitter, std::sync::atomic::Ordering::Relaxed);
                     // This is assembly progress after re-offer, not a
                     // renderer/decoder acknowledgement of the requested size.
                     video_picture_generation.store(generation, std::sync::atomic::Ordering::SeqCst);
@@ -1748,15 +1805,34 @@ async fn connect(
                 // The media state is reported every few seconds: how many
                 // access units have been assembled, how many packets went missing,
                 // and how many times the picture was asked for again.
-                // Apple SRTP does not yet give us a correlated RTT sample.
-                // Do not report an RTCP arrival delay as network RTT.
-                let stats = remote_core::SessionStats::default();
+                //
+                // Throughput and picture rate are measured here from the
+                // counters the receiver keeps, so the status panel describes
+                // the stream that actually arrived. Apple SRTP does not give
+                // a correlated RTT sample yet, so latency stays unreported.
+                // Reporting an RTCP arrival delay as RTT would be a guess.
+                let pictures = counters.pictures.load(std::sync::atomic::Ordering::Relaxed);
+                let bytes = counters.bytes.load(std::sync::atomic::Ordering::Relaxed);
+                let elapsed = last_stats_at.elapsed().as_secs_f64().max(0.001);
+                let stats = remote_core::SessionStats {
+                    throughput_bps: (bytes.saturating_sub(last_stats_bytes)) as f64 * 8.0 / elapsed,
+                    fps: (pictures.saturating_sub(last_stats_pictures)) as f32 / elapsed as f32,
+                    bytes_received: bytes,
+                    ..Default::default()
+                };
+                last_stats_at = Instant::now();
+                last_stats_bytes = bytes;
+                last_stats_pictures = pictures;
                 emit(events, SessionEvent::Stats(stats)).await.ok();
-                media_state.pictures = counters.pictures.load(std::sync::atomic::Ordering::Relaxed);
+                media_state.pictures = pictures;
                 media_state.lost = counters.lost.load(std::sync::atomic::Ordering::Relaxed);
                 media_state.dropped = counters.dropped.load(std::sync::atomic::Ordering::Relaxed);
                 media_state.requests = counters.requests.load(std::sync::atomic::Ordering::Relaxed);
                 media_state.recoveries = counters.recoveries.load(std::sync::atomic::Ordering::Relaxed);
+                media_state.packets = counters.packets.load(std::sync::atomic::Ordering::Relaxed);
+                media_state.bytes = bytes;
+                media_state.stalls = counters.stalls.load(std::sync::atomic::Ordering::Relaxed);
+                media_state.jitter_ms = counters.jitter_ms.load(std::sync::atomic::Ordering::Relaxed);
                 if last_media_report.elapsed() >= Duration::from_secs(1) {
                     last_media_report = Instant::now();
                     emit(events, SessionEvent::Protocol(remote_core::ProtocolEvent::AppleMedia(media_state))).await.ok();

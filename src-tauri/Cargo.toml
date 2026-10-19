@@ -62,6 +62,7 @@ serde_json = { workspace = true }
 base64 = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
+directories = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }

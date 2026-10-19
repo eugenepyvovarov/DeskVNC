@@ -22,6 +22,7 @@ import { useLivePreview } from "../hooks/useLivePreview";
 import { SessionStatusDetails, SessionToolbar } from "../components/SessionToolbar";
 import { CertPrompt } from "../components/CertPrompt";
 import { MacDisplayControls } from "../components/MacDisplayControls";
+import { ConnectionDiagnostics } from "../components/ConnectionDiagnostics";
 import { CredentialPrompt } from "../components/CredentialPrompt";
 import { SshHostKeyPrompt } from "../components/SshHostKeyPrompt";
 import { DropOverlay, FilePanel } from "../components/FilePanel";
@@ -354,6 +355,10 @@ function SessionView({
   const [alwaysRefresh, setAlwaysRefresh] = useState(stored.alwaysRefresh);
   const [recallSignal, setRecallSignal] = useState(0);
   const [connectionInfoOpen, setConnectionInfoOpen] = useState(false);
+  // When this connection started, so the diagnostics can describe it rather
+  // than describe how long its dialog has been open. Cleared on a disconnect
+  // so a reconnect starts its own clock.
+  const [connectedAt, setConnectedAt] = useState<number | null>(null);
   /**
    * Bumped by every native-menu action, so the menu's state is re-asserted
    * after the render even when the action changed nothing. See the note where
@@ -729,10 +734,23 @@ function SessionView({
     frameWidth: number;
     frameHeight: number;
   } | null>(null);
+  // The renderer's own queue, sampled on the same clock as the decoder, so
+  // the diagnostics panel can say whether a slow picture is the decoder or
+  // the shell that is behind.
+  const [queueStats, setQueueStats] = useState<{
+    depth: number;
+    bytes: number;
+    dropped: number;
+  } | null>(null);
   useEffect(() => {
     const renderer = rendererRef.current;
     if (!renderer) return;
-    const timer = window.setInterval(() => setMediaStats(renderer.getMediaStats()), 1000);
+    const sample = (): void => {
+      setMediaStats(renderer.getMediaStats());
+      const q = renderer.getQueueStats();
+      setQueueStats({ depth: q.depth, bytes: q.bytes, dropped: q.droppedUpdates });
+    };
+    const timer = window.setInterval(sample, 1000);
     return () => window.clearInterval(timer);
   }, [rendererRef.current]);
 
@@ -1086,6 +1104,16 @@ function SessionView({
    * time any one of them changed, and `useSession` hands back a new object on
    * every stats tick.
    */
+  useEffect(() => {
+    if (session.state.state === "connected") {
+      setConnectedAt((previous) => previous ?? Date.now());
+    } else if (session.state.state === "disconnected") {
+      // A reconnect builds a new connection underneath, so the clock starts
+      // again when it reaches `connected`.
+      setConnectedAt(null);
+    }
+  }, [session.state.state]);
+
   const restoreRef = useRef({ quality, viewOnly: requestedViewOnly, alwaysRefresh, passthrough });
   restoreRef.current = { quality, viewOnly: requestedViewOnly, alwaysRefresh, passthrough };
   useEffect(() => {
@@ -2045,6 +2073,7 @@ function SessionView({
           alwaysRefresh={alwaysRefresh}
           onAlwaysRefresh={toggleAlwaysRefresh}
           onDisconnect={disconnectWithThumbnail}
+          onDiagnostics={() => setConnectionInfoOpen(true)}
         />
       )}
 
@@ -2053,9 +2082,35 @@ function SessionView({
           live, and it is the first thing anyone asks for when a session feels
           slow. */}
       {connectionInfoOpen ? (
-        <Dialog title="Connection info" onClose={() => setConnectionInfoOpen(false)} width={360}>
-          <div className="p-4">
+        <Dialog title="Connection info" onClose={() => setConnectionInfoOpen(false)} width={420}>
+          <div className="space-y-3 p-4">
             <SessionStatusDetails stats={session.stats} desktopName={session.desktopName} />
+            <ConnectionDiagnostics
+              protocol={params.protocol}
+              desktopName={session.desktopName}
+              host={`${params.address}:${params.port}`}
+              media={session.appleMedia}
+              stats={session.stats}
+              decoder={mediaStats}
+              queue={queueStats}
+              requested={
+                session.appleMedia && session.appleMedia.requestedWidth > 0
+                  ? { w: session.appleMedia.requestedWidth, h: session.appleMedia.requestedHeight }
+                  : null
+              }
+              layout={
+                session.appleMedia && session.appleMedia.layoutWidth > 0
+                  ? { w: session.appleMedia.layoutWidth, h: session.appleMedia.layoutHeight }
+                  : remoteSize
+              }
+              decoded={
+                mediaStats && mediaStats.pictureWidth > 0
+                  ? { w: mediaStats.pictureWidth, h: mediaStats.pictureHeight }
+                  : null
+              }
+              live={st.state === "connected"}
+              connectedAt={connectedAt}
+            />
             <div className="mt-4 flex justify-end">
               <button
                 type="button"

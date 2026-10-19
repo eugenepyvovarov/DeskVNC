@@ -175,6 +175,8 @@ export interface SessionToolbarProps {
   onViewOnly: (v: boolean) => void;
   onScreenshot: () => void;
   onRefresh: () => void;
+  /** Open the live connection diagnostics, from the status popup. */
+  onDiagnostics: () => void;
   onDisconnect: () => void;
   /**
    * Divide this pane, putting the new one to the right or underneath.
@@ -794,6 +796,18 @@ export function SessionToolbar(props: SessionToolbarProps): ReactNode {
           {openMenu === "status" ? (
             <div className="w-60 px-2.5 py-1.5">
               <SessionStatusDetails stats={props.stats} desktopName={props.desktopName} />
+              {/* The numbers above are a snapshot. The dialog behind this is
+                  the live view, and it is where a report can be copied from. */}
+              <button
+                type="button"
+                className="mt-2 w-full rounded border border-subtle px-2 py-1 text-xs text-primary hover:bg-canvas"
+                onClick={() => {
+                  setOpenMenu(null);
+                  props.onDiagnostics();
+                }}
+              >
+                Live diagnostics…
+              </button>
             </div>
           ) : null}
           {openMenu === "scale" ? (

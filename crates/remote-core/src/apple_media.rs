@@ -28,6 +28,15 @@ pub struct MediaState {
     pub recoveries: u64,
     /// The number of feedback packets sent to the Mac.
     pub requests: u64,
+    /// Video datagrams read from the Mac.
+    pub packets: u64,
+    /// Bytes of those datagrams: the stream's bandwidth, not the link's.
+    pub bytes: u64,
+    /// Times the stream went quiet for longer than the stall timeout. A
+    /// stalled stream is what a person calls "frozen", whatever the cause.
+    pub stalls: u64,
+    /// Variation in the spacing between pictures, in milliseconds.
+    pub jitter_ms: u32,
 }
 
 impl MediaState {

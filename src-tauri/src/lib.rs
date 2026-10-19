@@ -8,6 +8,7 @@
 mod agent;
 mod commands;
 mod framing;
+mod logging;
 mod menu;
 mod state;
 mod thumbnail;
@@ -22,9 +23,26 @@ use tauri::{Manager, RunEvent};
 use state::AppState;
 
 pub fn run() {
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,deskvncviewer_lib=debug"));
-    tracing_subscriber::fmt().with_env_filter(filter).init();
+    let registry = tracing_subscriber::registry().with(filter);
+    // The terminal gets colours and the file does not; both get the same
+    // lines, so a report can quote what a developer would have watched.
+    let stderr = tracing_subscriber::fmt::layer();
+    match logging::log_dir().and_then(|dir| logging::LogFile::open(&dir).ok()) {
+        Some(file) => registry
+            .with(stderr)
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_ansi(false)
+                    .with_writer(file),
+            )
+            .init(),
+        None => registry.with(stderr).init(),
+    }
 
     let mut builder = tauri::Builder::default();
 

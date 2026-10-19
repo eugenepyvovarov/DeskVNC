@@ -33,6 +33,7 @@ it("keeps requested, layout, media-answer and decoded sizes separate", () => {
       layoutWidth: 2700, layoutHeight: 1754,
       canvasWidth: 2700, canvasHeight: 1754,
       tiles: 1, pictures: 100, lost: 0, dropped: 0, recoveries: 0, requests: 0,
+      packets: 100, bytes: 1000, stalls: 0, jitterMs: 0,
     },
     stats: {
       pictureWidth: 3600, pictureHeight: 2338,

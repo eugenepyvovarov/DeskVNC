@@ -18,4 +18,12 @@ export interface AppleMediaState {
   recoveries: number;
   /** Feedback packets sent to the Mac. */
   requests: number;
+  /** Video datagrams read from the Mac. */
+  packets: number;
+  /** Bytes of those datagrams: the stream's bandwidth. */
+  bytes: number;
+  /** Times the stream went quiet long enough to need recovery. */
+  stalls: number;
+  /** Variation in the spacing between pictures, in milliseconds. */
+  jitterMs: number;
 }
