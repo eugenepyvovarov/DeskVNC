@@ -18,7 +18,7 @@ use tokio::sync::mpsc;
 use crate::auth::{self, SrpSecret};
 use crate::h264::Depacketizer;
 use crate::record::{self, RecordLayer};
-use crate::srtp::{SrtcpEncryptor, SrtpContext, SrtpEncryptor};
+use crate::srtp::{SrtcpEncryptor, SrtpContext};
 
 /// How many distinct video streams are remembered at once. A resized canvas
 /// or a new quality tier brings a new SSRC; the old ones are dropped.
@@ -828,7 +828,6 @@ async fn connect(
     // what "native" means, what the quality presets are measured against,
     // and what a restore has to put back.
     let mut baseline: Option<(u16, u16)> = None;
-    let mut baseline_logical: Option<(u16, u16)> = None;
     // Whether a resize has been asked for. The first layout after that is
     // the answer to the resize, not the Mac's own geometry.
     let mut resize_requested = false;
@@ -1323,7 +1322,6 @@ async fn connect(
                     // Mac, is the Mac's own geometry.
                     if baseline.is_none() && !resize_requested {
                         baseline = Some((bw, bh));
-                        baseline_logical = Some((session.logical_width, session.logical_height));
                         tracing::info!(
                             width = bw, height = bh,
                             logical_width = session.logical_width, logical_height = session.logical_height,
@@ -1926,6 +1924,7 @@ impl From<std::io::Error> for SessionError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::srtp::SrtpEncryptor;
 
     #[test]
     fn a_whole_media_stream_survives_the_trip_from_the_wire() {

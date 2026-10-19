@@ -56,7 +56,7 @@ pub fn parse(bytes: &[u8]) -> Option<Value> {
     if table_end > bytes.len() {
         return None;
     }
-    let mut reader = Reader {
+    let reader = Reader {
         bytes,
         offset_size,
         ref_size,
