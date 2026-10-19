@@ -108,6 +108,22 @@ pub fn generic_nack(sender: Ssrc, media: Ssrc, lost: &[u16]) -> Vec<u8> {
     out
 }
 
+/// Whether a datagram is RTCP.
+///
+/// The control socket carries the RTCP the Mac sends, multiplexed with the
+/// audio it would send. The media socket carries RTP. The two are told
+/// apart by the version and the payload type, which is what the format is
+/// for.
+pub fn is_rtcp(packet: &[u8]) -> bool {
+    if packet.len() < 4 {
+        return false;
+    }
+    if packet[0] >> 6 != 2 {
+        return false;
+    }
+    matches!(packet[1], 200..=207)
+}
+
 /// A feedback packet with a receiver report in front of it.
 pub fn compound(sender: Ssrc, feedback: &[u8]) -> Vec<u8> {
     let mut out = receiver_report(sender);
@@ -179,6 +195,18 @@ mod tests {
     #[test]
     fn a_nack_with_nothing_to_say_is_empty() {
         assert!(generic_nack(1, 2, &[]).is_empty());
+    }
+
+    #[test]
+    fn rtcp_is_told_apart_from_rtp() {
+        // The Mac's feedback is RTCP: version 2 and a feedback payload type.
+        assert!(is_rtcp(&receiver_report(1)));
+        assert!(is_rtcp(&compound(1, &full_intra_request(1, 2, 0))));
+        // A video packet is not.
+        assert!(!is_rtcp(&[0x80, 123, 0, 1, 0, 0, 0, 7, 0, 0, 0, 7]));
+        // Nor is a scrap of nothing.
+        assert!(!is_rtcp(&[0x80]));
+        assert!(!is_rtcp(&[]));
     }
 
     #[test]

@@ -347,6 +347,53 @@ async fn request_resize(
     }
 }
 
+/// The round trip to the Mac, measured on the RTCP path.
+///
+/// The Mac sends its own RTCP on a schedule of its own, so a sample taken
+/// between one of our packets and the next of the Mac's is the round trip
+/// plus the gap until its next report. The smallest sample in a window is
+/// the closest to the truth, and it is the one that is reported.
+#[derive(Default)]
+struct RttEstimator {
+    /// When we last sent a packet, if we are waiting for the Mac's answer.
+    waiting: Option<Instant>,
+    /// The samples in the window, oldest first.
+    samples: std::collections::VecDeque<f32>,
+}
+
+impl RttEstimator {
+    /// We have sent a packet; the Mac's next one ends the wait.
+    fn sent(&mut self, now: Instant) {
+        self.waiting = Some(now);
+    }
+
+    /// The Mac answered. The sample is recorded; the estimate is
+    /// [`RttEstimator::best`].
+    fn answered(&mut self, now: Instant) -> Option<f32> {
+        let sent = self.waiting.take()?;
+        let sample = now.duration_since(sent).as_secs_f32() * 1000.0;
+        if sample > 0.0 && sample < 10_000.0 {
+            self.samples.push_back(sample);
+            while self.samples.len() > 32 {
+                self.samples.pop_front();
+            }
+            Some(sample)
+        } else {
+            None
+        }
+    }
+
+    /// The best estimate so far: the smallest sample in the window.
+    fn best(&self) -> Option<f32> {
+        self.samples.iter().copied().fold(None, |best: Option<f32>, sample| {
+            Some(match best {
+                None => sample,
+                Some(current) => current.min(sample),
+            })
+        })
+    }
+}
+
 /// The counters the video receiver keeps and the control loop reads.
 ///
 /// The receiver and the control loop are different tasks, and the numbers
@@ -885,6 +932,9 @@ async fn connect(
     let generation = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1));
     let picture_generation = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let video_generation = generation.clone();
+    // The round trip to the Mac, in milliseconds, measured on the RTCP path.
+    let video_rtt = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let rtt_value = video_rtt.clone();
     let video_picture_generation = picture_generation.clone();
     // A periodic tick, so a round can be finished, timed out or reported
     // without waiting for the next thing to happen on the wire.
@@ -945,6 +995,10 @@ async fn connect(
             let mut dropped = 0u64;
             // Packets from somewhere other than the Mac.
             let mut stray = 0u64;
+            // The round trip to the Mac, measured on the RTCP path.
+            let mut rtt = RttEstimator::default();
+            // When the last report went out.
+            let mut last_report = Instant::now() - Duration::from_secs(2);
             loop {
                 let n = tokio::select! {
                     _ = cancel2.cancelled() => break,
@@ -956,6 +1010,22 @@ async fn connect(
                         continue;
                     }
                     _ = flush_tick.tick() => {
+                        // The Mac wants to hear from us, and its answer is
+                        // how the round trip is measured. A report goes out
+                        // every second.
+                        if last_report.elapsed() >= Duration::from_secs(1) {
+                            last_report = Instant::now();
+                            if let Some(encryptor) = feedback.as_mut() {
+                                let packet = crate::rtcp::compound(feedback_ssrc, &[]);
+                                if let Some(protected) = encryptor.protect(&packet) {
+                                    if let Some(socket) = ctrl.as_ref() {
+                                        if socket.send_to(&protected, &ctrl_dest).await.is_ok() {
+                                            rtt.sent(Instant::now());
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         // Give up on a hole that has not been filled.
                         let Some(ssrc) = active_ssrc else { continue };
                         let Some(stream) = streams.get_mut(&ssrc) else { continue };
@@ -989,7 +1059,16 @@ async fn connect(
                             None => std::future::pending().await,
                         }
                     } => {
-                        let _ = r;
+                        // The Mac's RTCP is the answer to our last report,
+                        // and the gap between the two is the round trip.
+                        if let Ok(n) = r {
+                            if crate::rtcp::is_rtcp(&cbuf[..n]) {
+                                rtt.answered(Instant::now());
+                                if let Some(best) = rtt.best() {
+                                    rtt_value.store(best.to_bits(), std::sync::atomic::Ordering::Relaxed);
+                                }
+                            }
+                        }
                         continue;
                     }
                 };
@@ -1416,6 +1495,19 @@ async fn connect(
                 // The media state is reported every few seconds: how many
                 // pictures have been decoded, how many packets went missing,
                 // and how many times the picture was asked for again.
+                // The statistics the status panel shows. The round trip is
+                // the one the Mac's own RTCP gives us.
+                let rtt_ms = f32::from_bits(video_rtt.load(std::sync::atomic::Ordering::Relaxed));
+                let stats = remote_core::SessionStats {
+                    rtt_ms,
+                    rtt_source: if rtt_ms > 0.0 {
+                        remote_core::stats::RttSource::Rtcp
+                    } else {
+                        remote_core::stats::RttSource::None
+                    },
+                    ..Default::default()
+                };
+                emit(events, SessionEvent::Stats(stats)).await.ok();
                 media_state.pictures = counters.pictures.load(std::sync::atomic::Ordering::Relaxed);
                 media_state.lost = counters.lost.load(std::sync::atomic::Ordering::Relaxed);
                 media_state.recoveries = counters.recoveries.load(std::sync::atomic::Ordering::Relaxed);
@@ -1976,6 +2068,29 @@ impl From<std::io::Error> for SessionError {
 mod tests {
     use super::*;
     use crate::srtp::SrtpEncryptor;
+
+    #[test]
+    fn the_round_trip_is_the_smallest_sample_in_the_window() {
+        // The Mac reports on a schedule of its own, so a sample is the round
+        // trip plus the gap until its next report. The smallest sample is
+        // the one closest to the truth.
+        let start = Instant::now();
+        let mut rtt = RttEstimator::default();
+        // A report goes out, and the Mac answers 40 ms later: the link is
+        // slow.
+        rtt.sent(start);
+        assert_eq!(rtt.answered(start + Duration::from_millis(40)), Some(40.0));
+        // The next report is answered 120 ms later, because the Mac's
+        // reporting gap was long that time.
+        rtt.sent(start);
+        assert_eq!(rtt.answered(start + Duration::from_millis(120)), Some(120.0));
+        // The best estimate is the smallest of them.
+        assert_eq!(rtt.best(), Some(40.0));
+        // And an answer with no report to answer is not a sample.
+        let mut fresh = RttEstimator::default();
+        assert_eq!(fresh.answered(start), None);
+        assert_eq!(fresh.best(), None);
+    }
 
     #[test]
     fn a_whole_media_stream_survives_the_trip_from_the_wire() {

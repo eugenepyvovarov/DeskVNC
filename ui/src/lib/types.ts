@@ -520,10 +520,12 @@ export type SessionState =
  * request timed into a quiet screen, and `update-pipeline` is the passive
  * readout taken on the normal update path (always available, including on
  * the Fence-less TightVNC family, but it includes this client's own decode
- * of the previous update, so it reads high). `none` means nothing has been
+ * of the previous update, so it reads high). `rtcp` is the Apple path: the
+ * time from this client's RTCP feedback to the Mac's next RTCP packet, where
+ * the Mac reports on a schedule of its own. `none` means nothing has been
  * measured yet and `rtt_ms` is 0.
  */
-export type RttSource = "none" | "fence" | "idle-probe" | "update-pipeline";
+export type RttSource = "none" | "fence" | "idle-probe" | "update-pipeline" | "rtcp";
 
 /** `vnc_core::SessionStats`, no rename_all, so these stay snake_case. */
 export interface SessionStats {
