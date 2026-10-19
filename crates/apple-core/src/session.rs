@@ -1419,26 +1419,85 @@ fn auto_framebuffer(width: u16, height: u16) -> [u8; 16] {
     m
 }
 
+/// One rectangle of a framebuffer update.
+struct WireRect<'a> {
+    encoding: i32,
+    payload: &'a [u8],
+}
+
+/// The rectangles of a framebuffer update, as far as they can be walked.
+///
+/// A rectangle's payload has no length of its own: the encoding says how
+/// long it is. The two encodings this session cares about both say so, and
+/// anything else stops the walk, because guessing would mean guessing
+/// where the next rectangle starts.
+fn rectangles(body: &[u8]) -> Vec<WireRect<'_>> {
+    let mut out = Vec::new();
+    if body.first() != Some(&0) || body.len() < 4 {
+        return out;
+    }
+    let count = u16::from_be_bytes([body[2], body[3]]) as usize;
+    let mut p = 4;
+    for _ in 0..count {
+        if p + 12 > body.len() {
+            break;
+        }
+        let Ok(raw) = <[u8; 4]>::try_from(&body[p + 8..p + 12]) else { break };
+        let encoding = i32::from_be_bytes(raw);
+        p += 12;
+        let payload = match encoding {
+            // The rekey carries a fixed 36 byte body.
+            0x44f => match body.get(p..p + 36) {
+                Some(slice) => slice,
+                None => break,
+            },
+            // The layout carries its own length. A message that is
+            // shorter than it says is still worth reading: the fields that
+            // matter are at the front.
+            0x451 => {
+                let Some(header) = body.get(p..p + 2) else { break };
+                let len = u16::from_be_bytes([header[0], header[1]]) as usize;
+                let end = (p + len).min(body.len());
+                &body[p..end]
+            }
+            _ => break,
+        };
+        out.push(WireRect { encoding, payload });
+        p += match encoding {
+            0x44f => 36,
+            _ => u16::from_be_bytes([body[p], body[p + 1]]) as usize,
+        };
+    }
+    out
+}
+
 /// Extract `(scaled, backing)` geometry from an `AppleDisplayLayout` (`0x451`)
 /// rectangle inside a decrypted control record (RFC §8.4). The layout is
 /// authoritative: the server may answer a resize with a smaller fallback.
+///
+/// The layout is looked for in every rectangle, not only the first: a
+/// message that carries something else first is still a message that
+/// carries the layout.
 fn find_display_layout(body: &[u8]) -> Option<((u16, u16), (u16, u16))> {
-    if body.first() != Some(&0) || body.len() < 16 { return None; }
-    let rects = u16::from_be_bytes([body[2], body[3]]) as usize;
-    let mut p = 4;
-    for _ in 0..rects {
-        if p + 12 > body.len() { return None; }
-        let enc = i32::from_be_bytes(body[p + 8..p + 12].try_into().ok()?);
-        p += 12;
-        if enc != 0x451 { return None; }
-        if p + 12 > body.len() { return None; }
-        let ver = u16::from_be_bytes([body[p + 2], body[p + 3]]);
-        if ver == 0 { return None; }
-        let sw = u16::from_be_bytes([body[p + 4], body[p + 5]]);
-        let sh = u16::from_be_bytes([body[p + 6], body[p + 7]]);
-        let bw = u16::from_be_bytes([body[p + 8], body[p + 9]]);
-        let bh = u16::from_be_bytes([body[p + 10], body[p + 11]]);
-        if bw == 0 || bh == 0 { return None; }
+    for rect in rectangles(body) {
+        if rect.encoding != 0x451 {
+            continue;
+        }
+        let payload = rect.payload;
+        if payload.len() < 12 {
+            continue;
+        }
+        let ver = u16::from_be_bytes([payload[2], payload[3]]);
+        if ver == 0 {
+            continue;
+        }
+        let sw = u16::from_be_bytes([payload[4], payload[5]]);
+        let sh = u16::from_be_bytes([payload[6], payload[7]]);
+        let bw = u16::from_be_bytes([payload[8], payload[9]]);
+        let bh = u16::from_be_bytes([payload[10], payload[11]]);
+        if bw == 0 || bh == 0 {
+            continue;
+        }
         return Some(((sw, sh), (bw, bh)));
     }
     None
@@ -1532,19 +1591,21 @@ fn find_rekey(msg: &[u8], wrap: &[u8; 16]) -> Option<([u8; 16], [u8; 16])> {
     // Only a framebuffer rectangle whose encoding is 1103 (0x44f). Any other
     // message happens to be at least 36 bytes, and treating its tail as a
     // rekey resets the cipher and the next record fails its integrity check.
-    if msg.len() < 16 + 36 {
-        return None;
+    for rect in rectangles(msg) {
+        if rect.encoding != 0x44f {
+            continue;
+        }
+        let body = rect.payload;
+        if body.len() < 36 {
+            continue;
+        }
+        let mut key = [0u8; 16];
+        let mut iv = [0u8; 16];
+        key.copy_from_slice(&body[4..20]);
+        iv.copy_from_slice(&body[20..36]);
+        return Some(record::unwrap_rekey(wrap, &key, &iv));
     }
-    let enc = i32::from_be_bytes(msg.get(12..16)?.try_into().ok()?);
-    if enc != 0x44f {
-        return None;
-    }
-    let body = &msg[msg.len() - 36..];
-    let mut key = [0u8; 16];
-    let mut iv = [0u8; 16];
-    key.copy_from_slice(&body[4..20]);
-    iv.copy_from_slice(&body[20..36]);
-    Some(record::unwrap_rekey(wrap, &key, &iv))
+    None
 }
 
 #[derive(Debug)]
@@ -1758,6 +1819,61 @@ mod tests {
         assert_eq!(u32::from_be_bytes(m[mode..mode + 4].try_into().unwrap()), 1920);
         assert_eq!(u32::from_be_bytes(m[mode + 4..mode + 8].try_into().unwrap()), 1080);
         assert_eq!(f64::from_be_bytes(m[mode + 16..mode + 24].try_into().unwrap()), 60.0);
+    }
+
+    /// A framebuffer update carrying one rectangle with the given encoding
+    /// and payload.
+    fn update_with(encoding: i32, payload: &[u8]) -> Vec<u8> {
+        let mut body = vec![0u8, 0, 0, 1];
+        body.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0]); // x, y, w, h
+        body.extend_from_slice(&encoding.to_be_bytes());
+        body.extend_from_slice(payload);
+        body
+    }
+
+    #[test]
+    fn the_layout_is_found_after_another_rectangle() {
+        // A message that carries something else first is still a message
+        // that carries the layout.
+        let mut body = vec![0u8, 0, 0, 2];
+        body.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0]);
+        body.extend_from_slice(&1103i32.to_be_bytes()); // the rekey
+        body.extend_from_slice(&[0u8; 36]);
+        body.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0]);
+        body.extend_from_slice(&1105i32.to_be_bytes()); // the layout
+        let mut payload = vec![0u8; 82];
+        payload[0..2].copy_from_slice(&82u16.to_be_bytes());
+        payload[2..4].copy_from_slice(&5u16.to_be_bytes());
+        payload[4..6].copy_from_slice(&1800u16.to_be_bytes());
+        payload[6..8].copy_from_slice(&1169u16.to_be_bytes());
+        payload[8..10].copy_from_slice(&3600u16.to_be_bytes());
+        payload[10..12].copy_from_slice(&2338u16.to_be_bytes());
+        body.extend_from_slice(&payload);
+        assert_eq!(find_display_layout(&body), Some(((1800, 1169), (3600, 2338))));
+    }
+
+    #[test]
+    fn a_rekey_is_found_after_another_rectangle() {
+        let mut body = vec![0u8, 0, 0, 2];
+        body.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0]);
+        body.extend_from_slice(&1105i32.to_be_bytes()); // the layout
+        let mut payload = vec![0u8; 82];
+        payload[0..2].copy_from_slice(&82u16.to_be_bytes());
+        body.extend_from_slice(&payload);
+        body.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0]);
+        body.extend_from_slice(&1103i32.to_be_bytes()); // the rekey
+        body.extend_from_slice(&[0u8; 36]);
+        // The rekey is recognised by its encoding, wherever it is.
+        assert!(find_rekey(&body, &[0; 16]).is_some());
+    }
+
+    #[test]
+    fn a_rekey_is_not_mistaken_for_something_else() {
+        // A message with a long body that is not a rekey must not be
+        // treated as one: doing that resets the cipher and the next record
+        // fails its integrity check.
+        let body = update_with(1104, &[0u8; 64]);
+        assert!(find_rekey(&body, &[0; 16]).is_none());
     }
 
     #[test]
