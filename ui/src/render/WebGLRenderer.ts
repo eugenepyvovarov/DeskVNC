@@ -134,10 +134,25 @@ interface H264Context {
    * also ascending timestamp order; see `decodeH264` for what that buys.
    */
   waiters: Map<number, (frame: VideoFrame | null) => void>;
+  /**
+   * The acceleration this decoder was configured with. A decoder that
+   * fails to configure reports the failure asynchronously, so the retry
+   * needs to know what it was trying first.
+   */
+  acceleration: VideoDecoderConfig["hardwareAcceleration"];
+  /** Whether this decoder has produced a picture yet. */
+  outputSeen: boolean;
 }
 
 /** Maximum simultaneous decoder contexts, mirrors the backend's cap. */
 const H264_MAX_CONTEXTS = 64;
+
+/**
+ * How many times a stream's decoder may fail before the stream is given up
+ * on. Each failure is followed by a fresh attempt on the next independent
+ * picture, so a couple of failures are a hiccup rather than a dead end.
+ */
+const H264_MAX_FAILURES = 3;
 
 /**
  * How long one H.264 rect waits for its decoded frame before giving up on it.
@@ -598,7 +613,32 @@ export class WebGLRenderer {
   // H.264 (WebCodecs): one decoder per server-side context, keyed by the
   // context id the backend assigns per rect geometry (0..63).
   private h264 = new Map<number, H264Context>();
+  /**
+   * The current stream's H.264 decoding failed.
+   *
+   * This is a statement about the STREAM, not about the webview: a new
+   * stream (a resize, a new encoder) gets a new chance, and the failure
+   * must not survive into it. A webview with no H.264 decoder at all is a
+   * different fact, and is remembered separately.
+   */
   private h264Failed = false;
+  /**
+   * The webview has no H.264 decoder at all. Nothing about the stream can
+   * change that, so this is never cleared by a resize.
+   */
+  private h264Unsupported = false;
+  /**
+   * How many times the current stream's decoder has failed. A failure is
+   * not fatal on its own: the next independent picture builds a fresh
+   * decoder. After a few failures the stream is given up on, because a
+   * decoder that never works is not going to start working.
+   */
+  private h264Failures = 0;
+  /**
+   * Which acceleration to try first. It moves to software when the
+   * hardware path is refused, and the change is reported.
+   */
+  private h264Acceleration: VideoDecoderConfig["hardwareAcceleration"] = "prefer-hardware";
   private continuousH264 = false;
   private latestVideo: { frame: VideoFrame; ctx: H264Context } | null = null;
 
@@ -715,6 +755,14 @@ export class WebGLRenderer {
     this.fbHeight = height;
     if (!preserveVideo) this.generation++;
     this.sawFrame = false;
+    // A new stream is a new chance. A decoder that failed on the previous
+    // one says nothing about this one, and a failure that outlived the
+    // resize would leave the pane blank for ever. A webview with no H.264
+    // decoder at all is a different fact, and it does not change.
+    if (!this.h264Unsupported) {
+      this.h264Failed = false;
+      this.h264Failures = 0;
+    }
     // A monitor rect cut from the old geometry means nothing in the new one.
     this.clearViewRect();
     // A continuous single-display stream can reveal its dimensions only in
@@ -901,6 +949,10 @@ export class WebGLRenderer {
     gen: number,
   ): Promise<void> {
     const gl = this.gl;
+    // Whether anything was actually put on the screen by this batch. An
+    // H.264 rect only hands a chunk to the decoder, so it does not count
+    // here: the picture arrives later, and it is the upload that counts.
+    let painted = false;
     for (let i = 0; i < rects.length; i++) {
       const r = rects[i];
       if (this.disposed) return;
@@ -909,6 +961,7 @@ export class WebGLRenderer {
           if (r.payload.byteLength >= r.w * r.h * 4) {
             gl.bindTexture(gl.TEXTURE_2D, this.frameTex);
             gl.texSubImage2D(gl.TEXTURE_2D, 0, r.x, r.y, r.w, r.h, gl.RGBA, gl.UNSIGNED_BYTE, r.payload);
+            painted = true;
           }
           break;
         case RectFormat.Jpeg: {
@@ -937,19 +990,23 @@ export class WebGLRenderer {
           gl.bindTexture(gl.TEXTURE_2D, this.frameTex);
           gl.texSubImage2D(gl.TEXTURE_2D, 0, r.x, r.y, gl.RGBA, gl.UNSIGNED_BYTE, bmp);
           bmp.close();
+          painted = true;
           break;
         }
         case RectFormat.CopyRect:
           this.copyRect(r.srcX, r.srcY, r.x, r.y, r.w, r.h);
+          painted = true;
           break;
         case RectFormat.H264:
+          // The chunk goes to the decoder; the picture is uploaded when it
+          // comes out, and that upload is what counts as a frame.
           await this.decodeH264(r);
           break;
         default:
           break; // unknown format: skip gracefully
       }
     }
-    if (!this.sawFrame) {
+    if (painted && !this.sawFrame) {
       this.sawFrame = true;
       this.onFirstFrame?.();
     }
@@ -957,6 +1014,19 @@ export class WebGLRenderer {
     this.markDirty();
   }
 
+  /**
+   * A picture reached the screen.
+   *
+   * This is the only place a video frame counts as seen. Accepting a
+   * compressed chunk is not the same as showing a picture: a stream whose
+   * decoder never produces an output would otherwise report a first frame
+   * that nobody ever saw.
+   */
+  private noteFrameShown(): void {
+    if (this.sawFrame) return;
+    this.sawFrame = true;
+    this.onFirstFrame?.();
+  }
   /**
    * Start a JPEG decode. `bytes` is a view into the IPC buffer (recycled as
    * soon as this call returns), but that's safe without an explicit copy:
@@ -1037,6 +1107,7 @@ export class WebGLRenderer {
   private async decodeH264(r: WireRect): Promise<void> {
     if (this.h264Failed) return;
     if (typeof VideoDecoder === "undefined" || typeof EncodedVideoChunk === "undefined") {
+      this.h264Unsupported = true;
       this.h264Failed = true;
       this.notice(
         "This webview has no WebCodecs H.264 decoder; video-coded regions will not render. " +
@@ -1147,6 +1218,14 @@ export class WebGLRenderer {
   }
 
   /** Build a decoder for one context, or `null` if WebCodecs refuses. */
+  /**
+   * Start a decoder for one H.264 context.
+   *
+   * The decoder is created with the hardware path first. WebKit falls back
+   * to software when `vah264dec` is absent; Chromium rejects
+   * `prefer-hardware` outright, so the second attempt keeps those builds
+   * painting.
+   */
   private createH264(r: WireRect, id: number, annexb: Uint8Array): H264Context | null {
     if (this.h264.size >= H264_MAX_CONTEXTS) {
       // The backend caps contexts at 64 and recycles slots, so this only
@@ -1164,6 +1243,8 @@ export class WebGLRenderer {
       generation,
       timestamp: 0,
       waiters: new Map(),
+      acceleration: this.h264Acceleration,
+      outputSeen: false,
     };
     try {
       ctx.decoder = new VideoDecoder({
@@ -1172,6 +1253,7 @@ export class WebGLRenderer {
             frame.close();
             return;
           }
+          ctx.outputSeen = true;
           // Not uploaded here: `decodeH264` uploads it at the rect's own
           // position in the ordered apply loop.
           if (this.continuousH264) {
@@ -1192,24 +1274,21 @@ export class WebGLRenderer {
             this.deliverH264Frame(ctx, frame);
           }
         },
-        error: () => {
-          traceMark("h264_decode_error");
-          this.closeH264(id);
+        error: (error: unknown) => {
+          this.onH264Error(ctx, id, error);
         },
       });
       const stream = h264Config(annexb);
       ctx.avc = stream.description !== undefined;
-      // Ask for the GPU decoder first. WebKit falls back to software when
-      // `vah264dec` is absent; Chromium rejects `prefer-hardware` outright,
-      // so the second attempt keeps those builds painting.
-      const attempts: VideoDecoderConfig[] = [
-        { ...stream, hardwareAcceleration: "prefer-hardware" },
-        { ...stream, hardwareAcceleration: "prefer-software" },
-      ];
+      const order: VideoDecoderConfig["hardwareAcceleration"][] =
+        this.h264Acceleration === "prefer-software"
+          ? ["prefer-software", "prefer-hardware"]
+          : ["prefer-hardware", "prefer-software"];
       let configured = false;
-      for (const cfg of attempts) {
+      for (const acceleration of order) {
         try {
-          ctx.decoder.configure(cfg);
+          ctx.decoder.configure({ ...stream, hardwareAcceleration: acceleration });
+          ctx.acceleration = acceleration;
           configured = true;
           break;
         } catch {
@@ -1218,12 +1297,50 @@ export class WebGLRenderer {
       }
       if (!configured) throw new Error("H.264 configure failed");
     } catch {
-      this.h264Failed = true;
-      this.notice("H.264 decoding is unavailable in this webview; those regions will not render.");
+      // The configuration itself was refused. Try again on the next key
+      // picture, a bounded number of times, and then say what is wrong.
+      this.h264Failures += 1;
+      if (this.h264Failures >= H264_MAX_FAILURES) {
+        this.h264Failed = true;
+        this.notice("H.264 decoding is unavailable in this webview; those regions will not render.");
+      }
       return null;
     }
     this.h264.set(id, ctx);
     return ctx;
+  }
+
+  /**
+   * A decoder reported an error.
+   *
+   * `configure()` does not throw when the platform cannot provide the
+   * configuration: the refusal arrives here, asynchronously, after the
+   * chunk was already accepted. Closing the decoder and saying nothing left
+   * the pane blank with no explanation.
+   *
+   * A failure before any picture was decoded is usually the configuration
+   * being refused, so the decoder is closed, the next attempt uses the other
+   * acceleration mode, and the next key picture builds a fresh decoder. A
+   * failure after pictures have been decoded is a broken stream: the decoder
+   * is closed and the next independent picture starts a new one.
+   */
+  private onH264Error(ctx: H264Context, id: number, error: unknown): void {
+    traceMark("h264_decode_error");
+    if (this.disposed || ctx.generation !== this.generation) return;
+    const detail = error instanceof Error ? error.message : String(error);
+    const hardwareRefused = !ctx.outputSeen && ctx.acceleration === "prefer-hardware";
+    this.closeH264(id);
+    this.h264Failures += 1;
+    if (hardwareRefused) {
+      // Say it. A picture that is not perfect beats a pane that is empty,
+      // but a silent change of decoder is not something to hide.
+      this.h264Acceleration = "prefer-software";
+      this.notice("Hardware H.264 decoding was refused; falling back to software decoding.");
+    }
+    if (this.h264Failures >= H264_MAX_FAILURES) {
+      this.h264Failed = true;
+      this.notice(`H.264 decoding failed (${detail}); the video stream cannot be shown.`);
+    }
   }
 
   /**
@@ -1247,6 +1364,7 @@ export class WebGLRenderer {
         gl.TEXTURE_2D, 0, ctx.x, ctx.y,
         gl.RGBA, gl.UNSIGNED_BYTE, cropped ?? frame,
       );
+      this.noteFrameShown();
       this.markDirty();
     } catch {
       // VideoFrame cropping is not universally supported: fall back to a 2D
@@ -1267,6 +1385,7 @@ export class WebGLRenderer {
       const gl = this.gl;
       gl.bindTexture(gl.TEXTURE_2D, this.frameTex);
       gl.texSubImage2D(gl.TEXTURE_2D, 0, ctx.x, ctx.y, gl.RGBA, gl.UNSIGNED_BYTE, off);
+      this.noteFrameShown();
       this.markDirty();
     } catch {
       this.notice("Failed to present an H.264 frame; falling back to other encodings.");
