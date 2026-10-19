@@ -33,14 +33,23 @@ use crate::srtp::{SrtcpEncryptor, SrtpContext};
 fn first_records(geometry: Option<remote_core::options::AppleGeometry>) -> Vec<Vec<u8>> {
     let mut out = Vec::new();
     if let Some(geometry) = geometry {
-        out.push(display_config(
-            geometry.pixel_width,
-            geometry.pixel_height,
-            geometry.point_width,
-            geometry.point_height,
-            geometry.pixel_width,
-            geometry.pixel_height,
-        ));
+        // Pixel and point dimensions are different coordinate spaces. On a
+        // Retina panel, sending pixels where points belong doubles the
+        // desktop and makes the decoded picture look zoomed.
+        if geometry.pixel_width > 0
+            && geometry.pixel_height > 0
+            && geometry.point_width > 0
+            && geometry.point_height > 0
+        {
+            out.push(display_config(
+                geometry.pixel_width,
+                geometry.pixel_height,
+                geometry.point_width,
+                geometry.point_height,
+                geometry.pixel_width,
+                geometry.pixel_height,
+            ));
+        }
     }
     out.push(set_encodings());
     out
@@ -854,13 +863,20 @@ async fn connect(
         }
     };
 
+    let remembered_points = geometry.and_then(|geometry| {
+        if geometry.point_width > 0 && geometry.point_height > 0 {
+            Some((geometry.point_width, geometry.point_height))
+        } else {
+            None
+        }
+    });
     let mut session = Live {
         tcp,
         layer,
         width: server_w,
         height: server_h,
-        logical_width: server_w,
-        logical_height: server_h,
+        logical_width: remembered_points.map_or(server_w, |points| points.0),
+        logical_height: remembered_points.map_or(server_h, |points| points.1),
         srtp: None,
         feedback: None,
         feedback_ssrc: 0,
@@ -995,7 +1011,13 @@ async fn connect(
     let mut baseline: Option<(u16, u16)> = None;
     // The same, in points: a retina panel is twice the points of its pixels,
     // and the difference is what turns a window's size into a desktop's size.
-    let mut baseline_points: Option<(u16, u16)> = None;
+    let mut baseline_points: Option<(u16, u16)> = geometry.and_then(|geometry| {
+        if geometry.point_width > 0 && geometry.point_height > 0 {
+            Some((geometry.point_width, geometry.point_height))
+        } else {
+            None
+        }
+    });
     // Whether a resize has been asked for. The first layout after that is
     // the answer to the resize, not the Mac's own geometry.
     let mut resize_requested = false;
@@ -1665,7 +1687,9 @@ async fn connect(
                         session.logical_height = lh;
                     }
                     // The first layout, before anything was asked of the
-                    // Mac, is the Mac's own geometry.
+                    // Mac, is the Mac's own geometry. A remembered point
+                    // size is only a starting value for the first request;
+                    // this layout remains the authoritative baseline.
                     let learn_baseline = baseline.is_none() && !resize_requested;
                     if learn_baseline {
                         baseline = Some((bw, bh));
@@ -2510,6 +2534,19 @@ mod tests {
             u32::from_be_bytes(records[0][mode + 12..mode + 16].try_into().unwrap()),
             1169
         );
+        // Every mode keeps the desktop points. The native pixel size must
+        // not be substituted for them, or a Retina desktop is doubled.
+        for entry in 0..5 {
+            let at = mode + entry * 28;
+            assert_eq!(
+                u32::from_be_bytes(records[0][at + 8..at + 12].try_into().unwrap()),
+                1800
+            );
+            assert_eq!(
+                u32::from_be_bytes(records[0][at + 12..at + 16].try_into().unwrap()),
+                1169
+            );
+        }
     }
 
     #[test]
