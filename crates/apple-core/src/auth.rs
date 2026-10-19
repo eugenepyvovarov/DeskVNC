@@ -35,7 +35,9 @@ pub struct SrpSecret {
     pub m1: [u8; 64],
     /// First 16 bytes of SHA-256(K). Becomes the initial wrap key.
     pub wrap_key: [u8; 16],
-    /// The session key K = SHA-512(PAD(S)).
+    /// The session key K = SHA-512(PAD(S)). Read by the tests that check
+    /// the server's proof against it.
+    #[allow(dead_code)]
     session_key: [u8; 64],
     /// The server's proof: M2 = SHA-512(PAD(A) || M1 || K).
     expected_m2: [u8; 64],

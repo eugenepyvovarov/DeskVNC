@@ -18,7 +18,7 @@ use tokio::sync::mpsc;
 use crate::auth::{self, SrpSecret};
 use crate::h264::Depacketizer;
 use crate::record::{self, RecordLayer};
-use crate::srtp::SrtpContext;
+use crate::srtp::{SrtcpEncryptor, SrtpContext};
 
 /// How many distinct video streams are remembered at once. A resized canvas
 /// or a new quality tier brings a new SSRC; the old ones are dropped.
@@ -63,6 +63,80 @@ async fn release_all(session: &mut Live, held: &mut Held) -> Result<(), SessionE
     }
     Ok(())
 }
+
+/// Ask the Mac for a fresh independent picture.
+///
+/// The request goes out on the control socket, which is where the Mac's
+/// RTCP arrives. Three forms are sent together: the modern request, the
+/// picture loss indication, and the legacy request the native viewer uses.
+/// Apple's server answers whichever it honours first, and it often ignores
+/// the newer ones.
+///
+/// Requests are rate limited. A burst of loss would otherwise turn into a
+/// burst of requests, which the Mac answers with a burst of full pictures.
+async fn request_keyframe(
+    feedback: &mut Option<SrtcpEncryptor>,
+    sender: u32,
+    media: u32,
+    ctrl: Option<&UdpSocket>,
+    ctrl_dest: &str,
+    last: &mut Instant,
+) {
+    // Requests are rate limited. A burst of loss would otherwise turn into
+    // a burst of requests, which the Mac answers with a burst of full
+    // pictures.
+    if last.elapsed() < KEYFRAME_REQUEST_INTERVAL {
+        return;
+    }
+    *last = Instant::now();
+    let Some(encryptor) = feedback.as_mut() else { return };
+    let Some(socket) = ctrl else { return };
+    let packet = crate::rtcp::compound(
+        sender,
+        &[
+            crate::rtcp::full_intra_request(sender, media, 0),
+            crate::rtcp::picture_loss_indication(sender, media),
+            crate::rtcp::legacy_intra_request(media),
+        ]
+        .concat(),
+    );
+    let Some(protected) = encryptor.protect(&packet) else { return };
+    if socket.send_to(&protected, ctrl_dest).await.is_err() {
+        tracing::warn!("the keyframe request could not be sent");
+    } else {
+        tracing::info!(media, "asked the Mac for a fresh picture");
+    }
+}
+
+/// Ask the Mac to send the packets that went missing again.
+async fn request_retransmission(
+    feedback: &mut Option<SrtcpEncryptor>,
+    sender: u32,
+    media: u32,
+    missing: &[u16],
+    ctrl: Option<&UdpSocket>,
+    ctrl_dest: &str,
+) {
+    if missing.is_empty() {
+        return;
+    }
+    let Some(encryptor) = feedback.as_mut() else { return };
+    let Some(socket) = ctrl else { return };
+    let nack = crate::rtcp::generic_nack(sender, media, missing);
+    if nack.is_empty() {
+        return;
+    }
+    let packet = crate::rtcp::compound(sender, &nack);
+    let Some(protected) = encryptor.protect(&packet) else { return };
+    if socket.send_to(&protected, ctrl_dest).await.is_err() {
+        tracing::warn!("the retransmission request could not be sent");
+    } else {
+        tracing::info!(packets = missing.len(), "asked the Mac for the missing packets");
+    }
+}
+
+/// How often a fresh picture may be asked for.
+const KEYFRAME_REQUEST_INTERVAL: Duration = Duration::from_millis(500);
 
 /// A resize round.
 ///
@@ -462,8 +536,9 @@ async fn connect(
         layer,
         width: server_w,
         height: server_h,
-        video: Depacketizer::default(),
         srtp: None,
+        feedback: None,
+        feedback_ssrc: 0,
         udp: None,
         ctrl: None,
         incoming: Vec::with_capacity(8192),
@@ -475,8 +550,15 @@ async fn connect(
         .await?;
     tokio::time::sleep(Duration::from_millis(200)).await;
     session.send_body(&set_encodings()).await?;
-    let (offer, srtp_blob) = crate::offer::media_offer();
+    let (offer, srtp_blob, feedback_blob) = crate::offer::media_offer();
     session.srtp = SrtpContext::from_blob(&srtp_blob);
+    // The other half of the video key encrypts the feedback we send back.
+    session.feedback = SrtcpEncryptor::from_blob(&feedback_blob);
+    // Our own SSRC as the sender of that feedback. The Mac answers the
+    // feedback it receives, and answers it to this address.
+    let mut ssrc_bytes = [0u8; 4];
+    rand::rng().fill_bytes(&mut ssrc_bytes);
+    session.feedback_ssrc = u32::from_be_bytes(ssrc_bytes);
     session.send_body(&offer).await?;
     session.send_body(&framebuffer_request(session.width, session.height)).await?;
     session.bind_video(host).await?;
@@ -577,6 +659,11 @@ async fn connect(
     // A periodic tick, so a round can be finished, timed out or reported
     // without waiting for the next thing to happen on the wire.
     let mut tick = tokio::time::interval(Duration::from_millis(250));
+    // The feedback state travels with the video task: the requests are
+    // about the video, and the video task is what notices that a picture
+    // was lost.
+    let mut feedback = session.feedback.take();
+    let feedback_ssrc = session.feedback_ssrc;
     let video_task = tokio::spawn(async move {
         if let (Some(sock), Some(ctx)) = (udp, srtp.as_mut()) {
             let mut buf = vec![0u8; 65535];
@@ -594,6 +681,13 @@ async fn connect(
             let mut stream_count = 1u32;
             let mut tiled_reported = false;
             let mut streams: std::collections::HashMap<u32, Stream> = std::collections::HashMap::new();
+            // How many holes we have already asked about.
+            let mut gaps_seen = 0u64;
+            // The last time a keyframe was asked for, so a burst of loss
+            // does not turn into a burst of requests.
+            let mut last_request = Instant::now() - Duration::from_secs(10);
+            // The media generation the video task last saw.
+            let mut last_generation = 0u64;
             loop {
                 let n = tokio::select! {
                     _ = cancel2.cancelled() => break,
@@ -688,6 +782,15 @@ async fn connect(
                     }
                 }
                 last_published = Instant::now();
+                // A new media generation means the encoder restarted: the
+                // first picture of the new stream is the one that says the
+                // new size is good, and asking for it is what recovers a
+                // restart whose first picture was lost.
+                let generation = video_generation.load(std::sync::atomic::Ordering::SeqCst);
+                if generation != last_generation {
+                    last_generation = generation;
+                    request_keyframe(&mut feedback, feedback_ssrc, ssrc, ctrl.as_ref(), &ctrl_dest, &mut last_request).await;
+                }
                 let units = stream.depay.push(rtp.seq, rtp.timestamp, rtp.marker, &rtp.payload);
                 if !units.is_empty() {
                     // A picture belongs to the media generation that was
@@ -697,10 +800,24 @@ async fn connect(
                 if !publish(&events2, units, &video_dimensions, &mut pictures).await {
                     break;
                 }
+                // A lost packet leaves the decoder holding a picture that
+                // refers to something it never received, and the picture
+                // stays wrong until the next independent picture. Ask for
+                // one.
+                if stream.depay.stats.gaps > gaps_seen {
+                    gaps_seen = stream.depay.stats.gaps;
+                    // Ask for the packets that went missing, and for a
+                    // fresh picture: the missing ones may come back, and
+                    // the fresh one is what repairs the reference chain
+                    // when they do not.
+                    let missing = stream.depay.stats.lost_sequences.clone();
+                    request_retransmission(&mut feedback, feedback_ssrc, ssrc, &missing, ctrl.as_ref(), &ctrl_dest).await;
+                    request_keyframe(&mut feedback, feedback_ssrc, ssrc, ctrl.as_ref(), &ctrl_dest, &mut last_request).await;
+                }
                 // Report on the stream's health, so a picture that is going
                 // wrong is visible in the log instead of being guessed at.
                 if packets % 120 == 0 {
-                    let stats = stream.depay.stats;
+                    let stats = &stream.depay.stats;
                     if stats.gaps > 0 || stats.malformed > 0 {
                         tracing::info!(
                             gaps = stats.gaps,
@@ -884,8 +1001,10 @@ async fn connect(
                     // The key and IV change; the session's sequence counters
                     // do not. Resetting them would make the next record fail
                     // its integrity check and end the session.
+                    let send_seq = session.layer.send_sequence();
+                    let recv_seq = session.layer.recv_sequence();
                     session.layer.rekey(key, iv);
-                    tracing::info!("Apple control layer rekeyed");
+                    tracing::info!(send_seq, recv_seq, "Apple control layer rekeyed");
                 }
                 // AppleDisplayLayout (0x451): authoritative geometry (R-A15).
                 if let Some((_, (bw, bh))) = find_display_layout(&body) {
@@ -984,8 +1103,11 @@ struct Live {
     layer: RecordLayer,
     width: u16,
     height: u16,
-    video: Depacketizer,
     srtp: Option<SrtpContext>,
+    /// Encrypts the RTCP feedback we send back to the Mac.
+    feedback: Option<SrtcpEncryptor>,
+    /// Our own SSRC, as the sender of that feedback.
+    feedback_ssrc: u32,
     udp: Option<UdpSocket>,
     ctrl: Option<UdpSocket>,
     incoming: Vec<u8>,
@@ -1313,6 +1435,48 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn a_lost_picture_is_asked_for_again() {
+        // The recovery path: a request for a fresh picture goes out on the
+        // control socket, protected with the feedback keys, and starts with
+        // a receiver report so the peer accepts it.
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let dest = format!("{}", socket.local_addr().unwrap());
+        let mut encryptor = SrtcpEncryptor::from_blob(&[3; 46]).unwrap();
+        let mut last = Instant::now() - Duration::from_secs(10);
+        request_keyframe(&mut Some(encryptor), 0x1111_2222, 0x3333_4444, Some(&socket), &dest, &mut last).await;
+        let mut buf = [0u8; 2048];
+        let (n, _) = socket.recv_from(&mut buf).await.unwrap();
+        assert!(n > 24);
+        // The compound packet starts with the receiver report, in the clear.
+        assert_eq!(buf[0], 0x80);
+        assert_eq!(buf[1], 201);
+        assert_eq!(&buf[4..8], &0x1111_2222u32.to_be_bytes());
+        // Everything after the receiver report is encrypted, so the
+        // request itself is not readable on the wire.
+        assert_ne!(&buf[8..12], &[0x84, 206, 0, 4]);
+        assert_ne!(&buf[20..24], &0x3333_4444u32.to_be_bytes());
+    }
+
+    #[tokio::test]
+    async fn a_request_is_not_sent_twice_in_a_row() {
+        // A burst of loss must not turn into a burst of requests.
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let dest = format!("{}", socket.local_addr().unwrap());
+        let mut encryptor = SrtcpEncryptor::from_blob(&[3; 46]).unwrap();
+        let mut last = Instant::now() - Duration::from_secs(10);
+        request_keyframe(&mut Some(encryptor), 1, 2, Some(&socket), &dest, &mut last).await;
+        let mut buf = [0u8; 2048];
+        socket.recv_from(&mut buf).await.unwrap();
+        // The second request is held back.
+        let mut encryptor = SrtcpEncryptor::from_blob(&[3; 46]).unwrap();
+        request_keyframe(&mut Some(encryptor), 1, 2, Some(&socket), &dest, &mut last).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), socket.recv_from(&mut buf)).await.is_err(),
+            "a second request was sent straight after the first"
+        );
+    }
+
+    #[tokio::test]
     async fn releasing_everything_held_says_so_on_the_wire() {
         // A key or a button that was pressed and never released stays down on
         // the remote machine. The only way to release it is to say so.
@@ -1323,8 +1487,8 @@ mod tests {
             tcp,
             layer: RecordLayer::new([1; 16], [2; 16]),
             width: 1, height: 1,
-            video: Depacketizer::default(),
-            srtp: None, udp: None, ctrl: None,
+            srtp: None, feedback: None, feedback_ssrc: 0,
+            udp: None, ctrl: None,
             incoming: Vec::with_capacity(8192),
         };
         let mut held = Held::default();
@@ -1362,8 +1526,8 @@ mod tests {
             tcp,
             layer: RecordLayer::new([1; 16], [2; 16]),
             width: 1, height: 1,
-            video: Depacketizer::default(),
-            srtp: None, udp: None, ctrl: None,
+            srtp: None, feedback: None, feedback_ssrc: 0,
+            udp: None, ctrl: None,
             incoming: Vec::with_capacity(8192),
         };
         let mut sender = RecordLayer::new([1; 16], [2; 16]);

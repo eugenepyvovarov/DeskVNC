@@ -16,8 +16,12 @@ use rand::{Rng, RngExt};
 const HEVC_PARAMS_NO_LTR: &[u8] =
     b"FLS;MS:-1;LF:-1;CABAC;POS:0;EOD:1;HTS:2;RR:3;AR:16/9,5/8;XR:16/9,5/8;";
 
-/// `(message, server-to-viewer video key)`. The key decrypts the UDP stream.
-pub fn media_offer() -> (Vec<u8>, [u8; 46]) {
+/// `(message, server-to-viewer video key, viewer-to-server video key)`.
+///
+/// The first key decrypts the UDP stream. The second encrypts the feedback
+/// we send back: without it there is no way to ask the Mac for a fresh
+/// picture when one is lost.
+pub fn media_offer() -> (Vec<u8>, [u8; 46], [u8; 46]) {
     let audio_v = random_46();
     let audio_s = random_46();
     let video_v = random_46();
@@ -41,7 +45,7 @@ pub fn media_offer() -> (Vec<u8>, [u8; 46]) {
     buf[vo..vo + 0x2e].copy_from_slice(&video_v);
     buf[vo + 0x2e..vo + 0x5c].copy_from_slice(&video_s);
     buf[vo + 0x5c..].copy_from_slice(&video);
-    (buf, video_s)
+    (buf, video_s, video_v)
 }
 
 fn media_blob(mode: u64) -> Vec<u8> {
@@ -298,9 +302,11 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn offer_plist_loads() {
-        let (msg, key) = media_offer();
+        let (msg, key, feedback_key) = media_offer();
         assert_eq!(msg[0], 0x1c);
         assert_eq!(key.len(), 46);
+        assert_eq!(feedback_key.len(), 46);
+        assert_ne!(key, feedback_key, "the two directions must not share a key");
         assert!(msg.len() < 60_000, "offer is {} bytes", msg.len());
         let path = std::env::temp_dir().join(format!("apple-offer-test-{}.bin", std::process::id()));
         use std::os::unix::fs::OpenOptionsExt;

@@ -242,6 +242,74 @@ pub struct Rtp {
     pub payload: Vec<u8>,
 }
 
+/// The sending half of SRTCP: encrypts and authenticates the feedback we
+/// send back to the Mac.
+///
+/// The keys come from the same 46 byte blob as the media keys, but with
+/// their own labels (3, 4 and 5), because the RTCP stream is keyed
+/// separately from the RTP stream even though they share a socket.
+///
+/// The first eight bytes of an RTCP packet are the header and the sender's
+/// SSRC; they travel in the clear, and the rest is encrypted. The index is
+/// appended after the ciphertext and before the tag.
+#[derive(Clone)]
+pub struct SrtcpEncryptor {
+    cipher_key: [u8; 32],
+    auth_key: [u8; 20],
+    salt: [u8; 14],
+    /// The index of the next packet sent.
+    index: u32,
+}
+
+impl SrtcpEncryptor {
+    pub fn from_blob(blob: &[u8]) -> Option<Self> {
+        if blob.len() != 46 {
+            return None;
+        }
+        let mut master_key = [0u8; 32];
+        let mut master_salt = [0u8; 14];
+        master_key.copy_from_slice(&blob[..32]);
+        master_salt.copy_from_slice(&blob[32..]);
+        Some(Self {
+            cipher_key: derive(&master_key, &master_salt, 3, 32).try_into().ok()?,
+            auth_key: derive(&master_key, &master_salt, 4, 20).try_into().ok()?,
+            salt: derive(&master_key, &master_salt, 5, 14).try_into().ok()?,
+            index: 0,
+        })
+    }
+
+    /// Protect one RTCP packet.
+    pub fn protect(&mut self, packet: &[u8]) -> Option<Vec<u8>> {
+        if packet.len() < 8 {
+            return None;
+        }
+        let index = self.index;
+        self.index = self.index.wrapping_add(1);
+        let ssrc = u32::from_be_bytes(packet[4..8].try_into().ok()?);
+        let mut iv = [0u8; 16];
+        iv[..14].copy_from_slice(&self.salt);
+        iv[4] ^= (ssrc >> 24) as u8;
+        iv[5] ^= (ssrc >> 16) as u8;
+        iv[6] ^= (ssrc >> 8) as u8;
+        iv[7] ^= ssrc as u8;
+        iv[10] ^= (index >> 24) as u8;
+        iv[11] ^= (index >> 16) as u8;
+        iv[12] ^= (index >> 8) as u8;
+        iv[13] ^= index as u8;
+        let mut body = packet[..8].to_vec();
+        let mut payload = packet[8..].to_vec();
+        apply_keystream(&self.cipher_key, &iv, &mut payload);
+        body.extend_from_slice(&payload);
+        // The index travels with the packet, with the high bit set.
+        body.extend_from_slice(&(0x8000_0000 | index).to_be_bytes());
+        let mut mac = <HmacSha1 as Mac>::new_from_slice(&self.auth_key).ok()?;
+        mac.update(&body);
+        let tag = mac.finalize().into_bytes();
+        body.extend_from_slice(&tag[..10]);
+        Some(body)
+    }
+}
+
 fn rtp_header_len(packet: &[u8]) -> Option<usize> {
     let cc = (packet[0] & 0x0f) as usize;
     let mut len = 12 + 4 * cc;
@@ -354,6 +422,39 @@ mod tests {
         assert_eq!(receiver.unprotect(&packet).unwrap().payload, [0x65, 1, 2, 3]);
         packet[12] ^= 1;
         assert!(receiver.unprotect(&packet).is_none());
+    }
+
+    #[test]
+    fn an_encrypted_feedback_packet_carries_its_index_and_tag() {
+        let mut encryptor = SrtcpEncryptor::from_blob(&[7; 46]).unwrap();
+        let packet = crate::rtcp::compound(0x1122_3344, &crate::rtcp::full_intra_request(0x1122_3344, 0x2222_3333, 1));
+        let protected = encryptor.protect(&packet).unwrap();
+        // The header and the sender's SSRC travel in the clear.
+        assert_eq!(&protected[..8], &packet[..8]);
+        // The ciphertext, the index and the tag follow.
+        assert_eq!(protected.len(), packet.len() + 4 + 10);
+        let index = u32::from_be_bytes(protected[packet.len()..packet.len() + 4].try_into().unwrap());
+        assert_eq!(index, 0x8000_0000);
+        // The second packet gets the next index.
+        let second = encryptor.protect(&packet).unwrap();
+        let index = u32::from_be_bytes(second[packet.len()..packet.len() + 4].try_into().unwrap());
+        assert_eq!(index, 0x8000_0001);
+    }
+
+    #[test]
+    fn the_feedback_keys_differ_from_the_media_keys() {
+        let blob = [11u8; 46];
+        let mut media = SrtpContext::from_blob(&blob).unwrap();
+        let mut rtcp = SrtcpEncryptor::from_blob(&blob).unwrap();
+        let packet = crate::rtcp::receiver_report(1);
+        let protected = rtcp.protect(&packet).unwrap();
+        // The feedback is not readable as the media stream: the media keys
+        // are not the feedback keys.
+        assert!(media.unprotect(&protected).is_none());
+        // The header travels in the clear, and the rest is the index and
+        // the tag.
+        assert_eq!(&protected[..8], &packet[..8]);
+        assert_eq!(protected.len(), packet.len() + 4 + 10);
     }
 
     #[test]

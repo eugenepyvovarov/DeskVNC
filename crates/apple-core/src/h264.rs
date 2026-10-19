@@ -35,7 +35,7 @@ const MAX_ACCESS_UNIT_BYTES: usize = 8 * 1024 * 1024;
 
 /// What the depacketizer has seen. Cheap to read, and the only honest way
 /// to tell "the picture is fine" from "the picture is broken".
-#[derive(Default, Debug, Clone, Copy)]
+#[derive(Default, Debug, Clone)]
 pub struct Stats {
     /// Packets handed to the depacketizer.
     pub packets: u64,
@@ -47,6 +47,9 @@ pub struct Stats {
     pub gaps: u64,
     /// Packets missing across all holes.
     pub lost_packets: u64,
+    /// The sequence numbers of the packets that went missing, most recent
+    /// last. Bounded, because this is a report and not a history.
+    pub lost_sequences: Vec<u16>,
     /// Packets that could not be parsed (a truncated aggregation, a length
     /// that does not fit).
     pub malformed: u64,
@@ -137,7 +140,7 @@ impl Depacketizer {
                     self.buffer(seq, timestamp, marker, payload);
                 } else {
                     // Too far ahead: the packets in between are lost.
-                    self.report_gap(u64::from(ahead - 1));
+                    self.report_gap(expected, u64::from(ahead - 1));
                     self.expected = Some(seq);
                     self.assemble(timestamp, marker, payload);
                     self.expected = Some(seq.wrapping_add(1));
@@ -146,12 +149,6 @@ impl Depacketizer {
             }
         }
         std::mem::take(&mut self.ready)
-    }
-
-    /// Whether a fresh parameter set is needed, i.e. the decoder must be
-    /// rebuilt before the next picture.
-    pub fn has_parameter_sets(&self) -> bool {
-        !self.sps.is_empty() && !self.pps.is_empty()
     }
 
     /// Forget the stream: the next picture starts a new one.
@@ -218,7 +215,7 @@ impl Depacketizer {
         let Some(&seq) = self.reorder.keys().next() else { return };
         let expected = self.expected.unwrap_or(seq);
         let skipped = seq.wrapping_sub(expected);
-        self.report_gap(u64::from(skipped));
+        self.report_gap(expected, u64::from(skipped));
         let Some(packet) = self.reorder.remove(&seq) else { return };
         self.reorder_bytes = self.reorder_bytes.saturating_sub(packet.payload.len());
         self.expected = Some(seq);
@@ -229,9 +226,17 @@ impl Depacketizer {
 
     /// A hole in the sequence numbers. The picture it belongs to can never
     /// be assembled correctly, so it is thrown away.
-    fn report_gap(&mut self, lost: u64) {
+    fn report_gap(&mut self, from: u16, lost: u64) {
         self.stats.gaps += 1;
         self.stats.lost_packets += lost;
+        // Remember which packets went missing, so they can be asked for.
+        for i in 0..lost.min(64) {
+            self.stats.lost_sequences.push(from.wrapping_add(i as u16));
+        }
+        if self.stats.lost_sequences.len() > 64 {
+            let excess = self.stats.lost_sequences.len() - 64;
+            self.stats.lost_sequences.drain(..excess);
+        }
         self.discard_picture();
     }
 
@@ -259,9 +264,10 @@ impl Depacketizer {
             24 => match stap_a(payload) {
                 Ok(nals) => nals,
                 Err(()) => {
-                    // A truncated aggregation: the picture is broken.
+                    // A truncated aggregation: the picture is broken. No
+                    // packet went missing, but the picture is unusable.
                     self.stats.malformed += 1;
-                    self.report_gap(0);
+                    self.discard_picture();
                     return;
                 }
             },
@@ -282,7 +288,7 @@ impl Depacketizer {
             self.pending_bytes += nal.len();
             if self.pending_bytes > MAX_ACCESS_UNIT_BYTES {
                 self.stats.malformed += 1;
-                self.report_gap(0);
+                self.discard_picture();
                 return;
             }
             self.pending.push(nal);
