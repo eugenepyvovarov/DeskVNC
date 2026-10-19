@@ -13,6 +13,16 @@ export interface MacDisplayInfo {
 }
 export type MacDisplayAction = { action: "list" | "restore" } | { action: "set"; width: number; height: number };
 
+/** A size at half the native one, keeping its shape. */
+function half(native: { w: number; h: number }): { w: number; h: number } {
+  return { w: Math.max(2, Math.round(native.w / 2) & ~1), h: Math.max(2, Math.round(native.h / 2) & ~1) };
+}
+
+/** A size at a third of the native one, keeping its shape. */
+function third(native: { w: number; h: number }): { w: number; h: number } {
+  return { w: Math.max(2, Math.round(native.w / 3) & ~1), h: Math.max(2, Math.round(native.h / 3) & ~1) };
+}
+
 /**
  * Two separate Mac-side levers, honestly labelled:
  * stream size (the Apple Remote Desktop approach, over the live Screen
@@ -40,11 +50,13 @@ export function MacDisplayControls(props: {
         <strong>Stream size</strong>
         <p className="mt-1 text-secondary">Ask the Mac to render and stream at a smaller resolution, over the live session. This is the Apple Remote Desktop approach; the layout the Mac confirms is what you get.</p>
         <div className="mt-2 flex flex-wrap gap-2">
-          <button className="rounded border border-subtle px-2 py-1" onClick={() => props.onStreamResize(1920, 1080)}>1920×1080</button>
-          <button className="rounded border border-subtle px-2 py-1" onClick={() => props.onStreamResize(2560, 1440)}>2560×1440</button>
-          {native && <button className="rounded border border-subtle px-2 py-1" onClick={() => props.onStreamResize(native.w, native.h)}>Native ({native.w}×{native.h})</button>}
+          {native && <>
+            <button className="rounded border border-subtle px-2 py-1" onClick={() => props.onStreamResize(native.w, native.h)}>Native ({native.w}×{native.h})</button>
+            <button className="rounded border border-subtle px-2 py-1" onClick={() => props.onStreamResize(half(native).w, half(native).h)}>Half ({half(native).w}×{half(native).h})</button>
+            <button className="rounded border border-subtle px-2 py-1" onClick={() => props.onStreamResize(third(native).w, third(native).h)}>Third ({third(native).w}×{third(native).h})</button>
+          </>}
         </div>
-        <p className="mt-1 text-tertiary">The Quality menu maps its presets onto these sizes for a Mac.</p>
+        <p className="mt-1 text-tertiary">The Mac keeps its desktop at the size you arranged it at; only the number of pixels that arrive changes. The Quality menu maps its presets onto these sizes for a Mac.</p>
       </div>
       <div>
         <strong>Physical panel mode (advanced)</strong>

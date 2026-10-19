@@ -944,21 +944,55 @@ export function SessionToolbar(props: SessionToolbarProps): ReactNode {
                 346 ms because Auto dropped the quality on its own.
               */}
               <p className="px-2.5 py-1 text-2xs text-tertiary">Picture vs response</p>
-              <MenuRow selected={props.quality === "auto"} onClick={() => props.onQuality("auto")}>
-                Auto — sharp when idle, faster under load
-              </MenuRow>
-              <MenuRow selected={props.quality === "high"} onClick={() => props.onQuality("high")}>
-                Sharp — best picture, never adapts
-              </MenuRow>
-              <MenuRow selected={props.quality === "medium"} onClick={() => props.onQuality("medium")}>
-                Balanced
-              </MenuRow>
-              <MenuRow selected={props.quality === "low"} onClick={() => props.onQuality("low")}>
-                Responsive — softer picture, lowest lag
-              </MenuRow>
-              <MenuRow selected={props.quality === "bw"} onClick={() => props.onQuality("bw")}>
-                Black &amp; White
-              </MenuRow>
+              {/*
+                The Apple path has no adaptation of its own: the preset
+                asks the Mac for a picture of a given size and the Mac
+                renders it. So the labels say what the preset does rather
+                than promising a cleverness that is not there. "Auto" is the
+                Mac's own resolution, and "Black & White" is the smallest
+                picture, not a grey one.
+              */}
+              {props.protocol === "apple" ? (
+                <>
+                  <MenuRow selected={props.quality === "auto"} onClick={() => props.onQuality("auto")}>
+                    Full resolution — the Mac&apos;s own
+                  </MenuRow>
+                  <MenuRow selected={props.quality === "high"} onClick={() => props.onQuality("high")}>
+                    Sharp — the Mac&apos;s own resolution
+                  </MenuRow>
+                  <MenuRow selected={props.quality === "medium"} onClick={() => props.onQuality("medium")}>
+                    Balanced — fewer pixels, same desktop
+                  </MenuRow>
+                  <MenuRow selected={props.quality === "low"} onClick={() => props.onQuality("low")}>
+                    Responsive — fewest pixels, lowest lag
+                  </MenuRow>
+                  <MenuRow selected={props.quality === "bw"} onClick={() => props.onQuality("bw")}>
+                    Smallest — fewest pixels
+                  </MenuRow>
+                  <p className="px-2.5 pb-1 text-2xs text-tertiary">
+                    The Mac renders the picture at this size. Its desktop keeps the size
+                    you arranged it at; the physical panel is a separate control.
+                  </p>
+                </>
+              ) : (
+                <>
+                  <MenuRow selected={props.quality === "auto"} onClick={() => props.onQuality("auto")}>
+                    Auto — sharp when idle, faster under load
+                  </MenuRow>
+                  <MenuRow selected={props.quality === "high"} onClick={() => props.onQuality("high")}>
+                    Sharp — best picture, never adapts
+                  </MenuRow>
+                  <MenuRow selected={props.quality === "medium"} onClick={() => props.onQuality("medium")}>
+                    Balanced
+                  </MenuRow>
+                  <MenuRow selected={props.quality === "low"} onClick={() => props.onQuality("low")}>
+                    Responsive — softer picture, lowest lag
+                  </MenuRow>
+                  <MenuRow selected={props.quality === "bw"} onClick={() => props.onQuality("bw")}>
+                    Black &amp; White
+                  </MenuRow>
+                </>
+              )}
               {/*
                 Hidden for RDP rather than disabled, and that asymmetry with
                 "Remote resize" above is deliberate. This switch exists for a
