@@ -15,6 +15,7 @@ it("keeps only the latest decoded continuous picture until the next paint", () =
   const renderer = Object.assign(Object.create(WebGLRenderer.prototype), {
     h264: new Map(), generation: 1, disposed: false,
     continuousH264: true, latestVideo: null,
+    fbWidth: 3600, fbHeight: 2338,
     uploadVideoFrame: upload,
   });
   renderer.createH264({ x: 0, y: 0, w: 3600, h: 2338 }, 0, new Uint8Array());
@@ -55,6 +56,90 @@ it("feeds continuous AVC without waiting for output and converts Annex-B lengths
   expect(Array.from(decode.mock.calls[0][0].data)).toEqual([
     0, 0, 0, 2, 0x65, 0xaa, 0, 0, 0, 2, 0x61, 0xbb,
   ]);
+});
+
+/** A renderer with texture allocation but no real browser/GPU. */
+function sizedDecoderHarness(extra: Record<string, unknown> = {}) {
+  return decoderHarness({
+    fbWidth: 3600, fbHeight: 2338, sawFrame: true,
+    mediaPictureWidth: 3600, mediaPictureHeight: 2338,
+    mediaDecoded: 0,
+    frameTex: {}, scratchTex: {},
+    gl: {
+      bindTexture: vi.fn(), texImage2D: vi.fn(), texSubImage2D: vi.fn(),
+      TEXTURE_2D: 1, RGBA8: 2, RGBA: 3, UNSIGNED_BYTE: 4,
+    },
+    clearViewRect: vi.fn(), markDirty: vi.fn(),
+    ...extra,
+  });
+}
+
+it("does not let a previous H.264 rectangle override a normal framebuffer resize", () => {
+  const renderer = sizedDecoderHarness({
+    continuousH264: false, mediaPictureWidth: 320, mediaPictureHeight: 240,
+  });
+  renderer.setRemoteSize(1920, 1080);
+  expect(renderer.getRemoteSize()).toEqual({ width: 1920, height: 1080 });
+});
+
+it("adopts decoded dimensions even when they already match the new context rectangle", () => {
+  let output: (frame: unknown) => void = () => {};
+  vi.stubGlobal("VideoDecoder", class {
+    state = "configured";
+    constructor(callbacks: { output: typeof output }) { output = callbacks.output; }
+    configure() {}
+    close() { this.state = "closed"; }
+  });
+  const renderer = sizedDecoderHarness();
+  for (const [w, h] of [[1800, 1170], [2700, 1754], [3600, 2338]]) {
+    renderer.closeAllH264();
+    renderer.createH264({ x: 0, y: 0, w, h }, 0, new Uint8Array());
+    const frame = { displayWidth: w, displayHeight: h, timestamp: 1, close: vi.fn() };
+    output(frame);
+    expect(renderer.getRemoteSize()).toEqual({ width: w, height: h });
+    expect(renderer.latestVideo.frame).toBe(frame);
+  }
+});
+
+it("keeps the last continuous picture until replacement output, not the layout, arrives", () => {
+  let output: (frame: unknown) => void = () => {};
+  vi.stubGlobal("VideoDecoder", class {
+    state = "configured";
+    constructor(callbacks: { output: typeof output }) { output = callbacks.output; }
+    configure() {}
+    close() { this.state = "closed"; }
+  });
+  const renderer = sizedDecoderHarness();
+  const ctx = renderer.createH264({ x: 0, y: 0, w: 3600, h: 2338 }, 0, new Uint8Array());
+  renderer.setRemoteSize(2700, 1754);
+  expect(renderer.getRemoteSize()).toEqual({ width: 3600, height: 2338 });
+  expect(renderer.h264.get(0)).toBe(ctx);
+  expect(renderer.gl.texImage2D).not.toHaveBeenCalled();
+  output({ displayWidth: 2700, displayHeight: 1754, close: vi.fn() });
+  expect(renderer.getRemoteSize()).toEqual({ width: 2700, height: 1754 });
+  expect(renderer.h264.get(0)).toBe(ctx);
+});
+
+it("ignores output and errors from a retired decoder sharing the replacement's slot", () => {
+  const callbacks: { output: (f: unknown) => void; error: (e: Error) => void }[] = [];
+  vi.stubGlobal("VideoDecoder", class {
+    state = "configured";
+    constructor(c: typeof callbacks[number]) { callbacks.push(c); }
+    configure() {}
+    close() { this.state = "closed"; }
+  });
+  const renderer = sizedDecoderHarness();
+  renderer.createH264({ x: 0, y: 0, w: 3600, h: 2338 }, 0, new Uint8Array());
+  renderer.closeH264(0);
+  const replacement = renderer.createH264({ x: 0, y: 0, w: 2700, h: 1754 }, 0, new Uint8Array());
+  const stale = { displayWidth: 1800, displayHeight: 1170, close: vi.fn() };
+  callbacks[0].output(stale);
+  expect(stale.close).toHaveBeenCalledOnce();
+  expect(renderer.latestVideo).toBeNull();
+  expect(renderer.mediaPictureWidth).toBe(3600);
+  callbacks[0].error(new Error("late old decoder error"));
+  expect(renderer.h264.get(0)).toBe(replacement);
+  expect(renderer.h264Failures).toBe(0);
 });
 
 /** A renderer with just enough state for the decoder paths. */

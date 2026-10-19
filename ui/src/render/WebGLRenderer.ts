@@ -762,21 +762,11 @@ export class WebGLRenderer {
 
   /** Set remote framebuffer size (on connect and DesktopResize). */
   setRemoteSize(width: number, height: number, preserveVideo = false): void {
-    // The PICTURE decides the size of the frame, not the layout.
-    //
-    // A layout says how big the remote desktop is; the picture says how big
-    // the frame has to be to hold it. When the two disagree — and they do,
-    // because a Mac may answer with a different picture size than the one
-    // that was asked for — a frame of the layout's size either crops the
-    // picture or magnifies it, and the picture looks wrong in a way nobody
-    // can name. The picture is what is on the screen, so the picture wins.
-    if (
-      this.mediaPictureWidth > 0 &&
-      (this.mediaPictureWidth !== width || this.mediaPictureHeight !== height)
-    ) {
-      width = this.mediaPictureWidth;
-      height = this.mediaPictureHeight;
-    }
+    // Apple is a full-picture stream: keep its last texture and decoder
+    // while a layout announces the next size. Only decoded replacement
+    // output (preserveVideo) can resize it. A cached *old* picture size must
+    // not override that output, or an ordinary VNC/RDP framebuffer resize.
+    if (this.continuousH264 && !preserveVideo && this.h264.size > 0) return;
     if (width === this.fbWidth && height === this.fbHeight) return;
     const gl = this.gl;
     this.fbWidth = width;
@@ -1316,7 +1306,7 @@ export class WebGLRenderer {
     try {
       ctx.decoder = new VideoDecoder({
         output: (frame: VideoFrame) => {
-          if (this.disposed || generation !== this.generation) {
+          if (this.disposed || generation !== this.generation || this.h264.get(id) !== ctx) {
             frame.close();
             return;
           }
@@ -1349,11 +1339,12 @@ export class WebGLRenderer {
             // deadlocks that pipeline until each waiter expires.
             const w = frame.displayWidth || frame.codedWidth;
             const h = frame.displayHeight || frame.codedHeight;
-            if (ctx.w !== w || ctx.h !== h) {
-              ctx.w = w;
-              ctx.h = h;
-              this.setRemoteSize(w, h, true);
-            }
+            ctx.w = w;
+            ctx.h = h;
+            // A replacement context may already carry the new rectangle
+            // size while the texture still has the previous size. Compare
+            // against the framebuffer, not against that context rectangle.
+            this.setRemoteSize(w, h, true);
             // Decode all reference pictures, but present only the freshest
             // output at the next paint. Never turn a burst into a display FIFO.
             this.latestVideo?.frame.close();
@@ -1414,7 +1405,7 @@ export class WebGLRenderer {
    */
   private onH264Error(ctx: H264Context, id: number, error: unknown): void {
     traceMark("h264_decode_error");
-    if (this.disposed || ctx.generation !== this.generation) return;
+    if (this.disposed || ctx.generation !== this.generation || this.h264.get(id) !== ctx) return;
     const detail = error instanceof Error ? error.message : String(error);
     const hardwareRefused = !ctx.outputSeen && ctx.acceleration === "prefer-hardware";
     this.closeH264(id);
