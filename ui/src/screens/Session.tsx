@@ -21,6 +21,7 @@ import {
 import { useLivePreview } from "../hooks/useLivePreview";
 import { SessionStatusDetails, SessionToolbar } from "../components/SessionToolbar";
 import { CertPrompt } from "../components/CertPrompt";
+import { MacDisplayControls } from "../components/MacDisplayControls";
 import { CredentialPrompt } from "../components/CredentialPrompt";
 import { SshHostKeyPrompt } from "../components/SshHostKeyPrompt";
 import { DropOverlay, FilePanel } from "../components/FilePanel";
@@ -378,6 +379,9 @@ function SessionView({
   const sendComboRef = useRef<((c: "ctrl-alt-del") => void) | null>(null);
   const disconnectRef = useRef<(() => void) | null>(null);
   const [remoteSize, setRemoteSize] = useState<{ w: number; h: number } | null>(null);
+  /** The geometry the session started with: the "Native" restore target. */
+  const nativeSizeRef = useRef<{ w: number; h: number } | null>(null);
+  if (remoteSize && !nativeSizeRef.current) nativeSizeRef.current = remoteSize;
   /**
    * The monitor the user asked for, remembered against this computer, or null
    * for the whole desktop.
@@ -454,6 +458,7 @@ function SessionView({
       return;
     }
     rendererRef.current = renderer;
+    renderer.setContinuousH264(params.protocol === "apple");
     // The pointer preference was read before this renderer existed; see the
     // effect that owns `showRemoteCursorRef`.
     renderer.setCursorVisible(showRemoteCursorRef.current);
@@ -1952,6 +1957,13 @@ function SessionView({
         tabIndex={0}
         aria-label={`Remote desktop: ${session.desktopName}`}
       />
+
+      {params.protocol === "apple" && owns && <MacDisplayControls
+        info={session.macDisplayInfo} notice={session.macDisplayNotice}
+        busy={session.macDisplayBusy} size={remoteSize} native={nativeSizeRef.current}
+        onStreamResize={(w, h) => session.requestResize(w, h)}
+        onPanelMode={session.requestMacDisplay}
+      />}
 
       {/* Preferences ▸ Session can take the bar away; the View and Session
           menus carry the same options either way.

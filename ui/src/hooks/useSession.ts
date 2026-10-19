@@ -29,6 +29,7 @@ import {
 } from "../render/frameProtocol";
 import { encodeTerminalInput, encodeTerminalResize } from "../render/input";
 import type { PromptAnswer } from "../lib/credentials";
+import type { MacDisplayAction, MacDisplayInfo } from "../components/MacDisplayControls";
 import { initTrace, traceMark } from "../render/trace";
 import type {
   CredentialRequest,
@@ -70,7 +71,9 @@ type SshOnlyEvent =
   | { type: "ssh-notice"; message: string };
 
 /** `SessionEventPayload`, widened by `SshOnlyEvent` for the listener below. */
-type SessionOrSshEventPayload = SessionEventPayload | (SshOnlyEvent & { sessionId: string });
+type SessionOrSshEventPayload = SessionEventPayload | (SshOnlyEvent & { sessionId: string })
+  | { type: "apple-display"; sessionId: string; info: MacDisplayInfo | null; error: string | null }
+  | { type: "apple-notice"; sessionId: string; message: string }; 
 
 export interface CertPromptState {
   fingerprint: string;
@@ -118,6 +121,10 @@ export interface SshHostKeyPromptState {
 }
 
 export interface SessionApi {
+  macDisplayInfo: MacDisplayInfo | null;
+  macDisplayNotice: string | null;
+  macDisplayBusy: boolean;
+  requestMacDisplay: (action: MacDisplayAction) => void;
   boundaryControl: boolean | null;
   state: SessionState;
   desktopName: string;
@@ -333,6 +340,9 @@ export function useSession(
   const [boundaryControl, setBoundaryControl] = useState<boolean | null>(params.protocol === "boundary" ? false : null);
   const [screens, setScreens] = useState<RemoteScreen[]>([]);
   const [stats, setStats] = useState<SessionStats | null>(null);
+  const [macDisplayInfo, setMacDisplayInfo] = useState<MacDisplayInfo | null>(null);
+  const [macDisplayNotice, setMacDisplayNotice] = useState<string | null>(null);
+  const [macDisplayBusy, setMacDisplayBusy] = useState(false);
   const [certPrompt, setCertPrompt] = useState<CertPromptState | null>(null);
   const [sshHostKeyPrompt, setSshHostKeyPrompt] = useState<SshHostKeyPromptState | null>(null);
   const [credentialRequest, setCredentialRequest] = useState<CredentialRequest | null>(null);
@@ -499,6 +509,14 @@ export function useSession(
           // (attempt > 1) replaces the request in place so the dialog can
           // show the rejection reason without flickering.
           setCredentialRequest(ev.request);
+          break;
+        case "apple-display":
+          setMacDisplayBusy(false);
+          if (ev.info) setMacDisplayInfo(ev.info);
+          setMacDisplayNotice(ev.error ?? "Physical display mode confirmed by macOS.");
+          break;
+        case "apple-notice":
+          setMacDisplayNotice(ev.message);
           break;
         case "stats":
           setStats(ev.stats);
@@ -683,6 +701,14 @@ export function useSession(
   // ---------------------------------------------------------------- actions
 
   const sid = (): string => sessionIdRef.current;
+  const requestMacDisplay = useCallback((action: MacDisplayAction): void => {
+    setMacDisplayBusy(true);
+    setMacDisplayNotice("Waiting for macOS; the SSH host key must already be trusted.");
+    void invoke("apple_display", { sessionId: sessionIdRef.current, action }).catch(error => {
+      setMacDisplayBusy(false);
+      setMacDisplayNotice(String(error));
+    });
+  }, []);
 
   /**
    * Input goes out in ORDER, but not one packet per IPC call.
@@ -1005,6 +1031,7 @@ export function useSession(
   }, []);
 
   return {
+    macDisplayInfo, macDisplayNotice, macDisplayBusy, requestMacDisplay,
     state, desktopName, boundaryControl, screens, stats, certPrompt, sshHostKeyPrompt, credentialRequest, lastCredentialAnswer, remoteClipboard, bellTick,
     sshAttached, sshNotice,
     sendInput, sendTerminalInput, sendTerminalResize, disconnect, reconnectNow, setQuality, setViewOnly, refreshScreen,

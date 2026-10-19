@@ -119,6 +119,7 @@ void main() {
 /** One live `VideoDecoder` plus the rect geometry it decodes into. */
 interface H264Context {
   decoder: VideoDecoder;
+  avc: boolean;
   x: number;
   y: number;
   w: number;
@@ -442,6 +443,88 @@ function compile(gl: WebGL2RenderingContext, type: number, src: string): WebGLSh
   return sh;
 }
 
+/** Use avcC plus length-prefixed chunks: WebKit's Annex-B path fails decoding. */
+function h264Config(annexb: Uint8Array): VideoDecoderConfig {
+  const sets = parameterSets(annexb);
+  if (!sets) return { codec: "avc1.42E01E", optimizeForLatency: true };
+  const codec =
+    "avc1." +
+    sets.sps[1].toString(16).padStart(2, "0") +
+    sets.sps[2].toString(16).padStart(2, "0") +
+    sets.sps[3].toString(16).padStart(2, "0");
+  return {
+    codec,
+    description: avcDecoderConfig(sets.sps, sets.pps),
+    optimizeForLatency: true,
+  };
+}
+
+function lengthPrefixedH264(annexb: Uint8Array): Uint8Array {
+  const nals = annexBNals(annexb);
+  const data = new Uint8Array(nals.reduce((total, nal) => total + 4 + nal.length, 0));
+  const view = new DataView(data.buffer);
+  let offset = 0;
+  for (const nal of nals) {
+    view.setUint32(offset, nal.length, false);
+    offset += 4;
+    data.set(nal, offset);
+    offset += nal.length;
+  }
+  return data;
+}
+
+function parameterSets(data: Uint8Array): { sps: Uint8Array; pps: Uint8Array } | null {
+  const nals = annexBNals(data);
+  const sps = nals.find((n) => (n[0] & 0x1f) === 7);
+  const pps = nals.find((n) => (n[0] & 0x1f) === 8);
+  if (!sps || sps.length < 4 || !pps) return null;
+  return { sps, pps };
+}
+
+function annexBNals(data: Uint8Array): Uint8Array[] {
+  const marks: number[] = [];
+  for (let i = 0; i + 3 < data.length; i++) {
+    if (data[i] !== 0 || data[i + 1] !== 0) continue;
+    if (data[i + 2] === 1) {
+      marks.push(i + 3);
+      i += 2;
+    } else if (data[i + 2] === 0 && data[i + 3] === 1) {
+      marks.push(i + 4);
+      i += 3;
+    }
+  }
+  const nals: Uint8Array[] = [];
+  for (let s = 0; s < marks.length; s++) {
+    const begin = marks[s];
+    let end = data.length;
+    if (s + 1 < marks.length) {
+      const next = marks[s + 1];
+      end = next >= 4 && data[next - 4] === 0 && data[next - 3] === 0 && data[next - 2] === 0 ? next - 4 : next - 3;
+    }
+    if (end > begin) nals.push(data.subarray(begin, end));
+  }
+  return nals;
+}
+
+function avcDecoderConfig(sps: Uint8Array, pps: Uint8Array): Uint8Array {
+  const out = new Uint8Array(11 + sps.length + pps.length);
+  out[0] = 1;
+  out[1] = sps[1];
+  out[2] = sps[2];
+  out[3] = sps[3];
+  out[4] = 0xff;
+  out[5] = 0xe1;
+  out[6] = sps.length >> 8;
+  out[7] = sps.length & 0xff;
+  out.set(sps, 8);
+  const p = 8 + sps.length;
+  out[p] = 1;
+  out[p + 1] = pps.length >> 8;
+  out[p + 2] = pps.length & 0xff;
+  out.set(pps, p + 3);
+  return out;
+}
+
 export class WebGLRenderer {
   private gl: WebGL2RenderingContext;
   private canvas: HTMLCanvasElement;
@@ -516,6 +599,13 @@ export class WebGLRenderer {
   // context id the backend assigns per rect geometry (0..63).
   private h264 = new Map<number, H264Context>();
   private h264Failed = false;
+  private continuousH264 = false;
+  private latestVideo: { frame: VideoFrame; ctx: H264Context } | null = null;
+
+  /** Full-screen media streams must not wait for a frame before feeding the next. */
+  setContinuousH264(enabled: boolean): void {
+    this.continuousH264 = enabled;
+  }
 
   onFirstFrame: (() => void) | null = null;
 
@@ -618,17 +708,18 @@ export class WebGLRenderer {
   // ------------------------------------------------------------------ sizing
 
   /** Set remote framebuffer size (on connect and DesktopResize). */
-  setRemoteSize(width: number, height: number): void {
+  setRemoteSize(width: number, height: number, preserveVideo = false): void {
     if (width === this.fbWidth && height === this.fbHeight) return;
     const gl = this.gl;
     this.fbWidth = width;
     this.fbHeight = height;
-    this.generation++;
+    if (!preserveVideo) this.generation++;
     this.sawFrame = false;
     // A monitor rect cut from the old geometry means nothing in the new one.
     this.clearViewRect();
-    // Every decoder's target geometry just became meaningless.
-    this.closeAllH264();
+    // A continuous single-display stream can reveal its dimensions only in
+    // the decoder output. Keep that decoder alive while correcting the atlas.
+    if (!preserveVideo) this.closeAllH264();
     gl.bindTexture(gl.TEXTURE_2D, this.frameTex);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, width, height, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
     // A CopyRect scratch texture sized for the old (possibly much larger)
@@ -957,6 +1048,7 @@ export class WebGLRenderer {
     const id = r.h264Context ?? 0;
     const flags = r.h264Flags ?? 0;
     const isKey = r.h264Key === true;
+    traceMark("h264_chunk", isKey ? 1 : 0);
     if (flags & H264_RESET_ALL_CONTEXTS) this.closeAllH264();
     if (flags & H264_RESET_CONTEXT) this.closeH264(id);
     if (r.payload.byteLength === 0) return; // control message: nothing to decode
@@ -966,7 +1058,7 @@ export class WebGLRenderer {
       if (ctx) this.closeH264(id);
       // A decoder can only start on an IDR; anything else is undecodable.
       if (!isKey) return;
-      ctx = this.createH264(r, id) ?? undefined;
+      ctx = this.createH264(r, id, r.payload) ?? undefined;
       if (!ctx) return;
     }
     if (ctx.decoder.state === "closed") {
@@ -976,14 +1068,14 @@ export class WebGLRenderer {
 
     ctx.timestamp += 1000; // 1 ms apart: monotonic is all the decoder needs
     const ts = ctx.timestamp;
-    const wait = this.awaitH264Frame(ctx, ts);
+    const wait = this.continuousH264 ? null : this.awaitH264Frame(ctx, ts);
     try {
       ctx.decoder.decode(
         new EncodedVideoChunk({
           type: isKey ? "key" : "delta",
           timestamp: ts,
           // Copy: the parse buffer is recycled long before decode completes.
-          data: r.payload.slice(),
+          data: ctx.avc ? lengthPrefixedH264(r.payload) : r.payload.slice(),
         }),
       );
     } catch {
@@ -992,6 +1084,7 @@ export class WebGLRenderer {
       // returns immediately rather than sitting out the timeout.
       this.closeH264(id);
     }
+    if (this.continuousH264) return;
     const frame = await wait;
     if (!frame) return;
     if (this.disposed || ctx.generation !== this.generation) {
@@ -1054,7 +1147,7 @@ export class WebGLRenderer {
   }
 
   /** Build a decoder for one context, or `null` if WebCodecs refuses. */
-  private createH264(r: WireRect, id: number): H264Context | null {
+  private createH264(r: WireRect, id: number, annexb: Uint8Array): H264Context | null {
     if (this.h264.size >= H264_MAX_CONTEXTS) {
       // The backend caps contexts at 64 and recycles slots, so this only
       // happens if the two sides disagree. Start clean rather than leak.
@@ -1063,6 +1156,7 @@ export class WebGLRenderer {
     const generation = this.generation;
     const ctx: H264Context = {
       decoder: null as unknown as VideoDecoder,
+      avc: false,
       x: r.x,
       y: r.y,
       w: r.w,
@@ -1080,18 +1174,49 @@ export class WebGLRenderer {
           }
           // Not uploaded here: `decodeH264` uploads it at the rect's own
           // position in the ordered apply loop.
-          this.deliverH264Frame(ctx, frame);
+          if (this.continuousH264) {
+            // GStreamer can retain one picture. Awaiting output in decodeH264
+            // deadlocks that pipeline until each waiter expires.
+            const w = frame.displayWidth || frame.codedWidth;
+            const h = frame.displayHeight || frame.codedHeight;
+            if (ctx.w !== w || ctx.h !== h) {
+              ctx.w = w;
+              ctx.h = h;
+              this.setRemoteSize(w, h, true);
+            }
+            // Decode all reference pictures, but present only the freshest
+            // output at the next paint. Never turn a burst into a display FIFO.
+            this.latestVideo?.frame.close();
+            this.latestVideo = { frame, ctx };
+          } else {
+            this.deliverH264Frame(ctx, frame);
+          }
         },
         error: () => {
+          traceMark("h264_decode_error");
           this.closeH264(id);
         },
       });
-      ctx.decoder.configure({
-        // Baseline profile per the PRD; the decoder reads the real profile
-        // from the in-band SPS, this is only the initial hint.
-        codec: "avc1.42E01E",
-        optimizeForLatency: true,
-      } as VideoDecoderConfig);
+      const stream = h264Config(annexb);
+      ctx.avc = stream.description !== undefined;
+      // Ask for the GPU decoder first. WebKit falls back to software when
+      // `vah264dec` is absent; Chromium rejects `prefer-hardware` outright,
+      // so the second attempt keeps those builds painting.
+      const attempts: VideoDecoderConfig[] = [
+        { ...stream, hardwareAcceleration: "prefer-hardware" },
+        { ...stream, hardwareAcceleration: "prefer-software" },
+      ];
+      let configured = false;
+      for (const cfg of attempts) {
+        try {
+          ctx.decoder.configure(cfg);
+          configured = true;
+          break;
+        } catch {
+          // try the next acceleration mode
+        }
+      }
+      if (!configured) throw new Error("H.264 configure failed");
     } catch {
       this.h264Failed = true;
       this.notice("H.264 decoding is unavailable in this webview; those regions will not render.");
@@ -1153,6 +1278,10 @@ export class WebGLRenderer {
     const ctx = this.h264.get(id);
     if (!ctx) return;
     this.h264.delete(id);
+    if (this.latestVideo?.ctx === ctx) {
+      this.latestVideo.frame.close();
+      this.latestVideo = null;
+    }
     // Anything still waiting on this decoder is waiting on a frame that will
     // never be produced now. Settle those waiters so the apply loop moves on
     // instead of holding every later update behind a decoder that is gone.
@@ -1401,6 +1530,11 @@ export class WebGLRenderer {
     this.running = true;
     const loop = (): void => {
       if (!this.running) return;
+      if (this.latestVideo) {
+        const { frame, ctx } = this.latestVideo;
+        this.latestVideo = null;
+        this.uploadVideoFrame(frame, ctx);
+      }
       if (this.dirty) {
         this.dirty = false;
         this.draw();

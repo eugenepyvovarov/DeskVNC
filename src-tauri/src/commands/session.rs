@@ -136,6 +136,11 @@ fn event_json(session_id: &str, event: &SessionEvent) -> Option<serde_json::Valu
         // would put a remote machine's bytes in our own UI for a person who
         // asked for none of it (PRDAgentPlug/00 R51b).
         SessionEvent::AgentRefused(_) | SessionEvent::AgentServed(_) => return None,
+        SessionEvent::Protocol(ProtocolEvent::AppleNotice(message)) => json!({ "type": "apple-notice", "message": message }),
+        SessionEvent::Protocol(ProtocolEvent::AppleDisplay(result)) => match result {
+            Ok(info) => json!({ "type": "apple-display", "info": info, "error": null }),
+            Err(error) => json!({ "type": "apple-display", "info": null, "error": error }),
+        },
         SessionEvent::Protocol(ProtocolEvent::Rdp(event)) => rdp_event_json(event)?,
         SessionEvent::Protocol(ProtocolEvent::Boundary { control, tools }) => {
             json!({ "type": "boundary-control", "control": control, "tools": tools })
@@ -1036,7 +1041,9 @@ fn prefill_typed_username(
     creds: &mut vnc_core::Credentials,
     typed: Option<String>,
 ) {
-    if !matches!(kind, ProtocolKind::Vnc | ProtocolKind::Rdp) || creds.password.is_some() {
+    if !matches!(kind, ProtocolKind::Vnc | ProtocolKind::Rdp | ProtocolKind::Apple)
+        || creds.password.is_some()
+    {
         return;
     }
     if let Some(name) = typed.filter(|n| !n.trim().is_empty()) {
@@ -1130,6 +1137,7 @@ pub async fn connect_session(
         ProtocolKind::Rdp => ConnectOptions::rdp(address, port),
         ProtocolKind::Ssh => ConnectOptions::ssh(address, port),
         ProtocolKind::Boundary => ConnectOptions::boundary(address),
+        ProtocolKind::Apple => ConnectOptions::apple(address, port),
         _ => ConnectOptions::vnc(address, port),
     };
 
@@ -1221,6 +1229,9 @@ pub async fn connect_session(
             rdp.window_size = viewport(&window, viewport_width, viewport_height);
             *options.rdp_mut() = rdp;
         }
+        // Apple options are fixed at construction. There is no saved
+        // blob to fold in, and this arm must not call `vnc_mut`.
+        ProtocolKind::Apple => {}
         _ => {
             let vnc = options.vnc_mut();
             vnc.security_pref = profile.as_ref().and_then(|p| p.security_pref.clone());
@@ -1782,6 +1793,18 @@ pub async fn set_quality(
     preset: QualityPreset,
 ) -> Result<(), String> {
     send_command(&state, &session_id, ClientCommand::SetQuality(preset)).await
+}
+
+#[tauri::command]
+pub async fn apple_display(
+    state: State<'_, AppState>,
+    session_id: String,
+    action: remote_core::MacDisplayAction,
+) -> Result<(), String> {
+    let apple = state.sessions.lock().get(&session_id)
+        .is_some_and(|entry| entry.handle.kind == ProtocolKind::Apple);
+    if !apple { return Err("Physical Mac display control requires an Apple session".into()); }
+    send_command(&state, &session_id, ClientCommand::MacDisplay(action)).await
 }
 
 #[tauri::command]

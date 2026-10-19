@@ -205,6 +205,8 @@ pub struct AudioPacket {
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum ProtocolEvent {
+    AppleDisplay(Result<crate::mac_display::MacDisplayInfo, String>),
+    AppleNotice(String),
     /// Host permission for a support session: whether the helper may use
     /// the mouse and keyboard, and whether the person at that computer lets
     /// the helper's tools (DeskVNC's agents) run commands and copy files.

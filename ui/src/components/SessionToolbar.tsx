@@ -832,8 +832,9 @@ export function SessionToolbar(props: SessionToolbarProps): ReactNode {
               </MenuRow>
               {props.protocol === "rdp" ? (
                 <p className="px-2.5 pb-1 text-2xs text-tertiary">
-                  View, then Resolution, also sets the remote desktop to a fixed
-                  size.
+                  {props.protocol === "rdp"
+                    ? "View, then Resolution, also sets the remote desktop to a fixed size."
+                    : "For a Mac, quality presets ask the Mac to render and stream at a smaller size; the layout it confirms is what you get."}
                 </p>
               ) : null}
               <MenuRow

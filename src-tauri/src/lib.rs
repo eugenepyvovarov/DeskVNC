@@ -260,6 +260,7 @@ pub fn run() {
             commands::session::trace_enabled,
             commands::session::trace_marks,
             commands::session::set_quality,
+            commands::session::apple_display,
             commands::session::request_resize,
             commands::session::refresh_session,
             commands::session::set_view_only,

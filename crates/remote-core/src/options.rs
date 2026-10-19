@@ -87,6 +87,12 @@ impl ConnectOptions {
         Self::with_protocol(id, 0, ProtocolOptions::Boundary)
     }
 
+    /// Apple Screen Sharing. `width`/`height` are the fixed canvas asked for
+    /// in the encrypted display configuration.
+    pub fn apple(host: impl Into<String>, port: u16) -> Self {
+        Self::with_protocol(host, port, ProtocolOptions::Apple(AppleOptions::default()))
+    }
+
     fn with_protocol(host: impl Into<String>, port: u16, protocol: ProtocolOptions) -> Self {
         Self {
             host: host.into(),
@@ -181,6 +187,8 @@ pub enum ProtocolOptions {
     Rdp(RdpOptions),
     Ssh(SshOptions),
     Boundary,
+    /// Apple Screen Sharing high-performance H.264.
+    Apple(AppleOptions),
 }
 
 impl ProtocolOptions {
@@ -190,7 +198,34 @@ impl ProtocolOptions {
             ProtocolOptions::Rdp(_) => ProtocolKind::Rdp,
             ProtocolOptions::Ssh(_) => ProtocolKind::Ssh,
             ProtocolOptions::Boundary => ProtocolKind::Boundary,
+            ProtocolOptions::Apple(_) => ProtocolKind::Apple,
         }
+    }
+}
+
+/// Fixed canvas for an Apple Screen Sharing session.
+///
+/// One display, no dynamic resize. The Mac is asked for this geometry; the
+/// stream that comes back is H.264 for the webview's hardware decoder.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct AppleOptions {
+    pub width: u16,
+    pub height: u16,
+}
+
+impl Default for AppleOptions {
+    fn default() -> Self {
+        Self {
+            width: 1920,
+            height: 1080,
+        }
+    }
+}
+
+impl AppleOptions {
+    pub fn new(width: u16, height: u16) -> Self {
+        Self { width, height }
     }
 }
 
