@@ -1,7 +1,7 @@
 //! Explicit physical Mac display requests, separate from framebuffer resizing.
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(tag = "action", rename_all = "kebab-case")]
 pub enum MacDisplayAction {
     List,

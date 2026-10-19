@@ -32,6 +32,38 @@ const STREAM_STALL: Duration = Duration::from_millis(750);
 /// says so.
 const RESIZE_TIMEOUT: Duration = Duration::from_secs(8);
 
+/// What the user is holding down on the remote machine.
+#[derive(Default)]
+struct Held {
+    /// Keys that were pressed and not released.
+    keys: std::collections::BTreeSet<u32>,
+    /// The last pointer position and button mask sent.
+    pointer: Option<(u16, u16, u16)>,
+}
+
+/// Let go of every key and button that is held.
+///
+/// The remote machine is told about a key going down when it happens and
+/// about it coming up when it happens. If the viewer's attention goes
+/// elsewhere in between, the key stays down on the remote machine, and the
+/// only way to release it is to say so.
+async fn release_all(session: &mut Live, held: &mut Held) -> Result<(), SessionError> {
+    if let Some((x, y, _)) = held.pointer.take() {
+        let body = crate::input::pointer(session.layer.wrap_key(), x, y, 0);
+        session.send_body(&body).await?;
+    }
+    let keys: Vec<u32> = held.keys.iter().copied().collect();
+    held.keys.clear();
+    for keysym in keys {
+        let mut body = [0u8; 8];
+        body[0] = 4;
+        body[1] = 0; // key up
+        body[4..8].copy_from_slice(&keysym.to_be_bytes());
+        session.send_body(&body).await?;
+    }
+    Ok(())
+}
+
 /// A resize round.
 ///
 /// A round is: ask the Mac for a size, get the layout that answers it, let
@@ -363,7 +395,32 @@ async fn connect(
 
     // The server proof is length-prefixed. Pass/fail is the u32 after it.
     let proof_buf = read_counted(&mut tcp).await?;
-    let _ = proof_buf;
+    // The server proves it knows the password, and the proof is checked.
+    //
+    // Our M1 was accepted by the server, and M1 is built from the session
+    // key, so our key is the server's key and the proof we expect is the
+    // server's proof. A server that cannot produce it does not know the
+    // password, and a session with it would be a session whose every
+    // secret the other end could read.
+    let proofs = auth::server_proofs(&proof_buf[4..]);
+    if proofs.is_empty() {
+        tracing::warn!("the server's proof could not be read, so it was not checked");
+    } else if proofs.iter().any(|proof| secret.m2_matches(proof)) {
+        tracing::info!("the server proved that it knows the password");
+    } else {
+        // A server that cannot produce the proof does not know the
+        // password, and every secret of this session would be readable by
+        // it.
+        //
+        // This is reported rather than fatal: the exact shape of the
+        // proof has not been confirmed against a live Mac, and a sign-in
+        // that fails on a surprise is worse than a sign-in that warns.
+        // Make it fatal once a live session has confirmed the framing.
+        tracing::warn!("the server's proof did not match: this does not look like the Mac you expected");
+        emit(events, SessionEvent::Protocol(remote_core::ProtocolEvent::AppleNotice(
+            "The Mac's identity proof did not match. Check that you are connected to the machine you meant.".into(),
+        ))).await.ok();
+    }
     let result = read_exact(&mut tcp, 4).await?;
     if result != [0, 0, 0, 0] {
         return Err(SessionError::new("the server rejected the password"));
@@ -446,13 +503,70 @@ async fn connect(
     let ctrl_dest = format!("{host}:5900");
     let media_dimensions = std::sync::Arc::new(std::sync::atomic::AtomicU32::new((u32::from(width) << 16) | u32::from(height)));
     let video_dimensions = media_dimensions.clone();
-    let mut display: Option<crate::macos::DisplayController> = None;
+    // The physical-display controls talk to the Mac over SSH, and the
+    // helper it runs takes seconds. That work does not belong in the loop
+    // that carries the pointer and the keyboard, so it has a worker of its
+    // own and the loop only waits for the answer.
+    let (display_tx, mut display_rx) =
+        mpsc::channel::<(remote_core::MacDisplayAction, mpsc::Sender<Result<remote_core::MacDisplayInfo, String>>)>(4);
+    let display_host = host.to_string();
+    let display_user = username.to_string();
+    let display_password = password.to_string();
+    let display_keys = host_keys.clone();
+    let display_task = tokio::spawn(async move {
+        let mut display: Option<crate::macos::DisplayController> = None;
+        while let Some((action, reply)) = display_rx.recv().await {
+            let result = async {
+                if display.is_none() {
+                    let verifier = display_keys
+                        .clone()
+                        .ok_or_else(|| "Mac display controls require the application's SSH host-key store".to_owned())?;
+                    display = Some(
+                        crate::macos::DisplayController::connect(
+                            &display_host,
+                            &display_user,
+                            &display_password,
+                            verifier,
+                        )
+                        .await?,
+                    );
+                }
+                display.as_mut().expect("connected above").request(action).await
+            }
+            .await;
+            if reply.send(result).await.is_err() {
+                // The session went away while the Mac was working. The
+                // result is dropped, and the restore below still happens.
+                break;
+            }
+        }
+        // The session is over. If this connection changed the physical
+        // display, put it back: the person in front of the Mac should not
+        // find their panel in a state they did not ask for.
+        if let Some(mut display) = display {
+            display.restore_on_disconnect().await;
+        }
+    });
+    let mut display_reply: Option<mpsc::Receiver<Result<remote_core::MacDisplayInfo, String>>> = None;
+    // The action the pending reply answers, so the answer is read for what
+    // it is: reading the mode list says nothing about the desktop, and only
+    // a change resizes the picture.
+    let mut display_action: Option<remote_core::MacDisplayAction> = None;
     let native = (width, height);
     // One resize round at a time (§10.9): 0x1d → 0x451 → re-offer → a picture
     // at the new size. A round is not over when the server answers it: the
     // encoder restarts after the answer, and a second request sent into
     // that restart races it (observed live as a black screen).
     let mut round = ResizeRound::default();
+    // What the user is holding down, so it can be let go of. A session that
+    // ends, loses focus, or is taken over must not leave a key or a mouse
+    // button held on the remote machine.
+    let mut held: Held = Held::default();
+    // A view-only session sends no input at all.
+    let mut view_only = false;
+    // Ask for a fresh frame every tick, for servers whose damage tracking
+    // cannot be trusted.
+    let mut always_refresh = false;
     // The media generation. Every re-offer starts a new one, and a picture
     // carries the generation it belongs to, so "the new picture has arrived"
     // is a fact rather than a guess.
@@ -611,15 +725,72 @@ async fn connect(
                 match cmd {
                     None | Some(ClientCommand::Disconnect) => break,
                     Some(ClientCommand::Pointer { x, y, button_mask }) => {
+                        if view_only {
+                            // A view-only session must not move the remote
+                            // pointer, not even to "release" it.
+                            continue;
+                        }
                         let body = crate::input::pointer(session.layer.wrap_key(), x, y, button_mask);
                         session.send_body(&body).await?;
+                        held.pointer = Some((x, y, button_mask));
                     }
                     Some(ClientCommand::Key { keysym, down, .. }) => {
+                        if view_only {
+                            continue;
+                        }
                         let mut body = [0u8; 8];
                         body[0] = 4;
                         body[1] = u8::from(down);
                         body[4..8].copy_from_slice(&keysym.to_be_bytes());
                         session.send_body(&body).await?;
+                        if down {
+                            held.keys.insert(keysym);
+                        } else {
+                            held.keys.remove(&keysym);
+                        }
+                    }
+                    Some(ClientCommand::ReleaseAllKeys) => {
+                        // Let go of everything that is held. This is what a
+                        // focus loss, a takeover or a disconnect needs, and
+                        // the remote machine has no other way to learn about
+                        // it.
+                        release_all(&mut session, &mut held).await?;
+                    }
+                    Some(ClientCommand::SetViewOnly(on)) => {
+                        if on && !view_only {
+                            // Anything held was pressed under the old mode,
+                            // so it is let go of first.
+                            release_all(&mut session, &mut held).await?;
+                        }
+                        view_only = on;
+                        tracing::info!(enabled = on, "view-only toggled");
+                    }
+                    Some(ClientCommand::SetAlwaysRefresh(on)) => {
+                        always_refresh = on;
+                        tracing::info!(enabled = on, "always-refresh toggled");
+                    }
+                    Some(ClientCommand::SetPreferScancodes(_)) => {
+                        // The Apple path always sends keysyms, so the remote
+                        // machine's layout decides what a key types. There is
+                        // no scancode mode to switch to, and nothing to
+                        // release: the encoding does not change.
+                    }
+                    Some(ClientCommand::TrustCertificate { .. }) => {
+                        // Certificate trust is a property of the security
+                        // handshake. Apple Screen Sharing authenticates with
+                        // RSA-SRP and has no certificate to trust.
+                    }
+                    Some(ClientCommand::Agent(intent)) => {
+                        // Answered rather than ignored. An agent is blocked
+                        // on a settlement; a shrug here is an agent that
+                        // waits for ever.
+                        emit(
+                            events,
+                            SessionEvent::AgentRefused(intent.refuse(
+                                "Apple Screen Sharing has no native command channel: this intent cannot be served over it",
+                            )),
+                        )
+                        .await.ok();
                     }
                     Some(ClientCommand::Refresh) => {
                         session.send_body(&framebuffer_request(session.width, session.height)).await?;
@@ -633,36 +804,27 @@ async fn connect(
                         request_resize(&mut session, &mut round, target, current).await?;
                     }
                     Some(ClientCommand::MacDisplay(action)) => {
-                        use remote_core::{MacDisplayAction, ProtocolEvent};
+                        use remote_core::MacDisplayAction;
                         let changes_mode = !matches!(action, MacDisplayAction::List);
-                        let result = async {
-                            if display.is_none() {
-                                let verifier = host_keys.clone().ok_or_else(|| "Mac display controls require the application's SSH host-key store".to_owned())?;
-                                display = Some(crate::macos::DisplayController::connect(host, username, password, verifier).await?);
-                            }
-                            if changes_mode {
-                                // A pending stream resize was made for the
-                                // old desktop, so it no longer means what it
-                                // meant. A round that is already running is
-                                // left to finish.
-                                round.requested = None;
-                            }
-                            display.as_mut().unwrap().request(action).await
-                        }.await;
-                        if let Ok(info) = &result {
-                            session.width = info.pixel_width;
-                            session.height = info.pixel_height;
-                            media_dimensions.store((u32::from(info.pixel_width) << 16) | u32::from(info.pixel_height), std::sync::atomic::Ordering::Relaxed);
-                            emit(events, SessionEvent::DesktopResize { width: info.pixel_width, height: info.pixel_height }).await.ok();
+                        if changes_mode {
+                            // A pending stream resize was made for the old
+                            // desktop, so it no longer means what it meant.
+                            // A round that is already running is left to
+                            // finish.
+                            round.requested = None;
                         }
-                        if result.is_ok() && changes_mode {
-                            // Keep the SRTP keys, but re-offer after a physical
-                            // mode change so the HP encoder starts its new canvas.
-                            session.send_body(&offer).await?;
-                            generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                            session.send_body(&framebuffer_request(session.width, session.height)).await?;
+                        // The work happens on the display worker, so the
+                        // pointer and the keyboard keep flowing while the
+                        // Mac is busy.
+                        let (reply, wait) = mpsc::channel(1);
+                        display_action = Some(action);
+                        if display_tx.send((action, reply)).await.is_err() {
+                            emit(events, SessionEvent::Protocol(remote_core::ProtocolEvent::AppleNotice(
+                                "The Mac display controls are not available in this session.".into(),
+                            ))).await.ok();
+                        } else {
+                            display_reply = Some(wait);
                         }
-                        emit(events, SessionEvent::Protocol(ProtocolEvent::AppleDisplay(result))).await.ok();
                     }
                     Some(ClientCommand::RequestResize { width, height }) => {
                         // In-band dynamic resize (RFC §10.9): 0x1d now, and the
@@ -682,12 +844,48 @@ async fn connect(
                     _ => {}
                 }
             }
+            display = async {
+                match &mut display_reply {
+                    Some(reply) => reply.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                use remote_core::ProtocolEvent;
+                let result = display.expect("a display reply");
+                display_reply = None;
+                let action = display_action.take();
+                // Reading the mode list changes nothing, so it must not
+                // resize the picture. A change does, and so does a restore.
+                let changes_mode = !matches!(action, Some(remote_core::MacDisplayAction::List));
+                if let Ok(info) = &result {
+                    // Reading the mode list says nothing about the desktop,
+                    // so it must not resize the picture. Only a change does.
+                    if changes_mode {
+                        session.width = info.pixel_width;
+                        session.height = info.pixel_height;
+                        media_dimensions.store((u32::from(info.pixel_width) << 16) | u32::from(info.pixel_height), std::sync::atomic::Ordering::Relaxed);
+                        emit(events, SessionEvent::DesktopResize { width: info.pixel_width, height: info.pixel_height }).await.ok();
+                    }
+                }
+                if result.is_ok() && changes_mode {
+                    // Keep the SRTP keys, but re-offer after a physical
+                    // mode change so the HP encoder starts its new canvas.
+                    session.send_body(&offer).await?;
+                    generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    session.send_body(&framebuffer_request(session.width, session.height)).await?;
+                }
+                emit(events, SessionEvent::Protocol(ProtocolEvent::AppleDisplay(result))).await.ok();
+            }
             body = session.read_body() => {
                 let body = body?;
                 tracing::debug!(bytes = body.len(), "Apple control message");
                 // A rekey inside the record layer rotates the content key.
                 if let Some((key, iv)) = find_rekey(&body, session.layer.wrap_key()) {
-                    session.layer = RecordLayer::new(key, iv);
+                    // The key and IV change; the session's sequence counters
+                    // do not. Resetting them would make the next record fail
+                    // its integrity check and end the session.
+                    session.layer.rekey(key, iv);
+                    tracing::info!("Apple control layer rekeyed");
                 }
                 // AppleDisplayLayout (0x451): authoritative geometry (R-A15).
                 if let Some((_, (bw, bh))) = find_display_layout(&body) {
@@ -719,6 +917,12 @@ async fn connect(
                 }
             }
             _ = tick.tick() => {
+                if always_refresh {
+                    // The escape hatch for a server that does not report
+                    // what changed. It costs the whole desktop in bandwidth
+                    // every second, so it is off unless it is asked for.
+                    session.send_body(&framebuffer_request(session.width, session.height)).await?;
+                }
                 // Finish, report or time out a resize round.
                 if round.in_flight {
                     let picture_arrived = picture_generation.load(std::sync::atomic::Ordering::SeqCst)
@@ -761,6 +965,15 @@ async fn connect(
             }
         }
     }
+    // Let go of anything that is held before the session goes away. A key
+    // that was never released stays down on the remote machine, and the
+    // person in front of it has no way to know why.
+    release_all(&mut session, &mut held).await.ok();
+    // The display worker restores the physical panel if this connection
+    // changed it. Dropping the channel tells it to finish; waiting for it
+    // means the restore actually happens before the session is gone.
+    drop(display_tx);
+    let _ = tokio::time::timeout(Duration::from_secs(25), display_task).await;
     video_task.abort();
     let _ = fail(events, "disconnected").await;
     Ok(())
@@ -1098,6 +1311,47 @@ impl From<std::io::Error> for SessionError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn releasing_everything_held_says_so_on_the_wire() {
+        // A key or a button that was pressed and never released stays down on
+        // the remote machine. The only way to release it is to say so.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tcp = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let (mut server, _) = listener.accept().await.unwrap();
+        let mut live = Live {
+            tcp,
+            layer: RecordLayer::new([1; 16], [2; 16]),
+            width: 1, height: 1,
+            video: Depacketizer::default(),
+            srtp: None, udp: None, ctrl: None,
+            incoming: Vec::with_capacity(8192),
+        };
+        let mut held = Held::default();
+        held.keys.insert(0x61);
+        held.keys.insert(0x62);
+        held.pointer = Some((10, 20, 1));
+        release_all(&mut live, &mut held).await.unwrap();
+        assert!(held.keys.is_empty());
+        assert!(held.pointer.is_none());
+
+        // The server sees a pointer event with no buttons and two key ups.
+        let mut receiver = RecordLayer::new([1; 16], [2; 16]);
+        let mut bodies = Vec::new();
+        for _ in 0..3 {
+            let mut header = [0u8; 2];
+            server.read_exact(&mut header).await.unwrap();
+            let len = u16::from_be_bytes(header) as usize;
+            let mut packet = vec![0u8; len];
+            server.read_exact(&mut packet).await.unwrap();
+            bodies.push(receiver.open(&packet).unwrap());
+        }
+        assert_eq!(bodies[0][0], 0x10, "the pointer was not released");
+        assert_eq!(bodies[1][0], 4, "a key was not released");
+        assert_eq!(bodies[1][1], 0, "the key release was a key press");
+        assert_eq!(bodies[2][0], 4);
+        assert_eq!(bodies[2][1], 0);
+    }
 
     #[tokio::test]
     async fn interrupted_record_read_keeps_partial_ciphertext() {

@@ -40,6 +40,29 @@ impl RecordLayer {
         }
     }
 
+    /// Install a new key and IV without touching the sequence counters.
+    ///
+    /// The counters belong to the session, not to the key: the reference
+    /// protocol describes them as session-monotonic and explicitly not reset
+    /// at activation or at a rekey. A rekey that started the counters again
+    /// at zero would make the next record fail its integrity check on the
+    /// peer's side, and the session would end for no visible reason.
+    pub fn rekey(&mut self, key: [u8; 16], iv: [u8; 16]) {
+        self.key = key;
+        self.send_iv = iv;
+        self.recv_iv = iv;
+    }
+
+    /// The sequence number of the next record this side will send.
+    pub fn send_sequence(&self) -> u32 {
+        self.send_seq
+    }
+
+    /// The sequence number the next record received is expected to carry.
+    pub fn recv_sequence(&self) -> u32 {
+        self.recv_seq
+    }
+
     /// The content key is also the wrap key for the next rekey.
     pub fn wrap_key(&self) -> &[u8; 16] {
         &self.key
@@ -162,8 +185,28 @@ mod tests {
     }
 
     #[test]
-    fn rekey_halves_decrypt_independently() {
-        let wrap = [3u8; 16];
+    fn a_rekey_keeps_the_sequence_counters() {
+        // The counters belong to the session. A rekey that started them
+        // again at zero would make the next record fail its integrity check
+        // on the peer's side, and the session would end for no visible
+        // reason.
+        let mut a = RecordLayer::new([0x11; 16], [0x22; 16]);
+        let mut b = RecordLayer::new([0x11; 16], [0x22; 16]);
+        let before = a.seal(b"before the rekey");
+        assert_eq!(b.open(&before[2..]).unwrap(), b"before the rekey");
+        assert_eq!(a.send_sequence(), 1);
+        assert_eq!(b.recv_sequence(), 1);
+        a.rekey([0x33; 16], [0x44; 16]);
+        b.rekey([0x33; 16], [0x44; 16]);
+        assert_eq!(a.send_sequence(), 1, "the send counter was reset by the rekey");
+        assert_eq!(b.recv_sequence(), 1, "the receive counter was reset by the rekey");
+        // And the session carries on across the rekey.
+        let packet = a.seal(b"after the rekey");
+        assert_eq!(b.open(&packet[2..]).unwrap(), b"after the rekey");
+    }
+
+    #[test]
+    fn rekey_halves_decrypt_independently() {        let wrap = [3u8; 16];
         let mut enc = ecb::Encryptor::<Aes128>::new((&wrap).into());
         let mut key = cipher::generic_array::GenericArray::clone_from_slice(&[1u8; 16]);
         let mut iv = cipher::generic_array::GenericArray::clone_from_slice(&[2u8; 16]);

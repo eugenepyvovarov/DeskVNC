@@ -35,7 +35,10 @@ pub struct SrpSecret {
     pub m1: [u8; 64],
     /// First 16 bytes of SHA-256(K). Becomes the initial wrap key.
     pub wrap_key: [u8; 16],
-    expected_m2_prefix: Vec<u8>,
+    /// The session key K = SHA-512(PAD(S)).
+    session_key: [u8; 64],
+    /// The server's proof: M2 = SHA-512(PAD(A) || M1 || K).
+    expected_m2: [u8; 64],
 }
 
 impl SrpSecret {
@@ -97,16 +100,28 @@ impl SrpSecret {
         let digest = Sha256::digest(session);
         let mut wrap_key = [0u8; 16];
         wrap_key.copy_from_slice(&digest[..16]);
+        let mut session_key = [0u8; 64];
+        session_key.copy_from_slice(&session);
+        let mut expected_m2 = [0u8; 64];
+        expected_m2.copy_from_slice(&expected);
         Ok(Self {
             a_public: a_bytes,
             m1,
             wrap_key,
-            expected_m2_prefix: expected.to_vec(),
+            session_key,
+            expected_m2,
         })
     }
 
+    /// Whether the server's proof is the one this session expects.
     pub fn m2_matches(&self, server_m2: &[u8]) -> bool {
-        server_m2 == self.expected_m2_prefix
+        server_m2 == self.expected_m2
+    }
+
+    /// The session key, for tests that check the proof.
+    #[cfg(test)]
+    pub fn session_key(&self) -> &[u8; 64] {
+        &self.session_key
     }
 }
 
@@ -259,48 +274,25 @@ pub fn parse_challenge(body: &[u8]) -> Result<Challenge, AuthError> {
     })
 }
 
-fn take_u8(buf: &[u8], i: &mut usize) -> Result<u8, AuthError> {
-    let b = *buf.get(*i).ok_or(AuthError::Truncated)?;
-    *i += 1;
-    Ok(b)
-}
 
-fn take_m(buf: &[u8], i: &mut usize) -> Result<Vec<u8>, AuthError> {
-    if *i + 2 > buf.len() {
-        return Err(AuthError::Truncated);
+/// The places the server's proof may be in the final-proof payload.
+///
+/// The inner grammar is `%o M2 || %o server_random || %s empty || %u zero`,
+/// so the proof normally starts with its own one-byte length. Some servers
+/// put the 64 bytes of the proof straight into the payload. Both are
+/// offered, and the caller accepts the proof if EITHER of them matches: the
+/// two shapes overlap, and guessing wrong must not turn a sign-in into a
+/// failure.
+pub fn server_proofs(payload: &[u8]) -> Vec<&[u8]> {
+    const HASH: usize = 64;
+    let mut out = Vec::new();
+    if payload.len() >= HASH + 1 && payload[0] == HASH as u8 {
+        out.push(&payload[1..HASH + 1]);
     }
-    let n = u16::from_be_bytes([buf[*i], buf[*i + 1]]) as usize;
-    *i += 2;
-    take_n(buf, i, n)
-}
-
-fn take_o(buf: &[u8], i: &mut usize) -> Result<Vec<u8>, AuthError> {
-    let n = take_u8(buf, i)? as usize;
-    take_n(buf, i, n)
-}
-
-fn take_s(buf: &[u8], i: &mut usize) -> Result<Vec<u8>, AuthError> {
-    take_m(buf, i)
-}
-
-fn take_n(buf: &[u8], i: &mut usize, n: usize) -> Result<Vec<u8>, AuthError> {
-    if *i + n > buf.len() {
-        return Err(AuthError::Truncated);
+    if payload.len() >= HASH {
+        out.push(&payload[..HASH]);
     }
-    let v = buf[*i..*i + n].to_vec();
-    *i += n;
-    Ok(v)
-}
-
-/// Server proof: outer header then `%o M2 || %o random || %s || %u`.
-pub fn parse_server_proof(buf: &[u8]) -> Result<Vec<u8>, AuthError> {
-    if buf.len() < 13 {
-        return Err(AuthError::Truncated);
-    }
-    let payload_len = u32::from_be_bytes(buf[9..13].try_into().unwrap()) as usize;
-    let slice = buf.get(13..13 + payload_len).ok_or(AuthError::Truncated)?;
-    let mut i = 0;
-    take_o(slice, &mut i)
+    out
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -347,6 +339,41 @@ mod tests {
         let secret = SrpSecret::client("password", salt, 1000, &server_public).unwrap();
         assert_eq!(secret.a_public.len(), 512);
         assert_ne!(secret.wrap_key, [0u8; 16]);
+    }
+
+    #[test]
+    fn the_server_proof_is_the_one_this_session_expects() {
+        // The proof is M2 = H(PAD(A) || M1 || K), where K is the session key
+        // both sides derived. The live Mac accepted our M1, and M1 is built
+        // from K, so K is the Mac's K too, and this is the Mac's proof.
+        let n = BigUint::parse_bytes(MODP_4096.as_bytes(), 16).unwrap();
+        let g = BigUint::from(5u32);
+        let mut b_priv = [0u8; 32];
+        rand::rng().fill_bytes(&mut b_priv);
+        let b = BigUint::from_bytes_be(&b_priv);
+        let server_public = pad(&g.modpow(&b, &n));
+        let salt = b"salt-for-the-unit-test-only!!!!";
+        let secret = SrpSecret::client("password", salt, 1000, &server_public).unwrap();
+        let m2 = Sha512::digest(&[&secret.a_public[..], &secret.m1[..], &secret.session_key()[..]].concat());
+        assert!(secret.m2_matches(&m2), "the server's proof did not verify");
+        // And a proof from a server that does not know the password does
+        // not verify.
+        assert!(!secret.m2_matches(&[0u8; 64]));
+    }
+
+    #[test]
+    fn the_server_proof_is_found_in_both_shapes() {
+        let proof = [7u8; 64];
+        // The documented shape: a one-byte length, then the proof.
+        let mut with_length = vec![64u8];
+        with_length.extend_from_slice(&proof);
+        with_length.extend_from_slice(&[16u8]);
+        with_length.extend_from_slice(&[9u8; 16]);
+        assert!(server_proofs(&with_length).contains(&&proof[..]));
+        // And the proof on its own.
+        assert!(server_proofs(&proof).contains(&&proof[..]));
+        // Nothing that could be a proof.
+        assert!(server_proofs(&[1, 2, 3]).is_empty());
     }
 
     #[test]
