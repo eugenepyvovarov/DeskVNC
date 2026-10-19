@@ -1230,6 +1230,13 @@ async fn connect(
                 // complete key picture, not just because its SSRC appeared.
                 if generation != last_generation {
                     last_generation = generation;
+                    // A re-offer asks the Mac for a new stream, and the
+                    // Mac's encoder may start its packet numbers again. The
+                    // keys are the same, so the new packets authenticate,
+                    // but a receiver that remembers the old numbers calls
+                    // every one of them a replay and the picture never
+                    // comes back.
+                    streams.new_epoch();
                     request_keyframe(
                         &mut feedback,
                         feedback_ssrc,

@@ -37,6 +37,19 @@ impl VideoStreams {
         }
     }
 
+    /// Every stream starts a new epoch.
+    ///
+    /// A re-offer asks the Mac for a new stream. The Mac's encoder may
+    /// start its packet numbers again, and a receiver that remembers the
+    /// old ones refuses every packet of the new stream as a replay, so the
+    /// picture never comes back.
+    pub(crate) fn new_epoch(&mut self) {
+        for stream in self.streams.values_mut() {
+            stream.srtp.new_epoch();
+            stream.depay.reset();
+        }
+    }
+
     pub(crate) fn active(&self) -> Option<u32> {
         self.active
     }
@@ -240,6 +253,41 @@ mod tests {
             )
             .is_empty());
         assert_eq!(rx.active(), Some(20));
+    }
+
+    #[test]
+    fn a_new_stream_may_start_its_packet_numbers_again() {
+        // The Mac's encoder restarts when the viewer asks for a new
+        // stream, and it may number its packets from the beginning again.
+        // The keys are the same, so the packets authenticate, but a
+        // receiver that remembers the old numbers calls every one of them
+        // a replay, and the picture never comes back.
+        let mut rx = receiver();
+        let now = Instant::now();
+        rx.push(&packet(10, 40_000, &key_picture()), 1, now);
+        // The new stream numbers from zero again.
+        assert!(rx.push(&packet(10, 0, &key_picture()), 2, now).is_empty());
+        // The viewer asked for a new stream, so the epoch starts again.
+        rx.new_epoch();
+        let units = rx.push(&packet(10, 0, &key_picture()), 2, now);
+        assert_eq!(
+            units.len(),
+            1,
+            "the picture comes back after a new stream is asked for"
+        );
+        assert_eq!(rx.active(), Some(10));
+    }
+
+    #[test]
+    fn a_replayed_packet_is_still_refused_between_epochs() {
+        let mut rx = receiver();
+        let now = Instant::now();
+        let original = packet(10, 5, &key_picture());
+        rx.push(&original, 1, now);
+        assert!(rx.push(&original, 1, now).is_empty(), "a replay is refused");
+        // Without a new stream being asked for, the numbers keep moving
+        // forward and an old packet stays refused.
+        assert!(rx.push(&original, 1, now).is_empty());
     }
 
     #[test]

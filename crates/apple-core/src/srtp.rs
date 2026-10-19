@@ -110,6 +110,21 @@ impl SrtpContext {
         })
     }
 
+    /// Forget the packet numbers, and start a new epoch.
+    ///
+    /// A re-offer asks the Mac for a new stream, and the Mac's encoder may
+    /// start its packet numbers again from the beginning. The keys are the
+    /// same, so the packets still authenticate, but the replay window says
+    /// they are old and refuses every one of them: the picture never comes
+    /// back.
+    ///
+    /// The state is only reset when the session knows a new stream was
+    /// asked for, so a replayed packet cannot use this to get in.
+    pub fn new_epoch(&mut self) {
+        self.highest = None;
+        self.replay = ReplayWindow::default();
+    }
+
     /// Verify and decrypt one SRTP packet.
     ///
     /// The authentication tag is checked before anything else is believed,
