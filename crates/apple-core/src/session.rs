@@ -18,7 +18,7 @@ use tokio::sync::mpsc;
 use crate::auth::{self, SrpSecret};
 use crate::h264::Depacketizer;
 use crate::record::{self, RecordLayer};
-use crate::srtp::{SrtcpEncryptor, SrtpContext};
+use crate::srtp::{SrtcpEncryptor, SrtpContext, SrtpEncryptor};
 
 /// How many distinct video streams are remembered at once. A resized canvas
 /// or a new quality tier brings a new SSRC; the old ones are dropped.
@@ -1926,6 +1926,57 @@ impl From<std::io::Error> for SessionError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_whole_media_stream_survives_the_trip_from_the_wire() {
+        // A fake Mac: an encoder that sends a key picture, then deltas, all
+        // through the real SRTP protection and the real assembler. The
+        // pictures that come out have to be right, because everything
+        // downstream believes them.
+        let blob = [42u8; 46];
+        let mut sender = SrtpEncryptor::from_blob(&blob).expect("the keys");
+        let mut receiver = SrtpContext::from_blob(&blob).expect("the keys");
+        let mut depay = Depacketizer::default();
+
+        // A key picture: an IDR, split over three packets, with the
+        // parameter sets in front of it.
+        let mut wire: Vec<(u16, u32, bool, Vec<u8>)> = Vec::new();
+        wire.push((1, 100, false, vec![0x67, 0x64, 0x00, 0x1f]));
+        wire.push((2, 100, false, vec![0x68, 0xee]));
+        wire.push((3, 100, false, vec![0x7c, 0x85, 0xaa, 0xbb]));
+        wire.push((4, 100, true, vec![0x7c, 0x45, 0xcc]));
+        // Then a delta picture.
+        wire.push((5, 200, true, vec![0x41, 0x9a]));
+
+        let mut pictures = Vec::new();
+        for (seq, timestamp, marker, payload) in wire {
+            // The second byte of an RTP header carries the marker bit and
+            // the payload type.
+            let mut packet = vec![0x80, 123 | if marker { 0x80 } else { 0 }];
+            packet.extend_from_slice(&seq.to_be_bytes());
+            packet.extend_from_slice(&timestamp.to_be_bytes());
+            packet.extend_from_slice(&7u32.to_be_bytes());
+            packet.extend_from_slice(&payload);
+            let protected = sender.protect(&packet).expect("the packet was protected");
+            let rtp = receiver.unprotect(&protected).expect("the packet authenticated");
+            assert_eq!(rtp.marker, marker, "the marker did not survive the wire");
+            for unit in depay.push(rtp.seq, rtp.timestamp, rtp.marker, &rtp.payload) {
+                pictures.push(unit);
+            }
+        }
+        assert_eq!(pictures.len(), 2, "the stream did not produce two pictures");
+        // The first is an IDR: it can start a decoder and it resets the
+        // references.
+        assert!(pictures[0].keyframe);
+        assert!(pictures[0].reset);
+        // The second is a delta: neither.
+        assert!(!pictures[1].keyframe);
+        assert!(!pictures[1].reset);
+        // And the key picture carries the parameter sets with it, because a
+        // decoder that has just been built needs them.
+        assert!(pictures[0].annex_b.windows(4).any(|w| w == [0x67, 0x64, 0x00, 0x1f]));
+        assert!(pictures[0].annex_b.windows(2).any(|w| w == [0x68, 0xee]));
+    }
 
     #[tokio::test]
     async fn a_packet_from_somewhere_else_is_not_read_as_video() {

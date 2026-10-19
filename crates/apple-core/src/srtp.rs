@@ -242,6 +242,96 @@ pub struct Rtp {
     pub payload: Vec<u8>,
 }
 
+/// The sending half of SRTP: encrypts and authenticates a packet.
+///
+/// The mirror of [`SrtpContext`], and the reason the media path can be
+/// tested end to end: a packet that goes out of here is a packet the
+/// receiver can authenticate and decrypt.
+#[derive(Clone)]
+pub struct SrtpEncryptor {
+    cipher_key: [u8; 32],
+    auth_key: [u8; 20],
+    salt: [u8; 14],
+    /// The index of the next packet sent.
+    index: u64,
+}
+
+impl SrtpEncryptor {
+    pub fn from_blob(blob: &[u8]) -> Option<Self> {
+        if blob.len() != 46 {
+            return None;
+        }
+        let mut master_key = [0u8; 32];
+        let mut master_salt = [0u8; 14];
+        master_key.copy_from_slice(&blob[..32]);
+        master_salt.copy_from_slice(&blob[32..]);
+        Some(Self {
+            cipher_key: derive(&master_key, &master_salt, 0, 32).try_into().ok()?,
+            auth_key: derive(&master_key, &master_salt, 1, 20).try_into().ok()?,
+            salt: derive(&master_key, &master_salt, 2, 14).try_into().ok()?,
+            index: 0,
+        })
+    }
+
+    /// Protect one RTP packet: the header travels in the clear, the payload
+    /// is encrypted, and the tag is appended.
+    ///
+    /// The packet must already carry the sequence number and the timestamp;
+    /// the index is taken from the sequence number, so the rollover counter
+    /// follows the sequence number as it wraps.
+    pub fn protect(&mut self, packet: &[u8]) -> Option<Vec<u8>> {
+        if packet.len() < 12 {
+            return None;
+        }
+        let seq = u16::from_be_bytes([packet[2], packet[3]]);
+        let ssrc = u32::from_be_bytes(packet[8..12].try_into().ok()?);
+        let roc = self.roc_for(seq);
+        let index = (u64::from(roc) << 16) | u64::from(seq);
+        let header_len = rtp_header_len(packet)?;
+        if header_len > packet.len() {
+            return None;
+        }
+        let mut body = packet[..header_len].to_vec();
+        let mut payload = packet[header_len..].to_vec();
+        let iv = packet_iv(&self.salt, ssrc, index);
+        apply_keystream(&self.cipher_key, &iv, &mut payload);
+        body.extend_from_slice(&payload);
+        let mut mac = <HmacSha1 as Mac>::new_from_slice(&self.auth_key).ok()?;
+        mac.update(&body);
+        mac.update(&roc.to_be_bytes());
+        let tag = mac.finalize().into_bytes();
+        body.extend_from_slice(&tag[..10]);
+        self.index = index.wrapping_add(1);
+        Some(body)
+    }
+
+    /// The rollover counter for a sequence number, following the same rule
+    /// as the receiver.
+    fn roc_for(&self, seq: u16) -> u32 {
+        let (roc, s_l) = self.roc_and_seq();
+        let ahead = seq.wrapping_sub(s_l);
+        if s_l < 0x8000 {
+            if ahead > 0x8000 {
+                roc.wrapping_sub(1)
+            } else {
+                roc
+            }
+        } else if ahead > 0x8000 {
+            roc.wrapping_add(1)
+        } else {
+            roc
+        }
+    }
+
+    fn roc_and_seq(&self) -> (u32, u16) {
+        if self.index == 0 {
+            return (0, 0);
+        }
+        let index = self.index - 1;
+        ((index >> 16) as u32, (index & 0xffff) as u16)
+    }
+}
+
 /// The sending half of SRTCP: encrypts and authenticates the feedback we
 /// send back to the Mac.
 ///
@@ -455,6 +545,34 @@ mod tests {
         // the tag.
         assert_eq!(&protected[..8], &packet[..8]);
         assert_eq!(protected.len(), packet.len() + 4 + 10);
+    }
+
+    #[test]
+    fn a_protected_packet_is_read_back() {
+        let blob = [5u8; 46];
+        let mut sender = SrtpEncryptor::from_blob(&blob).unwrap();
+        let mut receiver = SrtpContext::from_blob(&blob).unwrap();
+        let payload = vec![0x65, 0xaa, 0xbb, 0xcc];
+        for seq in 0..5u16 {
+            let mut packet = vec![0x80, 123];
+            packet.extend_from_slice(&seq.to_be_bytes());
+            packet.extend_from_slice(&1000u32.to_be_bytes());
+            packet.extend_from_slice(&9u32.to_be_bytes());
+            packet.extend_from_slice(&payload);
+            let protected = sender.protect(&packet).expect("protected");
+            let rtp = receiver.unprotect(&protected).expect("authenticated");
+            assert_eq!(rtp.payload, payload);
+            assert_eq!(rtp.seq, seq);
+        }
+        // A packet that was tampered with is refused.
+        let mut packet = vec![0x80, 123];
+        packet.extend_from_slice(&9u16.to_be_bytes());
+        packet.extend_from_slice(&1000u32.to_be_bytes());
+        packet.extend_from_slice(&9u32.to_be_bytes());
+        packet.extend_from_slice(&payload);
+        let mut protected = sender.protect(&packet).expect("protected");
+        protected[13] ^= 0x01;
+        assert!(receiver.unprotect(&protected).is_none());
     }
 
     #[test]
