@@ -5,6 +5,8 @@
 // second opinion. The production tests are the ones that must keep passing.
 #[path = "../../../../crates/apple-core/src/h264.rs"]
 mod h264;
+#[path = "../../../../crates/apple-core/src/rtcp.rs"]
+mod rtcp;
 #[path = "../../../../crates/apple-core/src/srtp.rs"]
 mod srtp;
 

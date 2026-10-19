@@ -70,6 +70,44 @@ Normal softness from reducing resolution and enlarging H.264 4:2:0 is expected. 
 | Intermittent disconnects | Rekey resets the record sequence counters; unparsed control messages; worker death is silent | P1-11, P1-10, P1-14 |
 | Mac resolution changes unexpectedly | The resize path is a virtual-display configuration with flat 1× modes, not a panel-preserving quality control | P0-6, P1-7, P1-18 |
 
+## Where the work stands
+
+The findings below are the review as it was written. This is what has been
+done since, and what still needs a live Mac to settle.
+
+| Finding | State |
+|---|---|
+| P0-1 resize transaction | **Fixed.** A round ends on a picture at the new size, not on an acknowledgement; the newest request wins; a round that is never answered times out and says so. |
+| P0-2 SSRC adoption | **Fixed.** Packets are authenticated before they can change anything; each SSRC keeps its own state; a second stream is reported, not merged. |
+| P0-3 H.264 assembly | **Fixed.** Sequence numbers reach the assembler, packets are put back in order, a hole invalidates its picture instead of corrupting it, and the wait for a hole is bounded. |
+| P0-4 decoder recovery | **Fixed.** A failure belongs to the stream, not to the pane; the hardware refusal is reported and retried; a first frame is counted when pixels reach the screen. |
+| P0-5/P0-8 media recovery | **Fixed.** The feedback key is kept, and the session asks for the missing packets and for a fresh picture, in the three forms Apple's server answers. |
+| P0-6 virtual display | **Corrected, still to be seen.** The display type is required for a dynamic descriptor and is what the native viewer sends; the comment no longer calls it a private display. A quality change now keeps the desktop at the size the person arranged it at. Whether the physical panel itself is untouched still needs a live check. |
+| P0-7 intra picture | **Fixed.** Only an IDR resets the decoder; an intra picture is fed to the existing one. |
+| P0-9 two streams | **Fixed.** The negotiated tile count is reported and the streams are never merged. |
+| P1-7 logical and backing sizes | **Fixed.** The mode table keeps the desktop in points and changes only the pixels. |
+| P1-8 classification | **Fixed.** The whole picture is classified, and "key" and "reset" are different things. |
+| P1-9 SRTP replay | **Fixed.** A replay window, a monotonic state, and rollover counters that the tag settles. |
+| P1-10 control parsing | **Fixed.** The rectangles are walked, and the layout and the rekey are found wherever they are. |
+| P1-11 rekey counters | **Fixed.** A rekey changes the key and the IV; the counters belong to the session. |
+| P1-12 offer flags | **No change needed.** The code was already right, and the note in the protocol document is a trap. |
+| P1-13 offer and answer | **Partly.** The offer and answer still share one key pair, and the answer is still not parsed. |
+| P1-14 supervisor | **Fixed.** A dropped connection comes back, "reconnect now" works, and a dead video receiver ends the session instead of hiding it. |
+| P1-15 display controls | **Fixed.** The work is off the input path, listing modes no longer resizes the picture, and an orderly disconnect restores the panel. |
+| P1-16 authentication | **Partly.** The server's proof is now checked, the sign-in has a deadline, and the group is checked. The proof's exact shape is still unconfirmed against a live Mac, so a mismatch is reported rather than fatal. |
+| P1-17 input contracts | **Fixed.** Held keys and buttons are released, view-only sends nothing, and the agent's intents are refused with a reason. |
+| P1-18 sizes and baselines | **Partly.** The bounds are one rule for every entry point, and the presets ask for even dimensions. The original mode is still the session's first geometry rather than a saved mode. |
+| P2-19 measurement | **Partly.** The stream's health is counted and logged. The counts are not on the screen yet. |
+| P2-20 UDP buffers | **Open.** |
+| P2-21 decoder backlog | **Open.** |
+| P2-22 the interface | **Partly.** The Mac's quality menu says what it does. The statistics are not on the screen yet. |
+| P2-23 regression coverage | **Partly.** The protocol, the renderer and the session rules have tests. There is still no fake server to drive a whole session. |
+
+**The mouse offset in a scaled window is still open.** It was not in the
+findings above, because the review could not tell a scaling mistake from
+a mapping mistake without a live session. It is the next thing to look at,
+and it needs the picture and the pointer together.
+
 ## Priorities
 
 Here **P0** means fix before further unattended resize experiments, **P1** means required for a dependable driver, and **P2** means measurement, completeness, or performance work. This is project triage, not a CVSS security classification.
