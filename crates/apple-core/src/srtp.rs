@@ -150,16 +150,11 @@ impl SrtpContext {
             self.stats.malformed += 1;
             return None;
         }
-        let mut payload_end = tag_at;
-        if packet[0] & 0x20 != 0 {
-            // Padding: the last byte before the tag counts it.
-            let pad = packet[tag_at - 1] as usize;
-            if pad == 0 || pad > tag_at - header_len {
-                self.stats.malformed += 1;
-                return None;
-            }
-            payload_end -= pad;
-        }
+        // RTP padding is inside the encrypted payload (RFC 3711 section 3.1),
+        // so the byte before the tag is ciphertext and only means anything
+        // after decryption. Reading it in the clear rejected valid padded
+        // packets and decrypted the wrong number of bytes.
+        let padded = packet[0] & 0x20 != 0;
         let seq = u16::from_be_bytes([packet[2], packet[3]]);
         let ssrc = u32::from_be_bytes(packet[8..12].try_into().ok()?);
         for roc in self.candidate_rocs(seq) {
@@ -179,13 +174,25 @@ impl SrtpContext {
                 }
                 return None;
             }
-            let mut payload = packet[header_len..payload_end].to_vec();
+            let mut payload = packet[header_len..tag_at].to_vec();
             let iv = packet_iv(&self.salt, ssrc, index);
             apply_keystream(&self.cipher_key, &iv, &mut payload);
             // The state only ever moves forward, so a packet that arrives
             // late cannot rewind the rollover counter.
             if self.highest.is_none_or(|high| index > high) {
                 self.highest = Some(index);
+            }
+            if padded {
+                // The count byte is the last plaintext byte and includes
+                // itself. A malformed count is an authenticated packet with
+                // an unusable payload: its packet index stays consumed, so
+                // rejecting it cannot rewind the replay state.
+                let pad = payload.last().copied().unwrap_or(0) as usize;
+                if pad == 0 || pad > payload.len() {
+                    self.stats.malformed += 1;
+                    return None;
+                }
+                payload.truncate(payload.len() - pad);
             }
             self.stats.accepted += 1;
             return Some(Rtp {
@@ -687,17 +694,14 @@ mod tests {
         assert_eq!(receiver.stats.malformed, 1);
     }
 
-    #[test]
-    fn padding_is_removed_from_the_payload() {
-        let mut receiver = SrtpContext::from_blob(&[42; 46]).unwrap();
-        let index = 1u64;
-        let mut payload = vec![0x65, 1, 2, 3];
+    /// A protected packet whose payload, padding included, is encrypted as
+    /// one region, the way a sender writes it.
+    fn padded_for(receiver: &SrtpContext, plain: &[u8], seq: u16, index: u64) -> Vec<u8> {
+        let mut payload = plain.to_vec();
         let iv = packet_iv(&receiver.salt, 7, index);
         apply_keystream(&receiver.cipher_key, &iv, &mut payload);
-        // Three padding bytes, counted by the last one.
-        payload.extend([0xaa, 0xbb, 0x03]);
         let mut p = vec![0x80 | 0x20, 0xe4];
-        p.extend_from_slice(&1u16.to_be_bytes());
+        p.extend_from_slice(&seq.to_be_bytes());
         p.extend_from_slice(&9u32.to_be_bytes());
         p.extend_from_slice(&7u32.to_be_bytes());
         p.extend(payload);
@@ -705,7 +709,37 @@ mod tests {
         mac.update(&p);
         mac.update(&0u32.to_be_bytes());
         p.extend_from_slice(&mac.finalize().into_bytes()[..10]);
-        let rtp = receiver.unprotect(&p).unwrap();
+        p
+    }
+
+    #[test]
+    fn padding_is_removed_from_the_payload() {
+        let mut receiver = SrtpContext::from_blob(&[42; 46]).unwrap();
+        // Three padding bytes, counted by the last one, all encrypted.
+        let p = padded_for(&receiver, &[0x65, 1, 2, 3, 0xa5, 0xa5, 3], 1, 1);
+        let rtp = receiver.unprotect(&p).expect("authenticated");
         assert_eq!(rtp.payload, [0x65, 1, 2, 3]);
+    }
+
+    #[test]
+    fn a_payload_that_is_only_padding_becomes_empty() {
+        let mut receiver = SrtpContext::from_blob(&[42; 46]).unwrap();
+        let p = padded_for(&receiver, &[1], 1, 1);
+        let rtp = receiver.unprotect(&p).expect("authenticated");
+        assert!(rtp.payload.is_empty());
+    }
+
+    #[test]
+    fn malformed_padding_is_rejected_without_rewinding_the_stream() {
+        let mut receiver = SrtpContext::from_blob(&[42; 46]).unwrap();
+        // The count claims more bytes than the payload has.
+        let bad = padded_for(&receiver, &[0xa5, 0xa5, 0xa5, 9], 5, 5);
+        assert!(receiver.unprotect(&bad).is_none());
+        assert_eq!(receiver.stats.malformed, 1);
+        // An authenticated packet consumed its index, so the next genuine
+        // packet is still accepted and the rollover counter is intact.
+        let good = packet(&receiver, 6, 0, 7);
+        assert!(receiver.unprotect(&good).is_some());
+        assert!(receiver.unprotect(&packet(&receiver, 0, 1, 7)).is_some());
     }
 }
