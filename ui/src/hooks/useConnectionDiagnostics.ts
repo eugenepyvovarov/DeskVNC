@@ -43,7 +43,7 @@ export interface DiagnosticsState {
 }
 
 /** One second of healthy stream, before the first real sample arrives. */
-const IDLE: Sample = { at: 0, throughput: 0, fps: 0, loss: 0, jitter: 0, queued: 0, decodeMs: 0, acceleration: "unknown", behind: false };
+const IDLE: Sample = { at: 0, throughput: 0, fps: 0, loss: 0, jitter: 0, queued: 0, decodeMs: 0, inputLatencyMs: 0, acceleration: "unknown", behind: false };
 
 export function useConnectionDiagnostics(
   input: DiagnosticsInput,

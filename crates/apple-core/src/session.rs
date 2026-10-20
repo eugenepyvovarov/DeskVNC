@@ -541,6 +541,14 @@ struct MediaCounters {
     /// began. The control loop reads it to decide whether the stream has
     /// stopped for good.
     last_picture_ms: std::sync::atomic::AtomicU64,
+    /// Smoothed time from the user's input to the picture that answers it,
+    /// in milliseconds. This is the number a person feels as lag, and it is
+    /// the only one that separates an idle desktop from a server that is
+    /// throttling: a still screen sends nothing, but a screen being used
+    /// must answer.
+    input_latency_ms: std::sync::atomic::AtomicU32,
+    /// The slowest answer in the last few, so one freeze is visible.
+    input_worst_ms: std::sync::atomic::AtomicU32,
 }
 
 /// Timing between pictures, as the receiver sees it.
@@ -1480,6 +1488,30 @@ async fn connect(
                     video_counters
                         .last_picture_ms
                         .store(last_picture_ms, std::sync::atomic::Ordering::Relaxed);
+                    // How long the person waited for this picture, if they
+                    // had asked for one. The mark is cleared so the wait is
+                    // measured once, not counted again by the next picture.
+                    let asked_at = video_owed.swap(0, std::sync::atomic::Ordering::Relaxed);
+                    if asked_at != 0 && last_picture_ms > asked_at {
+                        let waited = (last_picture_ms - asked_at).min(60_000) as u32;
+                        let previous = video_counters
+                            .input_latency_ms
+                            .load(std::sync::atomic::Ordering::Relaxed);
+                        let smoothed = if previous == 0 {
+                            waited
+                        } else {
+                            // A slow average that hides a single freeze is
+                            // not a measurement; the worst case is kept
+                            // beside it.
+                            (u64::from(previous) * 7 / 8 + u64::from(waited) / 8) as u32
+                        };
+                        video_counters
+                            .input_latency_ms
+                            .store(smoothed, std::sync::atomic::Ordering::Relaxed);
+                        video_counters
+                            .input_worst_ms
+                            .fetch_max(waited, std::sync::atomic::Ordering::Relaxed);
+                    }
                     // The spacing between pictures is what a person feels as
                     // smoothness, so it is measured where the pictures land.
                     let jitter = cadence.picture(Instant::now());
@@ -1952,6 +1984,10 @@ async fn connect(
                 media_state.bytes = bytes;
                 media_state.stalls = counters.stalls.load(std::sync::atomic::Ordering::Relaxed);
                 media_state.jitter_ms = counters.jitter_ms.load(std::sync::atomic::Ordering::Relaxed);
+                media_state.input_latency_ms =
+                    counters.input_latency_ms.load(std::sync::atomic::Ordering::Relaxed);
+                media_state.input_worst_ms =
+                    counters.input_worst_ms.load(std::sync::atomic::Ordering::Relaxed);
                 if last_media_report.elapsed() >= Duration::from_secs(1) {
                     last_media_report = Instant::now();
                     emit(events, SessionEvent::Protocol(remote_core::ProtocolEvent::AppleMedia(media_state))).await.ok();

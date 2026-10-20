@@ -5,7 +5,7 @@ import type { AppleMediaState } from "./appleMedia";
 function sample(over: Partial<Sample> = {}): Sample {
   return {
     at: 0, throughput: 4e6, fps: 30, loss: 0, jitter: 10, queued: 0, decodeMs: 5,
-    acceleration: "hardware", behind: false,
+    inputLatencyMs: 0, acceleration: "hardware", behind: false,
     ...over,
   };
 }
@@ -17,7 +17,7 @@ function media(over: Partial<AppleMediaState> = {}): AppleMediaState {
     desktopWidth: 0, desktopHeight: 0,
     canvasWidth: 0, canvasHeight: 0,
     tiles: 0, pictures: 0, lost: 0, dropped: 0, recoveries: 0, requests: 0,
-    packets: 0, bytes: 0, stalls: 0, jitterMs: 0,
+    packets: 0, bytes: 0, stalls: 0, jitterMs: 0, inputLatencyMs: 0, inputWorstMs: 0,
     ...over,
   };
 }
@@ -65,6 +65,27 @@ describe("findings", () => {
 
     const software = findings(sample({ decodeMs: 400, acceleration: "software" }));
     expect(software.some((f) => f.title === "Decoding on the CPU")).toBe(true);
+  });
+
+  it("judges picture lag against the spacing between pictures", () => {
+    // The decoder holds one picture until the next arrives, so at two
+    // pictures a second a 400 ms delay is the wait, not a fault.
+    const still = findings(sample({ fps: 2, decodeMs: 400, queued: 0 }));
+    expect(still.some((f) => f.title.includes("400 ms"))).toBe(false);
+    // At 30 pictures a second the same delay means something is wrong.
+    const busy = findings(sample({ fps: 30, decodeMs: 400, queued: 0 }));
+    expect(busy.some((f) => f.title.includes("400 ms"))).toBe(true);
+  });
+
+  it("reports input lag, which is the delay a person feels", () => {
+    const slow = findings(sample({ inputLatencyMs: 600 }));
+    expect(slow[0].severity).toBe("warning");
+    expect(slow[0].title).toContain("600 ms");
+    const quick = findings(sample({ inputLatencyMs: 40 }));
+    expect(quick.some((f) => f.title.includes("answered in 40 ms"))).toBe(true);
+    // Nothing sent yet is not a verdict about responsiveness.
+    const unused = findings(sample({ inputLatencyMs: 0 }));
+    expect(unused.every((f) => !f.title.includes("answered"))).toBe(true);
   });
 
   it("reports a decoder that dropped its queue as a warning", () => {

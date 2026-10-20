@@ -161,6 +161,10 @@ export function ConnectionDiagnostics(props: ConnectionDiagnosticsProps): ReactN
         <Row label="Pictures" value={`${sample.fps.toFixed(1)}/s`} />
         <Row label="Lost" value={`${lossPercent(props.media).toFixed(2)}%`} />
         <Row label="Jitter" value={`${Math.round(sample.jitter)} ms`} />
+        <Row
+          label="Input lag"
+          value={sample.inputLatencyMs > 0 ? `${Math.round(sample.inputLatencyMs)} ms` : "-"}
+        />
         <Row label="Decoder queue" value={`${sample.queued}`} />
         <Row label="Picture delay" value={`${Math.round(sample.decodeMs)} ms`} />
         {props.decoder?.acceleration

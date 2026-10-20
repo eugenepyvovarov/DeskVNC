@@ -40,6 +40,8 @@ export interface Sample {
   queued: number;
   /** Submission-to-output decoder delay, in milliseconds. */
   decodeMs: number;
+  /** Input to answering picture, in milliseconds. Zero until the person uses it. */
+  inputLatencyMs: number;
   /** What the webview configured: hardware or software. */
   acceleration: "hardware" | "software" | "unknown";
   /** The decoder dropped its queue because it could not keep up. */
@@ -162,7 +164,13 @@ export function findings(sample: Sample, totals: { stalls?: number; dropped?: nu
     });
   }
 
-  if (sample.decodeMs >= 250) {
+  // The decoder holds one picture until the next arrives, so at a low
+  // picture rate the handover-to-output delay is mostly that wait. Judging
+  // it against the spacing is what keeps a still desktop from being
+  // reported as a fault.
+  const spacing = sample.fps > 0 ? 1000 / sample.fps : 0;
+  const lagIsBeyondSpacing = spacing === 0 || sample.decodeMs > spacing * 1.5;
+  if (sample.decodeMs >= 250 && lagIsBeyondSpacing) {
     out.push({
       severity: "warning",
       title: `A picture arrives ${Math.round(sample.decodeMs)} ms after it was handed over`,
@@ -170,7 +178,7 @@ export function findings(sample: Sample, totals: { stalls?: number; dropped?: nu
         ? "Nothing is queued, so this is buffering in the decoder pipeline rather than slow arithmetic."
         : "Some of this is pictures waiting in the decoder queue, which grows when the decoder cannot keep up.",
     });
-  } else if (sample.decodeMs >= 60) {
+  } else if (sample.decodeMs >= 60 && lagIsBeyondSpacing) {
     out.push({
       severity: "notice",
       title: `A picture takes ${Math.round(sample.decodeMs)} ms to come back`,
@@ -182,6 +190,19 @@ export function findings(sample: Sample, totals: { stalls?: number; dropped?: nu
       severity: "warning",
       title: `Only ${sample.fps.toFixed(1)} pictures per second`,
       detail: "A mostly still desktop looks like this. A desktop being used does not.",
+    });
+  }
+
+  if (sample.inputLatencyMs >= 250) {
+    out.push({
+      severity: "warning",
+      title: `The picture answers input after ${Math.round(sample.inputLatencyMs)} ms`,
+      detail: "This is what lag feels like: the time from a pointer move or a key to the picture that shows it.",
+    });
+  } else if (sample.inputLatencyMs > 0) {
+    out.push({
+      severity: "good",
+      title: `Input is answered in ${Math.round(sample.inputLatencyMs)} ms`,
     });
   }
 
@@ -230,6 +251,7 @@ export function sampleFrom(
     jitter: media?.jitterMs ?? 0,
     queued: decoder?.queued ?? 0,
     decodeMs: decoder?.latencyMs ?? 0,
+    inputLatencyMs: media?.inputLatencyMs ?? 0,
     acceleration: decoder?.acceleration ?? "unknown",
     behind: decoder?.behind ?? false,
   };
@@ -305,6 +327,10 @@ export function report(input: ReportInput): string {
     push(`  pictures:   ${m.pictures}`);
     push(`  lost:       ${m.lost} (${(lossFraction(m.lost, m.packets) * 100).toFixed(2)}%)`);
     push(`  jitter:     ${m.jitterMs} ms`);
+    push(
+      `  input lag:  ${m.inputLatencyMs} ms typical, ${m.inputWorstMs} ms worst` +
+        (m.inputLatencyMs === 0 ? " (not used yet in this session)" : ""),
+    );
     push(`  stalls:     ${m.stalls}`);
     push(`  dropped:    ${m.dropped} locally`);
     push(`  recovers:   ${m.recoveries} (${m.requests} feedback packets sent)`);

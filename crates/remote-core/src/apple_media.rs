@@ -37,6 +37,11 @@ pub struct MediaState {
     pub stalls: u64,
     /// Variation in the spacing between pictures, in milliseconds.
     pub jitter_ms: u32,
+    /// Smoothed time from the user's input to the picture that answers it.
+    /// Zero until the person has used the session.
+    pub input_latency_ms: u32,
+    /// The slowest of those answers, so one freeze stays visible.
+    pub input_worst_ms: u32,
 }
 
 impl MediaState {

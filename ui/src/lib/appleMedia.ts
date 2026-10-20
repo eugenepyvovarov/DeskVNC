@@ -26,4 +26,8 @@ export interface AppleMediaState {
   stalls: number;
   /** Variation in the spacing between pictures, in milliseconds. */
   jitterMs: number;
+  /** Smoothed time from input to the picture that answers it. */
+  inputLatencyMs: number;
+  /** The slowest such answer, so one freeze stays visible. */
+  inputWorstMs: number;
 }
