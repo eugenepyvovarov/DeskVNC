@@ -39,10 +39,7 @@ fn first_records(geometry: Option<remote_core::options::AppleGeometry>) -> Vec<V
         out.push(display_config(
             DisplayRequest {
                 points: (geometry.point_width, geometry.point_height),
-                scale: backing_scale(
-                    (geometry.pixel_width, geometry.pixel_height),
-                    (geometry.point_width, geometry.point_height),
-                ),
+                pixels: (geometry.pixel_width, geometry.pixel_height),
             },
             (geometry.pixel_width, geometry.pixel_height),
         ));
@@ -354,8 +351,10 @@ struct ResizeRound {
     in_flight: bool,
     /// When the request was sent.
     sent_at: Option<Instant>,
-    /// The round has to wait for a picture at the new size before it ends.
-    /// A layout that did not change the geometry needs no new picture.
+    /// The round has to wait for the replacement picture before it ends.
+    /// The layout alone is a statement about the canvas; the encoder
+    /// restarts after it, and only a picture from the restarted encoder
+    /// says the new stream is really running.
     needs_picture: bool,
     /// The request has been sent and the layout that answers it has not
     /// arrived yet. A picture from the old encoder says nothing about the
@@ -363,10 +362,16 @@ struct ResizeRound {
     awaiting_layout: bool,
     /// The geometry the session had before this round asked for anything.
     ///
-    /// A Mac that cannot do what was asked answers with something smaller,
-    /// and accepting that shrinks the person's desktop. When that happens
+    /// A Mac that cannot do what was asked answers with a smaller desktop,
+    /// and accepting that shrinks the person's windows. When that happens
     /// the round puts this geometry back.
     before: Option<DisplayGeometry>,
+    /// This round is putting back the geometry a failed round started from,
+    /// rather than carrying something a person asked for.
+    restoring: bool,
+    /// Automatic restorations still allowed for the current intent. One is
+    /// enough: a Mac that answered small twice does not need a third try.
+    restores_left: u8,
 }
 
 /// What asking for a size means.
@@ -398,14 +403,30 @@ fn plan_resize(
         round.requested = None;
         return ResizeAction::Nothing;
     }
-    round.before = Some(current);
+    start_round(round, target, current, false);
+    ResizeAction::Send(target)
+}
+
+/// Put a request in flight.
+///
+/// `before` is what a failed round puts back, so it has to be the geometry
+/// the session really has at the moment the request goes out, not the one
+/// from before the previous round.
+fn start_round(
+    round: &mut ResizeRound,
+    target: DisplayGeometry,
+    before: DisplayGeometry,
+    restoring: bool,
+) {
+    round.before = Some(before);
     round.sent = Some(target);
     round.confirmed = None;
     round.sent_at = Some(Instant::now());
     round.in_flight = true;
     round.needs_picture = true;
     round.awaiting_layout = true;
-    ResizeAction::Send(target)
+    round.restoring = restoring;
+    round.restores_left = if restoring { 0 } else { 1 };
 }
 
 /// What the end of a round means.
@@ -427,12 +448,11 @@ fn finish_round(round: &mut ResizeRound) -> RoundEnd {
     match round.requested {
         Some(target) if Some(target) != sent => {
             // A newer request arrived while this round was running. It wins.
-            round.sent = Some(target);
-            round.confirmed = None;
-            round.sent_at = Some(Instant::now());
-            round.in_flight = true;
-            round.needs_picture = true;
-            round.awaiting_layout = true;
+            // The geometry this session really has is what a later failure
+            // has to put back, so the next round snapshots the answer this
+            // one received rather than its own older `before`.
+            let before = round.confirmed.or(round.before).unwrap_or(target);
+            start_round(round, target, before, false);
             RoundEnd::Send(target)
         }
         _ => {
@@ -446,14 +466,27 @@ fn finish_round(round: &mut ResizeRound) -> RoundEnd {
     }
 }
 
-/// Whether the Mac answered with a smaller picture than was asked for.
+/// Whether the Mac answered with a smaller desktop than was asked for.
 ///
-/// That answer is not a quality setting, it is a smaller desktop: fewer
-/// points, which looks like the viewer has zoomed in.
-fn answered_smaller(clamped: Option<(DisplayGeometry, DisplayGeometry)>) -> bool {
+/// The desktop is measured in points. A picture with fewer pixels at the
+/// same point size is a lower stream quality, which is what a quality
+/// preset asks for; treating it as a failure is what made a 1800x1170
+/// request for an 1800x1169 desktop shrink and then bounce back.
+fn desktop_shrank(clamped: Option<(DisplayGeometry, DisplayGeometry)>) -> bool {
     clamped.is_some_and(|(sent, confirmed)| {
-        confirmed.pixels.0 < sent.pixels.0 || confirmed.pixels.1 < sent.pixels.1
+        confirmed.points.0 < sent.points.0 || confirmed.points.1 < sent.points.1
     })
+}
+
+/// Whether an answer differs enough from the request to tell the person.
+///
+/// Rounding an odd height to an even one is not news: the Mac reports what
+/// it laid out, and one pixel is the encoder's padding, not a different
+/// picture.
+fn answer_is_notable(sent: DisplayGeometry, confirmed: DisplayGeometry) -> bool {
+    confirmed.points != sent.points
+        || confirmed.pixels.0.abs_diff(sent.pixels.0) > 2
+        || confirmed.pixels.1.abs_diff(sent.pixels.1) > 2
 }
 
 /// Ask for a size, or remember the ask until the running round is over.
@@ -1936,8 +1969,17 @@ async fn connect(
                         // a renderer acknowledgement of the effective size.
                         session.send_body(&offer).await?;
                         generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                        round.confirmed = Some(DisplayGeometry { pixels: (bw, bh), points: (lw, lh) });
-                        round.needs_picture = changed;
+                        // The points are the session's after the update
+                        // above, so a layout that carries no logical size
+                        // cannot look like a shrink to zero.
+                        round.confirmed = Some(DisplayGeometry {
+                            pixels: (bw, bh),
+                            points: (session.logical_width, session.logical_height),
+                        });
+                        // The re-offer restarts the encoder, so the round
+                        // ends on a picture from that restarted encoder, not
+                        // on the layout that asked for it.
+                        round.needs_picture = true;
                         round.awaiting_layout = false;
                         tracing::info!(bw, bh, lw, lh, "Apple display layout received; media re-offered");
                     }
@@ -2017,7 +2059,12 @@ async fn connect(
                 let silent_ms = now_ms.saturating_sub(
                     counters.last_picture_ms.load(std::sync::atomic::Ordering::Relaxed),
                 );
+                // A round already re-offered the media session and is
+                // waiting for the encoder it restarted. A second re-offer
+                // here restarts the same encoder under it, which is how a
+                // resize raced its own recovery.
                 if owed != 0
+                    && !round.in_flight
                     && silent_ms >= REVIVE_AFTER.as_millis() as u64
                     && last_revive.elapsed() >= REVIVE_AFTER
                 {
@@ -2058,51 +2105,73 @@ async fn connect(
                     // The layout has to come first: a picture from the old
                     // encoder says nothing about the size that was asked for.
                     if !round.awaiting_layout && (!round.needs_picture || picture_arrived) {
+                        let was_restoring = round.restoring;
+                        let before = round.before;
                         match finish_round(&mut round) {
                             RoundEnd::Send(target) => {
                                 tracing::info!(?target, "Apple queued resize sent");
+                                media_state.requested_width = u32::from(target.pixels.0);
+                                media_state.requested_height = u32::from(target.pixels.1);
                                 let cap = baseline.unwrap_or((session.width, session.height));
                                 session
                                     .send_body(&display_config(request_for(target), cap))
                                     .await?;
                             }
                             RoundEnd::Done(clamped) => {
-                                tracing::info!("Apple resize round complete");
-                                // The Mac answers what it can do, which may be
-                                // smaller than what was asked. Accepting that
-                                // would shrink the person's desktop, and a
-                                // desktop that got smaller looks like the
-                                // viewer has zoomed in: every window is
-                                // bigger for the same screen.
-                                //
-                                // So a smaller answer is undone. The picture
-                                // goes back to the size it had, and the
-                                // person is told that the request was more
-                                // than this Mac would stream.
-                                let shrunk = answered_smaller(clamped);
-                                if shrunk {
-                                    if let Some(before) = round.before {
+                                tracing::info!(?clamped, restoring = was_restoring, "Apple resize round complete");
+                                let confirmed = round.confirmed;
+                                if was_restoring {
+                                    // The write that asked for the old size is
+                                    // not a restore. The layout that answers
+                                    // it is what proves the Mac is back.
+                                    round.restoring = false;
+                                    let restored = match (round.sent, confirmed) {
+                                        (Some(sent), Some(confirmed)) => {
+                                            confirmed.points == sent.points
+                                        }
+                                        _ => false,
+                                    };
+                                    let message = if restored {
+                                        "The Mac refused that stream size. Its desktop is back at the previous size."
+                                    } else {
+                                        "The Mac refused that stream size and did not confirm the previous desktop size. The current size is unverified."
+                                    };
+                                    tracing::warn!(restored, "Apple resize refusal handled");
+                                    emit(events, SessionEvent::Protocol(remote_core::ProtocolEvent::AppleNotice(message.into()))).await.ok();
+                                } else if desktop_shrank(clamped) && round.restores_left > 0 {
+                                    // The Mac answered with fewer points. That
+                                    // is a smaller desktop, not a lower quality:
+                                    // every window is bigger for the same
+                                    // screen. Put the geometry back as a round
+                                    // of its own, so the layout and the picture
+                                    // prove it before anything is reported.
+                                    if let Some(before) = before {
                                         let cap = baseline.unwrap_or(before.pixels);
+                                        start_round(&mut round, before, confirmed.unwrap_or(before), true);
+                                        media_state.requested_width = u32::from(before.pixels.0);
+                                        media_state.requested_height = u32::from(before.pixels.1);
+                                        tracing::warn!(?before, ?clamped, "Apple answered with a smaller desktop; putting the previous one back");
                                         session
                                             .send_body(&display_config(request_for(before), cap))
                                             .await?;
-                                        tracing::info!(?before, "Apple answered smaller than asked; desktop restored");
+                                        emit(events, SessionEvent::Protocol(remote_core::ProtocolEvent::AppleNotice(
+                                            "The Mac offered a smaller desktop than the stream size asked for. Putting the previous desktop back.".into(),
+                                        ))).await.ok();
                                     }
-                                }
-                                if let Some((sent, confirmed)) = clamped {
-                                    let tail = if shrunk {
-                                        " The desktop was put back to its previous size."
-                                    } else {
-                                        ""
-                                    };
+                                } else if let Some((sent, confirmed)) = clamped
+                                    .filter(|(sent, confirmed)| answer_is_notable(*sent, *confirmed))
+                                {
                                     emit(events, SessionEvent::Protocol(remote_core::ProtocolEvent::AppleNotice(
                                         format!(
-                                            "The Mac reported {}x{} pixels / {}x{} points; requested {}x{} pixels / {}x{} points. This is a layout acknowledgement, not decoded output.{}",
+                                            "The Mac reported {}x{} pixels / {}x{} points; requested {}x{} pixels / {}x{} points. This is a layout acknowledgement, not decoded output.",
                                             confirmed.pixels.0, confirmed.pixels.1, confirmed.points.0, confirmed.points.1,
                                             sent.pixels.0, sent.pixels.1, sent.points.0, sent.points.1,
-                                            tail,
                                         ),
                                     ))).await.ok();
+                                }
+                                if !round.in_flight {
+                                    media_state.requested_width = 0;
+                                    media_state.requested_height = 0;
                                 }
                             }
                         }
@@ -2110,14 +2179,22 @@ async fn connect(
                         if sent_at.elapsed() > RESIZE_TIMEOUT {
                             // The Mac did not answer in time. Say so, and
                             // leave the session where it was rather than
-                            // waiting for ever.
+                            // waiting for ever. A restoration that timed out
+                            // is not a restoration.
+                            let was_restoring = round.restoring;
                             round.in_flight = false;
                             round.sent_at = None;
                             round.requested = None;
-                            tracing::warn!("Apple resize round timed out");
-                            emit(events, SessionEvent::Protocol(remote_core::ProtocolEvent::AppleNotice(
-                                "The stream-size request timed out. Its effective size has not been verified; check the decoded picture dimensions.".into(),
-                            ))).await.ok();
+                            round.restoring = false;
+                            media_state.requested_width = 0;
+                            media_state.requested_height = 0;
+                            tracing::warn!(restoring = was_restoring, "Apple resize round timed out");
+                            let message = if was_restoring {
+                                "The Mac did not confirm the previous desktop size. Its current size is unverified."
+                            } else {
+                                "The stream-size request timed out. Its effective size has not been verified; check the decoded picture dimensions."
+                            };
+                            emit(events, SessionEvent::Protocol(remote_core::ProtocolEvent::AppleNotice(message.into()))).await.ok();
                         }
                     }
                 }
@@ -2269,36 +2346,26 @@ fn viewer_info() -> Vec<u8> {
     msg
 }
 
-/// The desktop size a request asks for, and the pixels per point it wants.
+/// The desktop size a request asks for, and the picture size it asks for.
 ///
 /// The two are separate because a Mac display has two resolutions: the
 /// desktop in points, which is what a person sees as "how big things are",
-/// and the backing store in pixels, which is how sharp they are. Asking for
-/// the wrong one of them is what made a quality change look like a zoom.
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// and the backing store in pixels, which is how sharp they are. Both are
+/// carried exactly. Deriving the pixels back from a rounded ratio is how a
+/// request for 1800x1170 was serialized as an 1800x1169 mode, and then
+/// reported back as a failure when the Mac did what was on the wire.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct DisplayRequest {
     points: (u16, u16),
-    /// Backing pixels per point: 2.0 is a Retina panel, 1.0 is a plain one.
-    scale: f32,
+    pixels: (u16, u16),
 }
 
-/// The request a geometry means: its desktop size, and its pixels per point.
+/// The request a geometry means: its desktop size, and its picture size.
 fn request_for(geometry: DisplayGeometry) -> DisplayRequest {
     DisplayRequest {
         points: geometry.points,
-        scale: backing_scale(geometry.pixels, geometry.points),
+        pixels: geometry.pixels,
     }
-}
-
-/// Pixels per point for a picture of `pixels` on a desktop of `points`.
-fn backing_scale(pixels: (u16, u16), points: (u16, u16)) -> f32 {
-    if points.0 == 0 || points.1 == 0 {
-        return 1.0;
-    }
-    let x = f64::from(pixels.0) / f64::from(points.0);
-    let y = f64::from(pixels.1) / f64::from(points.1);
-    let scale = ((x + y) / 2.0).clamp(1.0, 3.0);
-    (scale * 100.0).round() as f32 / 100.0
 }
 
 /// The point sizes a Mac display offers, from the native mode table.
@@ -2306,15 +2373,15 @@ fn backing_scale(pixels: (u16, u16), points: (u16, u16)) -> f32 {
 /// The daemon expects a mode list that looks like a display's: several
 /// different sizes, not the same size repeated with shrinking pixels. A
 /// table that does not look like one is answered with the server's own
-/// fallback, which is how a request for the native panel came back as
-/// 800x600 points. These are the reference sizes, scaled to whatever was
-/// asked for.
+/// fallback. The first template is the size being asked for, which the
+/// request itself fills in; the rest are the alternate desktops the same
+/// display offers, scaled to it.
 const NATIVE_MODES: [(u32, u32); 5] = [
     (1920, 1080),
     (1440, 900),
-    (1920, 1080),
-    (1440, 810),
     (1312, 848),
+    (1280, 800),
+    (1152, 720),
 ];
 
 /// The smallest cap that is advertised, matching the reference client.
@@ -2365,12 +2432,12 @@ fn display_config(request: DisplayRequest, cap: (u16, u16)) -> Vec<u8> {
     m.extend_from_slice(&4u32.to_be_bytes());
     m.extend_from_slice(&369.45f32.to_be_bytes()); // physical mm (native)
     m.extend_from_slice(&207.82f32.to_be_bytes());
-    let wanted_backing = (
-        (f64::from(request.points.0) * f64::from(request.scale)).round() as u32,
-        (f64::from(request.points.1) * f64::from(request.scale)).round() as u32,
-    );
-    let max_w = wanted_backing.0.max(u32::from(cap.0)).max(MAX_BACKING.0);
-    let max_h = wanted_backing.1.max(u32::from(cap.1)).max(MAX_BACKING.1);
+    let max_w = u32::from(request.pixels.0)
+        .max(u32::from(cap.0))
+        .max(MAX_BACKING.0);
+    let max_h = u32::from(request.pixels.1)
+        .max(u32::from(cap.1))
+        .max(MAX_BACKING.1);
     m.extend_from_slice(&max_w.to_be_bytes());
     m.extend_from_slice(&max_h.to_be_bytes());
     m.extend_from_slice(&0u16.to_be_bytes()); // current_mode_index
@@ -2378,15 +2445,35 @@ fn display_config(request: DisplayRequest, cap: (u16, u16)) -> Vec<u8> {
     m.extend_from_slice(&7u32.to_be_bytes()); // rotations: the native sends 7
     m.extend_from_slice(&(MODE_COUNT as u16).to_be_bytes());
     // A mode list that looks like a display's, scaled to the desktop that
-    // was asked for. The backing size follows the requested ratio, so a
-    // quality change moves the pixels and leaves the points alone.
+    // was asked for. The first entry is the request itself, byte for byte,
+    // so the geometry that is logged, sent and compared is one geometry.
+    //
+    // The alternate desktops keep the request's pixels per point on each
+    // axis, which is what leaves the person's desktop alone when only the
+    // picture size changes. One averaged ratio used to serialize a request
+    // for 1800x1170 pixels on an 1800x1169 point desktop as 1800x1169.
+    let scale_x = f64::from(request.pixels.0) / f64::from(request.points.0.max(1));
+    let scale_y = f64::from(request.pixels.1) / f64::from(request.points.1.max(1));
     let sx = f64::from(request.points.0) / 1920.0;
     let sy = f64::from(request.points.1) / 1080.0;
-    for (template_w, template_h) in NATIVE_MODES {
-        let points_w = (f64::from(template_w) * sx).round().max(2.0) as u32;
-        let points_h = (f64::from(template_h) * sy).round().max(2.0) as u32;
-        let backing_w = even_u32((f64::from(points_w) * f64::from(request.scale)).round() as u32);
-        let backing_h = even_u32((f64::from(points_h) * f64::from(request.scale)).round() as u32);
+    for (index, (template_w, template_h)) in NATIVE_MODES.into_iter().enumerate() {
+        let (points_w, points_h, backing_w, backing_h) = if index == 0 {
+            (
+                u32::from(request.points.0),
+                u32::from(request.points.1),
+                u32::from(request.pixels.0),
+                u32::from(request.pixels.1),
+            )
+        } else {
+            let points_w = (f64::from(template_w) * sx).round().max(2.0) as u32;
+            let points_h = (f64::from(template_h) * sy).round().max(2.0) as u32;
+            (
+                points_w,
+                points_h,
+                even_u32((f64::from(points_w) * scale_x).round() as u32),
+                even_u32((f64::from(points_h) * scale_y).round() as u32),
+            )
+        };
         m.extend_from_slice(&backing_w.to_be_bytes()); // pixel width
         m.extend_from_slice(&backing_h.to_be_bytes()); // pixel height
         m.extend_from_slice(&points_w.to_be_bytes()); // scaled width (points)
@@ -3155,7 +3242,7 @@ mod tests {
         let m = display_config(
             DisplayRequest {
                 points: (1800, 1169),
-                scale: 2.0,
+                pixels: (3600, 2338),
             },
             (3600, 2338),
         );
@@ -3221,7 +3308,7 @@ mod tests {
         let m = display_config(
             DisplayRequest {
                 points: (1800, 1169),
-                scale: 2.0,
+                pixels: (3600, 2338),
             },
             (3600, 2338),
         );
@@ -3255,14 +3342,14 @@ mod tests {
         let plain = display_config(
             DisplayRequest {
                 points: (1800, 1169),
-                scale: 1.0,
+                pixels: (1800, 1170),
             },
             (3600, 2338),
         );
         let retina = display_config(
             DisplayRequest {
                 points: (1800, 1169),
-                scale: 2.0,
+                pixels: (3600, 2338),
             },
             (3600, 2338),
         );
@@ -3288,17 +3375,44 @@ mod tests {
     }
 
     #[test]
-    fn pixels_per_point_survives_a_round_trip() {
-        assert_eq!(backing_scale((3600, 2338), (1800, 1169)), 2.0);
-        assert_eq!(backing_scale((1800, 1170), (1800, 1169)), 1.0);
-        // Nothing known about the desktop is not a ratio.
-        assert_eq!(backing_scale((3600, 2338), (0, 0)), 1.0);
-        let request = request_for(DisplayGeometry {
-            pixels: (2700, 1754),
+    fn the_mode_that_is_asked_for_is_the_mode_that_is_sent() {
+        // A 1800x1170 picture on an 1800x1169 point desktop used to be
+        // averaged into a 1.0 ratio and serialized as 1800x1169, so the
+        // request that was logged, the request on the wire and the answer
+        // were three different numbers.
+        let geometry = DisplayGeometry {
+            pixels: (1800, 1170),
             points: (1800, 1169),
-        });
-        assert_eq!(request.points, (1800, 1169));
-        assert!((request.scale - 1.5).abs() < 0.01);
+        };
+        let m = display_config(request_for(geometry), (3600, 2338));
+        let mode = 12 + 0x9c;
+        assert_eq!(
+            u32::from_be_bytes(m[mode..mode + 4].try_into().unwrap()),
+            u32::from(geometry.pixels.0)
+        );
+        assert_eq!(
+            u32::from_be_bytes(m[mode + 4..mode + 8].try_into().unwrap()),
+            u32::from(geometry.pixels.1)
+        );
+        assert_eq!(
+            u32::from_be_bytes(m[mode + 8..mode + 12].try_into().unwrap()),
+            u32::from(geometry.points.0)
+        );
+        assert_eq!(
+            u32::from_be_bytes(m[mode + 12..mode + 16].try_into().unwrap()),
+            u32::from(geometry.points.1)
+        );
+        // The alternate desktops keep the same pixels per point on each
+        // axis, so none of them asks for a different desktop.
+        for entry in 1..5 {
+            let at = mode + entry * 28;
+            let px = f64::from(u32::from_be_bytes(m[at..at + 4].try_into().unwrap()));
+            let pts = f64::from(u32::from_be_bytes(m[at + 8..at + 12].try_into().unwrap()));
+            assert!(
+                (px / pts - 1.0008).abs() < 0.01,
+                "entry {entry}: {px}/{pts}"
+            );
+        }
     }
 
     /// A framebuffer update body carrying one rectangle.
@@ -3347,24 +3461,104 @@ mod tests {
     }
 
     #[test]
-    fn a_smaller_answer_is_recognised_so_the_desktop_can_be_put_back() {
+    fn a_smaller_desktop_is_recognised_so_it_can_be_put_back() {
         // A Mac that cannot stream the size that was asked for answers with
-        // something smaller. Accepting it shrinks the desktop, and a desktop
-        // with fewer points is what "zoomed in" looks like.
+        // a smaller desktop. A desktop with fewer points is what "zoomed in"
+        // looks like, so it is worth undoing.
         let sent = retina((3600, 2338));
-        assert!(answered_smaller(Some((sent, retina((1600, 1200))))));
+        let fallback = DisplayGeometry {
+            pixels: (1600, 1200),
+            points: (800, 600),
+        };
+        assert!(desktop_shrank(Some((sent, fallback))));
         // An answer that matches is not a problem.
-        assert!(!answered_smaller(Some((sent, sent))));
-        // A larger answer that only differs in points is not "smaller".
-        assert!(!answered_smaller(Some((
-            sent,
-            DisplayGeometry {
-                pixels: (3600, 2338),
-                points: (1800, 1170)
-            },
-        ))));
+        assert!(!desktop_shrank(Some((sent, sent))));
+        // Neither is a smaller picture on the same desktop: that is a lower
+        // stream quality, which is what a quality preset asks for.
+        assert!(!desktop_shrank(Some((sent, retina((1800, 1170))))));
         // Nothing to compare is not a clamp.
-        assert!(!answered_smaller(None));
+        assert!(!desktop_shrank(None));
+    }
+
+    #[test]
+    fn a_one_pixel_rounding_is_not_worth_reporting() {
+        let sent = retina((1800, 1170));
+        assert!(!answer_is_notable(sent, retina((1800, 1169))));
+        // A desktop that changed is worth saying even when the picture did not.
+        let smaller = DisplayGeometry {
+            pixels: (1800, 1169),
+            points: (900, 584),
+        };
+        assert!(answer_is_notable(sent, smaller));
+        // So is a picture that is materially different from the request.
+        assert!(answer_is_notable(sent, retina((1600, 1200))));
+    }
+
+    #[test]
+    fn a_queued_round_puts_back_the_geometry_the_session_really_has() {
+        // The first round was answered with a smaller picture than asked.
+        // A second request must not carry the first round's rollback target:
+        // the session's desktop is what the second round must be able to
+        // restore.
+        let original = retina((3600, 2338));
+        let low = retina((1800, 1170));
+        let answered = retina((1800, 1169));
+        let medium = retina((2700, 1754));
+        let mut round = ResizeRound::default();
+        plan_resize(&mut round, low, original);
+        assert_eq!(
+            plan_resize(&mut round, medium, original),
+            ResizeAction::Wait
+        );
+        round.confirmed = Some(answered);
+        round.awaiting_layout = false;
+        assert_eq!(finish_round(&mut round), RoundEnd::Send(medium));
+        assert_eq!(round.before, Some(answered));
+    }
+
+    #[test]
+    fn a_refused_round_gets_one_restoration_and_no_more() {
+        // The restore is a round, not a write: it has to be acknowledged and
+        // followed by a picture like any other, and it may not loop.
+        let mut round = ResizeRound::default();
+        let original = retina((3600, 2338));
+        let low = retina((1800, 1170));
+        plan_resize(&mut round, low, original);
+        assert_eq!(round.restores_left, 1);
+        // The answer is a smaller desktop, which is what starts a restore.
+        let fallback = DisplayGeometry {
+            pixels: (1600, 1200),
+            points: (800, 600),
+        };
+        round.confirmed = Some(fallback);
+        round.awaiting_layout = false;
+        assert!(desktop_shrank(Some((low, fallback))));
+        assert_eq!(
+            finish_round(&mut round),
+            RoundEnd::Done(Some((low, fallback)))
+        );
+        start_round(&mut round, original, fallback, true);
+        assert!(round.restoring);
+        assert_eq!(round.restores_left, 0);
+        assert!(round.in_flight && round.awaiting_layout && round.needs_picture);
+        // The restore's own answer is what ends it.
+        round.confirmed = Some(original);
+        round.awaiting_layout = false;
+        assert_eq!(finish_round(&mut round), RoundEnd::Done(None));
+        assert_eq!(round.sent, Some(original));
+    }
+
+    #[test]
+    fn a_round_waits_for_the_picture_the_re_offer_promised() {
+        // The layout is not the end of a round: the encoder restarts after
+        // it, and the new stream is proven by a picture from that encoder.
+        let mut round = ResizeRound::default();
+        plan_resize(&mut round, retina((2700, 1754)), retina((3600, 2338)));
+        assert!(round.needs_picture);
+        round.awaiting_layout = false;
+        round.confirmed = Some(retina((2700, 1754)));
+        // Still in flight: no picture has arrived since the re-offer.
+        assert!(round.in_flight);
     }
 
     #[test]
