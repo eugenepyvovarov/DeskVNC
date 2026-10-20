@@ -2,10 +2,12 @@
 
 Audit target: `6933f0d`, 2026-10-20.
 
-These probes assert desired corrected behaviour against unchanged production
-code. They are intentionally outside the normal test suite and are expected to
-fail until the findings in
-`../../plans/2026-10-20-apple-resolution-stabilization-plan.md` are fixed.
+These probes assert the behaviour the audit asked for, against the real
+production helpers. They were written RED against `6933f0d` (4 of 5 Rust and
+all 3 UI probes failed) and are GREEN after the fixes in
+`../../plans/2026-10-20-apple-resolution-stabilization-plan.md`. They stay
+outside the normal suite on purpose: they are the audit's acceptance record,
+and the same requirements also live in the crates' and the UI's own tests.
 They do not connect to a Mac, send input, change a display, modify application
 storage, restart an app, or install a binary.
 
@@ -28,39 +30,37 @@ The UI harness imports the real renderer and geometry-cache module, with a
 fake VideoDecoder and GL allocation functions. It does not run a GUI or prove
 actual decoded content.
 
-## Results at the audit target
+## Results
 
-Rust: **4 failing, 1 passing**.
+At `6933f0d`: **4 Rust failing, 1 passing; 3 UI failing**. After the fixes:
+**5 Rust passing, 3 UI passing**.
 
-- FAIL: 1800x1170 requested, 1800x1169 acknowledged, unchanged desktop points
-  triggers an unnecessary rollback.
-- FAIL: unchanged backing with smaller desktop points does not trigger the
-  pixel-only shrink check.
-- FAIL: a queued round retains the first round's rollback snapshot instead of
-  the latest accepted geometry.
-- FAIL: a 1600x1200 requested picture is serialized as 1800x1170 after ratio
-  averaging/clamping, so reported intent and actual wire mode differ.
-- PASS: the current descriptor already bounds its first requested mode even
-  when the previous desktop is smaller. A separate inspection of the parent
-  of `4a897d8` shows it also used `max(request, prior bound)`. This contradicts
-  the earlier claim that a small initial cap necessarily prevented growth.
+The failures reproduced, and now guard against:
 
-UI: **3 failing**.
+- 1800x1170 requested and 1800x1169 acknowledged, with unchanged desktop
+  points, triggering a rollback.
+- A logical desktop shrink hidden by a pixel-only comparison.
+- A queued round reusing the first round's rollback snapshot instead of the
+  geometry the session really has.
+- A 1600x1200 intent serialized as an 1800x1170 mode, so the reported request
+  and the wire disagreed.
+- A confirmed 2700x1754 layout leaving the renderer at 3600x2338.
+- An unrelated 1600x1200 picture being stretched across a Retina desktop
+  instead of being surfaced as a mismatch.
+- A reduced-stream layout with unchanged points overwriting the cached native
+  pixels.
 
-- FAIL: after layout 2700x1754 and matching decoded output, an active continuous
-  renderer still reports its old 3600x2338 framebuffer.
-- FAIL: an unrelated 1600x1200 fallback replaces the last valid Retina picture
-  and is stretched into the old framebuffer rather than being surfaced as a
-  mismatch.
-- FAIL: a reduced-stream layout with unchanged point dimensions overwrites
-  the same cache entry later used as initial/native geometry.
+The passing Rust probe is the one that establishes the descriptor already
+advertised a bound covering its first mode, which is why the earlier
+"the cap prevented growth" explanation was withdrawn.
 
 These are narrow regression reproductions, not a full protocol test. In
-particular, they do not validate which `0x451` acknowledges which request or
-prove why macOS selected a particular fallback. The implementation plan calls
-for a fake-session transaction test and an authorized live validation matrix.
+particular, they do not validate which `0x451` acknowledges which request, and
+they cannot show why a particular macOS host chose a fallback. The remaining
+work is listed in the plan: startup descriptor behaviour, presentation
+acknowledgement, transaction logging, a fake-session transaction test, and an
+authorized live matrix.
 
-The normal suites still pass at this target: 103 apple-core tests and 480 UI
-tests. Their success does not cover these seven failing cases. Migrate these
-requirements into production tests as the fixes are implemented; do not make
-them pass by asserting the current wrong behaviour.
+The normal suites pass at both targets (103 apple-core and 480 UI tests at the
+audit target; 107 and 482 after the fixes). Their earlier success did not cover
+any of the eight cases above.

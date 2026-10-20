@@ -26,7 +26,7 @@ def main() -> int:
         source.index("/// Ask for a size, or remember the ask until the running round is over.")
     ]
     descriptor = source[
-        source.index("#[derive(Clone, Copy, Debug, PartialEq)]\nstruct DisplayRequest"):
+        source.index("#[derive(Clone, Copy, Debug, PartialEq, Eq)]\nstruct DisplayRequest"):
         source.index("fn set_encodings()")
     ]
     rustc = shutil.which("rustc")
@@ -46,7 +46,7 @@ mod review {
         let sent = geometry((1800, 1170), (1800, 1169));
         let confirmed = geometry((1800, 1169), (1800, 1169));
         assert!(
-            !answered_smaller(Some((sent, confirmed))),
+            !desktop_shrank(Some((sent, confirmed))),
             "unchanged desktop points plus a one-pixel backing difference triggers rollback"
         );
     }
@@ -56,7 +56,7 @@ mod review {
         let sent = geometry((3600, 2338), (1800, 1169));
         let confirmed = geometry((3600, 2338), (900, 584));
         assert!(
-            answered_smaller(Some((sent, confirmed))),
+            desktop_shrank(Some((sent, confirmed))),
             "logical desktop shrank while pixel-only check reported no shrink"
         );
     }
@@ -81,8 +81,12 @@ mod review {
 
     #[test]
     fn descriptor_must_not_silently_serialize_a_different_pixel_request() {
-        let intent = geometry((1600, 1200), (1800, 1169));
-        let wire = display_config(request_for(intent), (3600, 2338));
+        // A 4:3 picture on a 16:10 desktop is an intent that cannot be
+        // expressed without changing the desktop, so it must be rejected
+        // before transmission. What must never happen is reporting one target
+        // and sending another.
+        let intent = DisplayRequest { points: (1800, 1169), pixels: (1600, 1200) };
+        let wire = display_config(intent, (3600, 2338));
         let mode = 12 + 0x9c;
         let actual = (
             u32::from_be_bytes(wire[mode..mode + 4].try_into().unwrap()),
@@ -96,7 +100,7 @@ mod review {
 
     #[test]
     fn advertised_bounds_already_cover_first_mode() {
-        let request = DisplayRequest { points: (1800, 1169), scale: 2.0 };
+        let request = DisplayRequest { points: (1800, 1169), pixels: (3600, 2338) };
         let wire = display_config(request, (1600, 1200));
         let d = 12;
         let mode = d + 0x9c;

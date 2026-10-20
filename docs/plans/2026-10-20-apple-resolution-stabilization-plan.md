@@ -1,11 +1,47 @@
 # Apple resolution instability: evidence and exact repair plan
 
-Date: 2026-10-20. Inspected HEAD: `6933f0d`.
-Status: proposed implementation plan, not an implemented fix.
+Date: 2026-10-20. Audit target: `6933f0d`.
 
-This audit changed documentation and isolated regression probes only. It did
-not change production code, the installed AppImage, the running application,
-application storage, or any Mac. No new live connection or input was sent.
+Status: the client-side defects below are fixed on
+`feature/apple-screen-sharing-driver`, and the eight probes that reproduced
+them now pass. Nothing has been verified against a live Mac yet, and no PR has
+been pushed.
+
+## What this round changed
+
+Fixed, with tests:
+
+| Finding | State | Where |
+|---|---|---|
+| R1 one-pixel answer treated as a shrink | fixed: a shrink is a loss of points, not of pixels | `desktop_shrank`, `answer_is_notable` |
+| R2 restoration was a bare write | fixed: a restore is a full round with one attempt, reported only after the layout confirms it | `start_round`, `ResizeRound::restoring` |
+| R2 queued round kept a stale rollback target | fixed: the next round snapshots the geometry this one confirmed | `finish_round` |
+| R3 any layout/picture counted as completion | fixed in part: the round requires a picture assembled after its re-offer, and recovery cannot re-offer during a round | `round.needs_picture`, revive guard |
+| R4 renderer dropped a new layout and stretched into the old one | fixed: the layout is held and committed with the picture that answers it; a differently shaped picture is surfaced, not stretched | `WebGLRenderer.pendingLayout` |
+| R5 a reduced stream overwrote the remembered panel | fixed: equal points with fewer pixels no longer replaces the entry | `writeAppleGeometry` |
+| R6 wire request could differ from the reported intent | fixed: the descriptor carries the request's pixels exactly, no ratio round trip | `DisplayRequest`, `display_config` |
+
+Not done in this round, and still required before normal use:
+
+- Step 1's startup descriptor change. The first `0x1d` still asks for the
+  remembered geometry, because that is the message that attaches the session
+  to the console display. A person who changed the Mac's resolution since the
+  last session will still have it put back. Deciding between a non-dynamic
+  descriptor and a dynamic one that echoes the current mode needs a live test.
+- Step 2's full separation of observation and preference (one versioned cache,
+  connection epochs, per-display keys).
+- Step 3's rejection of a request that cannot keep the desktop (for example a
+  4:3 picture on a 16:10 desktop). It is now sent exactly and reported, not
+  silently rewritten.
+- Step 7's presentation acknowledgement back to the driver. Completion still
+  rests on an assembled access unit, not on the renderer confirming what it
+  presented.
+- Step 8's transaction logging, Step 9's fake-session transaction test, and
+  Step 10's live matrix.
+
+This round changed production code, tests, and these documents. It did not
+install a binary, restart the application, change application storage, or
+connect to a Mac.
 
 ## 1. What needs to hold
 
