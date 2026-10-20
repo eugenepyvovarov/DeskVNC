@@ -308,6 +308,10 @@ const ALWAYS_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 /// A quiet video stream needs recovery even when no later packet arrives to
 /// report a sequence gap.
 const SILENT_STREAM_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long a promised picture may be missing before the media session is
+/// offered again. A request over UDP asks a media session that may no longer
+/// exist; a re-offer over the control connection rebuilds it.
+const REVIVE_AFTER: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy)]
 enum VideoRequest {
@@ -533,6 +537,10 @@ struct MediaCounters {
     /// spacing is a steady picture; a link that queues and bursts shows up
     /// here before it shows up anywhere else.
     jitter_ms: std::sync::atomic::AtomicU32,
+    /// When the last picture came out, in milliseconds since the session
+    /// began. The control loop reads it to decide whether the stream has
+    /// stopped for good.
+    last_picture_ms: std::sync::atomic::AtomicU64,
 }
 
 /// Timing between pictures, as the receiver sees it.
@@ -1133,6 +1141,9 @@ async fn connect(
     let mut last_stats_at = Instant::now();
     let mut last_stats_bytes = 0u64;
     let mut last_stats_pictures = 0u64;
+    // When the media session was last offered again because the stream had
+    // stopped.
+    let mut last_revive = Instant::now() - REVIVE_AFTER;
     // The counters the video receiver keeps.
     let counters = std::sync::Arc::new(MediaCounters::default());
     let video_counters = counters.clone();
@@ -1187,6 +1198,14 @@ async fn connect(
         }
     });
     let peer = Peer::resolve(host, ports.0).await;
+    // When the Mac started owing us a picture, in milliseconds since the
+    // session began. Input, or a request for a fresh picture, is a promise
+    // that the screen will change; if no picture follows, the stream is
+    // stuck rather than idle, and asking again is the recovery.
+    let session_start = Instant::now();
+    let picture_owed = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let video_owed = picture_owed.clone();
+    let video_start = session_start;
     let video_task = tokio::spawn(async move {
         if let (Some(sock), Some(ctx)) = (udp, srtp) {
             let mut buf = vec![0u8; 65535];
@@ -1221,6 +1240,9 @@ async fn connect(
             // When the last video packet arrived, whatever it contained. A
             // still desktop sends nothing at all, and that is not a stall.
             let mut last_packet_at: Option<Instant> = None;
+            // When a picture last came out, on the same clock as the marks
+            // below, so "the Mac owes us one" can be decided here.
+            let mut last_picture_ms = 0u64;
             // Packets from somewhere other than the Mac.
             let mut stray = 0u64;
             // The round trip to the Mac, measured on the RTCP path.
@@ -1288,12 +1310,27 @@ async fn connect(
                         let packets_arriving = last_packet_at
                             .map(|at| now.duration_since(at) < Duration::from_secs(1))
                             .unwrap_or(false);
-                        if should_ask_for_stalled_picture(
-                            packets_arriving,
-                            streams.active_picture_stalled(now, SILENT_STREAM_TIMEOUT),
-                            last_silence_request.elapsed(),
-                        ) {
+                        // Two ways a stream can stall. Mid-assembly, packets
+                        // keep arriving and never complete a picture. Owed, a
+                        // picture was promised by input or by an earlier
+                        // request and simply did not come, which is the case
+                        // that leaves a session frozen for minutes.
+                        let now_ms = video_start.elapsed().as_millis() as u64;
+                        let owed_at = video_owed.load(std::sync::atomic::Ordering::Relaxed);
+                        let owed_long_enough = owed_at != 0
+                            && now_ms.saturating_sub(owed_at) >= SILENT_STREAM_TIMEOUT.as_millis() as u64
+                            && now_ms.saturating_sub(last_picture_ms) >= SILENT_STREAM_TIMEOUT.as_millis() as u64;
+                        if owed_long_enough
+                            || should_ask_for_stalled_picture(
+                                packets_arriving,
+                                streams.active_picture_stalled(now, SILENT_STREAM_TIMEOUT),
+                                last_silence_request.elapsed(),
+                            )
+                        {
                             last_silence_request = now;
+                            // Asking again two seconds later if this one is
+                            // not answered either.
+                            video_owed.store(now_ms, std::sync::atomic::Ordering::Relaxed);
                             video_counters
                                 .stalls
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1439,6 +1476,10 @@ async fn connect(
                     .await;
                 }
                 if !units.is_empty() {
+                    last_picture_ms = video_start.elapsed().as_millis() as u64;
+                    video_counters
+                        .last_picture_ms
+                        .store(last_picture_ms, std::sync::atomic::Ordering::Relaxed);
                     // The spacing between pictures is what a person feels as
                     // smoothness, so it is measured where the pictures land.
                     let jitter = cadence.picture(Instant::now());
@@ -1560,6 +1601,13 @@ async fn connect(
                         let body = crate::input::pointer(session.layer.wrap_key(), x, y, button_mask);
                         session.send_body(&body).await?;
                         held.pointer = Some((x, y, button_mask));
+                        // Input is a promise that the screen will change. If
+                        // no picture follows, the stream is stuck rather than
+                        // idle, and the recovery paths can tell the two apart.
+                        picture_owed.store(
+                            session_start.elapsed().as_millis() as u64,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
                     }
                     Some(ClientCommand::Key { keysym, down, .. }) => {
                         if view_only {
@@ -1575,6 +1623,10 @@ async fn connect(
                         } else {
                             held.keys.remove(&keysym);
                         }
+                        picture_owed.store(
+                            session_start.elapsed().as_millis() as u64,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
                     }
                     Some(ClientCommand::ReconnectNow) => {
                         // End the session so a new one can start. The
@@ -1629,6 +1681,10 @@ async fn connect(
                         // The Apple picture is an H.264 stream over UDP. A
                         // framebuffer request over TCP does not ask that
                         // encoder for a clean independent picture.
+                        picture_owed.store(
+                            session_start.elapsed().as_millis() as u64,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
                         let _ = video_request_tx.send(VideoRequest::FreshPicture);
                     }
                     Some(ClientCommand::SetQuality(preset)) => {
@@ -1899,6 +1955,47 @@ async fn connect(
                 if last_media_report.elapsed() >= Duration::from_secs(1) {
                     last_media_report = Instant::now();
                     emit(events, SessionEvent::Protocol(remote_core::ProtocolEvent::AppleMedia(media_state))).await.ok();
+                }
+                // A stream that has genuinely stopped needs more than
+                // another UDP request: that asks a media session which may
+                // no longer exist. Escalate, and say what is happening
+                // rather than leaving a frozen pane that claims to be
+                // connected.
+                //
+                // A quiet desktop is not this case: the Mac owes a picture
+                // only when input was sent or one was asked for, and that is
+                // recorded where the input is handled.
+                let now_ms = session_start.elapsed().as_millis() as u64;
+                let owed = picture_owed.load(std::sync::atomic::Ordering::Relaxed);
+                let silent_ms = now_ms.saturating_sub(
+                    counters.last_picture_ms.load(std::sync::atomic::Ordering::Relaxed),
+                );
+                if owed != 0
+                    && silent_ms >= REVIVE_AFTER.as_millis() as u64
+                    && last_revive.elapsed() >= REVIVE_AFTER
+                {
+                    {
+                        last_revive = Instant::now();
+                        tracing::warn!(
+                            silent_ms,
+                            "the Mac has sent no picture for a while; re-offering the media session"
+                        );
+                        // The keys are reused, which the protocol allows for
+                        // a re-offer, and the new generation resets the
+                        // replay window so the restarted encoder's numbering
+                        // is not mistaken for replays.
+                        session.send_body(&offer).await?;
+                        generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        session
+                            .send_body(&framebuffer_request(session.width, session.height))
+                            .await?;
+                        counters
+                            .recoveries
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        emit(events, SessionEvent::Protocol(remote_core::ProtocolEvent::AppleNotice(
+                            "The Mac stopped sending pictures; its media session was offered again.".into(),
+                        ))).await.ok();
+                    }
                 }
                 // A video receiver that died leaves a session that reports
                 // itself connected and shows nothing. The supervisor

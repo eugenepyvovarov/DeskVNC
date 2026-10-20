@@ -47,7 +47,7 @@ export interface Sample {
 }
 
 /** How many seconds of history the trend line keeps. */
-export const HISTORY_SECONDS = 60;
+export const HISTORY_SECONDS = 600;
 
 /** A bounded history of samples, newest last. */
 export class History {
@@ -256,6 +256,8 @@ export interface ReportInput {
   queue: { depth?: number; bytes?: number; dropped?: number } | null;
   findings: Finding[];
   history: readonly Sample[];
+  /** What changed during the session, oldest first. */
+  events?: readonly { at: number; text: string }[];
 }
 
 function mbps(bits: number): string {
@@ -321,17 +323,26 @@ export function report(input: ReportInput): string {
   push();
   push("Findings");
   for (const finding of input.findings) push(`  [${finding.severity}] ${finding.title}`);
+  if (input.events && input.events.length > 0) {
+    push();
+    push("Timeline (seconds into the session)");
+    for (const event of input.events.slice(-60)) {
+      push(`  ${Math.round(event.at / 1000)}s  ${event.text}`);
+    }
+  }
   if (input.history.length > 0) {
     push();
-    push("Last samples (seconds ago, Mbit/s, pictures/s, loss %, jitter ms, queued)");
-    const recent = input.history.slice(-30);
+    push("Samples (seconds into the session, Mbit/s, pictures/s, loss %, jitter ms, queued)");
+    // Every second that was recorded, not a sample of a sample: a freeze is
+    // a run of identical rows, and hiding most of them hides the freeze.
+    const recent = input.history.slice(-120);
     for (const sample of recent) {
       push(
-        `  -${Math.round(input.history[input.history.length - 1].at - sample.at)}s ` +
-          `${(sample.throughput / 1e6).toFixed(2)} ` +
-          `${sample.fps.toFixed(1)} ` +
-          `${(sample.loss * 100).toFixed(2)} ` +
-          `${Math.round(sample.jitter)} ` +
+        `  ${Math.round(sample.at / 1000).toString().padStart(5)} ` +
+          `${(sample.throughput / 1e6).toFixed(2).padStart(6)} ` +
+          `${sample.fps.toFixed(1).padStart(5)} ` +
+          `${(sample.loss * 100).toFixed(2).padStart(6)} ` +
+          `${Math.round(sample.jitter).toString().padStart(5)} ` +
           `${sample.queued}`,
       );
     }

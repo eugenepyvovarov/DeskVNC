@@ -147,7 +147,18 @@ interface H264Context {
   acceleration: VideoDecoderConfig["hardwareAcceleration"];
   /** Whether this decoder has produced a picture yet. */
   outputSeen: boolean;
+  /**
+   * The pictures are a different size from the framebuffer, so they are
+   * scaled into it rather than cropping to its top-left corner.
+   */
+  stretch: boolean;
 }
+
+/**
+ * How far a decoded picture may differ from the framebuffer before it is
+ * treated as a different size rather than encoder padding.
+ */
+const H264_SIZE_TOLERANCE = 32;
 
 /** Maximum simultaneous decoder contexts, mirrors the backend's cap. */
 const H264_MAX_CONTEXTS = 64;
@@ -1387,6 +1398,7 @@ export class WebGLRenderer {
       submitted: new Map(),
       acceleration: this.h264Acceleration,
       outputSeen: false,
+      stretch: false,
     };
     try {
       ctx.decoder = new VideoDecoder({
@@ -1424,12 +1436,32 @@ export class WebGLRenderer {
             // deadlocks that pipeline until each waiter expires.
             const w = frame.displayWidth || frame.codedWidth;
             const h = frame.displayHeight || frame.codedHeight;
-            ctx.w = w;
-            ctx.h = h;
-            // A replacement context may already carry the new rectangle
-            // size while the texture still has the previous size. Compare
-            // against the framebuffer, not against that context rectangle.
-            this.setRemoteSize(w, h, true);
+            // The Mac's own layout is authoritative for the desktop's size,
+            // and its encoder does not always follow it: a stream asked for
+            // 3600x2338 arrived at 1800x1168, and adopting that would have
+            // changed the desktop's size in the middle of a session, which
+            // reads as the view suddenly zooming.
+            //
+            // So a picture that disagrees with a known layout is scaled into
+            // that layout instead of redefining it. The tolerance is wider
+            // than the macroblock padding an encoder adds.
+            const layoutKnown = this.fbWidth > 0 && this.fbHeight > 0;
+            const disagrees = layoutKnown
+              && (Math.abs(w - this.fbWidth) > H264_SIZE_TOLERANCE
+                || Math.abs(h - this.fbHeight) > H264_SIZE_TOLERANCE);
+            if (disagrees) {
+              ctx.stretch = true;
+              ctx.w = this.fbWidth;
+              ctx.h = this.fbHeight;
+            } else {
+              ctx.stretch = false;
+              ctx.w = w;
+              ctx.h = h;
+              // A replacement context may already carry the new rectangle
+              // size while the texture still has the previous size. Compare
+              // against the framebuffer, not against that context rectangle.
+              this.setRemoteSize(w, h, true);
+            }
             // Decode all reference pictures, but present only the freshest
             // output at the next paint. Never turn a burst into a display FIFO.
             this.latestVideo?.frame.close();
@@ -1518,6 +1550,17 @@ export class WebGLRenderer {
     const gl = this.gl;
     const frameW = frame.displayWidth || frame.codedWidth;
     const frameH = frame.displayHeight || frame.codedHeight;
+    if (ctx.stretch) {
+      // Scaled into the layout the Mac confirmed, edges included. The
+      // canvas path takes the source size from the frame itself, so a
+      // mismatch in either direction still lands in the right place.
+      try {
+        this.uploadVideoFrameViaCanvas(frame, ctx, ctx.w, ctx.h);
+      } finally {
+        frame.close();
+      }
+      return;
+    }
     const w = Math.min(frameW, ctx.w);
     const h = Math.min(frameH, ctx.h);
     let cropped: VideoFrame | null = null;

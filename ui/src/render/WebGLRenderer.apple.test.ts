@@ -82,7 +82,10 @@ it("does not let a previous H.264 rectangle override a normal framebuffer resize
   expect(renderer.getRemoteSize()).toEqual({ width: 1920, height: 1080 });
 });
 
-it("adopts decoded dimensions even when they already match the new context rectangle", () => {
+it("scales a picture that disagrees with the confirmed layout instead of resizing it", () => {
+  // The Mac's encoder does not always follow the layout it reports: a stream
+  // asked for 3600x2338 arrived at 1800x1168. Adopting that changed the
+  // desktop's size mid session, which reads as the view zooming.
   let output: (frame: unknown) => void = () => {};
   vi.stubGlobal("VideoDecoder", class {
     state = "configured";
@@ -91,41 +94,41 @@ it("adopts decoded dimensions even when they already match the new context recta
     close() { this.state = "closed"; }
   });
   const renderer = sizedDecoderHarness();
-  for (const [w, h] of [[1800, 1170], [2700, 1754], [3600, 2338]]) {
-    renderer.closeAllH264();
-    renderer.createH264({ x: 0, y: 0, w, h }, 0, new Uint8Array());
-    const frame = { displayWidth: w, displayHeight: h, timestamp: 1, close: vi.fn() };
-    output(frame);
-    expect(renderer.getRemoteSize()).toEqual({ width: w, height: h });
-    expect(renderer.latestVideo.frame).toBe(frame);
-  }
-});
-
-it("uploads the whole decoded picture after both clamped and enlarged size transitions", () => {
-  let output: (frame: unknown) => void = () => {};
-  vi.stubGlobal("VideoDecoder", class {
-    state = "configured";
-    constructor(callbacks: { output: typeof output }) { output = callbacks.output; }
-    configure() {}
-    close() { this.state = "closed"; }
-  });
-  const renderer = sizedDecoderHarness();
-  renderer.createH264({ x: 0, y: 0, w: 2700, h: 1754 }, 0, new Uint8Array());
-  for (const [w, h] of [[1800, 1170], [2700, 1754], [3600, 2338]]) {
-    const frame = { displayWidth: w, displayHeight: h, close: vi.fn() };
-    output(frame);
-    const pending = renderer.latestVideo;
+  const ctx = renderer.createH264({ x: 0, y: 0, w: 3600, h: 2338 }, 0, new Uint8Array());
+  for (const [w, h] of [[1800, 1168], [2700, 1754]]) {
+    output({ displayWidth: w, displayHeight: h, timestamp: 1, close: vi.fn() });
+    const pending = renderer.latestVideo!;
     renderer.latestVideo = null;
-    expect(pending.ctx.w).toBe(w);
-    expect(pending.ctx.h).toBe(h);
-    expect(renderer.getRemoteSize()).toEqual({ width: w, height: h });
-    renderer.uploadVideoFrame(pending.frame, pending.ctx);
-    expect(renderer.gl.texSubImage2D).toHaveBeenLastCalledWith(1, 0, 0, 0, 3, 4, frame);
-    expect(frame.close).toHaveBeenCalledOnce();
+    expect(pending.ctx.stretch).toBe(true);
+    expect(pending.ctx.w).toBe(3600);
+    expect(pending.ctx.h).toBe(2338);
+    expect(renderer.getRemoteSize()).toEqual({ width: 3600, height: 2338 });
   }
+  // A picture that matches the layout is uploaded at its own size.
+  output({ displayWidth: 3600, displayHeight: 2338, timestamp: 2, close: vi.fn() });
+  const pending = renderer.latestVideo!;
+  expect(pending.ctx.stretch).toBe(false);
+  expect(renderer.getRemoteSize()).toEqual({ width: 3600, height: 2338 });
+  expect(renderer.h264.get(0)).toBe(ctx);
 });
 
-it("keeps the last continuous picture until replacement output, not the layout, arrives", () => {
+it("lets the first picture define the size when no layout is known yet", () => {
+  let output: (frame: unknown) => void = () => {};
+  vi.stubGlobal("VideoDecoder", class {
+    state = "configured";
+    constructor(callbacks: { output: typeof output }) { output = callbacks.output; }
+    configure() {}
+    close() { this.state = "closed"; }
+  });
+  const renderer = sizedDecoderHarness({ fbWidth: 0, fbHeight: 0 });
+  renderer.createH264({ x: 0, y: 0, w: 0, h: 0 }, 0, new Uint8Array());
+  const frame = { displayWidth: 1800, displayHeight: 1168, timestamp: 1, close: vi.fn() };
+  output(frame);
+  expect(renderer.latestVideo?.ctx.stretch).toBe(false);
+  expect(renderer.getRemoteSize()).toEqual({ width: 1800, height: 1168 });
+});
+
+it("keeps the layout a continuous stream confirmed when the picture differs", () => {
   let output: (frame: unknown) => void = () => {};
   vi.stubGlobal("VideoDecoder", class {
     state = "configured";
@@ -140,7 +143,8 @@ it("keeps the last continuous picture until replacement output, not the layout, 
   expect(renderer.h264.get(0)).toBe(ctx);
   expect(renderer.gl.texImage2D).not.toHaveBeenCalled();
   output({ displayWidth: 2700, displayHeight: 1754, close: vi.fn() });
-  expect(renderer.getRemoteSize()).toEqual({ width: 2700, height: 1754 });
+  expect(renderer.getRemoteSize()).toEqual({ width: 3600, height: 2338 });
+  expect(renderer.latestVideo?.ctx.stretch).toBe(true);
   expect(renderer.h264.get(0)).toBe(ctx);
 });
 

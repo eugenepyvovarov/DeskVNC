@@ -121,6 +121,7 @@ export function ConnectionDiagnostics(props: ConnectionDiagnosticsProps): ReactN
       queue: props.queue ?? null,
       findings: diagnostics.findings,
       history: diagnostics.history,
+      events: diagnostics.events,
     });
     // Through the shell, not `navigator.clipboard`: WebKit only honours the
     // DOM API while a user gesture is still active, and the copy is the last

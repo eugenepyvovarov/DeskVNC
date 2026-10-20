@@ -134,12 +134,13 @@ describe("report", () => {
       queue: { depth: 0, bytes: 0, dropped: 0 },
       findings: findings(sample()),
       history: [sample({ at: 0 }), sample({ at: 1000 })],
+      events: [{ at: 1000, text: "the stream stalled (1)" }],
     });
     expect(text).toContain("Protocol: apple");
     expect(text).toContain("3600x2338");
     expect(text).toContain("4.00%");
     expect(text).toContain("not measured");
-    expect(text).toContain("Last samples");
+    expect(text).toContain("Samples (seconds into the session");
   });
 
   it("says plainly when nothing has been measured yet", () => {
@@ -156,6 +157,6 @@ describe("report", () => {
       history: [],
     });
     expect(text).toContain("no transport statistics yet");
-    expect(text).not.toContain("Last samples");
+    expect(text).not.toContain("Samples (seconds");
   });
 });
