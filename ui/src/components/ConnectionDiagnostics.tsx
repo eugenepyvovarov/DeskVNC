@@ -68,6 +68,7 @@ export interface ConnectionDiagnosticsProps {
   queue: { depth?: number; bytes?: number; dropped?: number } | null;
   requested?: { w: number; h: number } | null;
   layout?: { w: number; h: number } | null;
+  desktopPoints?: { w: number; h: number } | null;
   decoded?: { w: number; h: number } | null;
   /**
    * Where the log file is and which build wrote it. Fetched here rather than
@@ -112,6 +113,7 @@ export function ConnectionDiagnostics(props: ConnectionDiagnosticsProps): ReactN
       connectedFor: diagnostics.seconds,
       requested: props.requested,
       layout: props.layout,
+      desktopPoints: props.desktopPoints,
       decoded: props.decoded,
       media: props.media,
       stats: props.stats ?? null,

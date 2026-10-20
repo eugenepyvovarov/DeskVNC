@@ -82,6 +82,20 @@ fn should_ask_for_backlog_picture(chain_broken: bool, since_last: Duration) -> b
     chain_broken && since_last >= BACKLOG_REQUEST_INTERVAL
 }
 
+/// Whether a stream that has stopped producing pictures needs a fresh one.
+///
+/// Only while packets are still arriving. This stream is damage driven: an
+/// idle desktop sends nothing at all, and treating that as a stall asked the
+/// Mac for a full picture every two seconds for a screen that had not
+/// changed.
+fn should_ask_for_stalled_picture(
+    packets_arriving: bool,
+    picture_stalled: bool,
+    since_last_request: Duration,
+) -> bool {
+    packets_arriving && picture_stalled && since_last_request >= SILENT_STREAM_TIMEOUT
+}
+
 /// How long a resize round may take before the session gives up on it and
 /// says so.
 const RESIZE_TIMEOUT: Duration = Duration::from_secs(8);
@@ -337,6 +351,12 @@ struct ResizeRound {
     /// arrived yet. A picture from the old encoder says nothing about the
     /// new size, so the round waits for the layout first.
     awaiting_layout: bool,
+    /// The geometry the session had before this round asked for anything.
+    ///
+    /// A Mac that cannot do what was asked answers with something smaller,
+    /// and accepting that shrinks the person's desktop. When that happens
+    /// the round puts this geometry back.
+    before: Option<DisplayGeometry>,
 }
 
 /// What asking for a size means.
@@ -368,6 +388,7 @@ fn plan_resize(
         round.requested = None;
         return ResizeAction::Nothing;
     }
+    round.before = Some(current);
     round.sent = Some(target);
     round.confirmed = None;
     round.sent_at = Some(Instant::now());
@@ -508,22 +529,33 @@ struct MediaCounters {
 #[derive(Default)]
 struct PictureCadence {
     last: Option<Instant>,
+    /// The previous interval, so a change can be measured against it.
+    last_interval: Option<f32>,
     /// Mean absolute change of the interval, in milliseconds.
     jitter_ms: f32,
 }
 
 impl PictureCadence {
     /// Record one picture and return the jitter in whole milliseconds.
+    ///
+    /// Jitter is how much the spacing CHANGES, not how long it is: a steady
+    /// stream at four pictures a second has a 250 ms spacing and no jitter,
+    /// and reporting the spacing as jitter made an idle desktop look like a
+    /// broken link.
     fn picture(&mut self, now: Instant) -> u32 {
         let Some(last) = self.last.replace(now) else {
             return 0;
         };
         let interval = now.duration_since(last).as_secs_f32() * 1000.0;
-        if self.jitter_ms == 0.0 {
-            self.jitter_ms = interval;
+        let Some(previous) = self.last_interval.replace(interval) else {
+            return 0;
+        };
+        let change = (interval - previous).abs();
+        self.jitter_ms = if self.jitter_ms == 0.0 {
+            change
         } else {
-            self.jitter_ms = self.jitter_ms * 0.9 + interval * 0.1;
-        }
+            self.jitter_ms * 0.9 + change * 0.1
+        };
         self.jitter_ms.round().min(60_000.0) as u32
     }
 }
@@ -1176,6 +1208,9 @@ async fn connect(
             let mut always_refresh = false;
             let mut last_always_refresh = Instant::now() - ALWAYS_REFRESH_INTERVAL;
             let mut last_silence_request = Instant::now() - SILENT_STREAM_TIMEOUT;
+            // When the last video packet arrived, whatever it contained. A
+            // still desktop sends nothing at all, and that is not a stall.
+            let mut last_packet_at: Option<Instant> = None;
             // Packets from somewhere other than the Mac.
             let mut stray = 0u64;
             // The round trip to the Mac, measured on the RTCP path.
@@ -1229,14 +1264,25 @@ async fn connect(
                                 }
                             }
                         }
-                        // A silent stream is also recoverable: unlike a
-                        // sequence gap, it may never send another packet to
-                        // trigger the loss path. Ask for an independent
-                        // picture after two seconds without a complete one.
+                        // A stream that is still arriving but cannot
+                        // complete a picture is stuck mid-assembly, and only
+                        // a fresh picture clears it: no later packet reports
+                        // the gap that is holding it.
+                        //
+                        // Packets that have stopped entirely are a different
+                        // case, and not a fault: this stream is damage
+                        // driven, so an idle desktop sends nothing. Asking
+                        // for a picture then costs the Mac a full frame every
+                        // two seconds for a screen that has not changed.
                         let now = Instant::now();
-                        if streams.active_picture_stalled(now, SILENT_STREAM_TIMEOUT)
-                            && last_silence_request.elapsed() >= SILENT_STREAM_TIMEOUT
-                        {
+                        let packets_arriving = last_packet_at
+                            .map(|at| now.duration_since(at) < Duration::from_secs(1))
+                            .unwrap_or(false);
+                        if should_ask_for_stalled_picture(
+                            packets_arriving,
+                            streams.active_picture_stalled(now, SILENT_STREAM_TIMEOUT),
+                            last_silence_request.elapsed(),
+                        ) {
                             last_silence_request = now;
                             video_counters
                                 .stalls
@@ -1341,6 +1387,7 @@ async fn connect(
                         if packets <= 3 {
                             tracing::debug!(bytes = n, "Apple video datagram");
                         }
+                        last_packet_at = Some(Instant::now());
                         let units = streams.push(&buf[..n], generation, Instant::now());
                         let authenticated = streams.authenticated();
                         if opened == 0 && authenticated > 0 {
@@ -1783,7 +1830,7 @@ async fn connect(
                         round.confirmed = Some(DisplayGeometry { pixels: (bw, bh), points: (lw, lh) });
                         round.needs_picture = changed;
                         round.awaiting_layout = false;
-                        tracing::info!(bw, bh, "Apple display layout received; media re-offered");
+                        tracing::info!(bw, bh, lw, lh, "Apple display layout received; media re-offered");
                     }
                     // Start a deferred preset only AFTER processing this
                     // unsolicited baseline layout. It cannot acknowledge a
@@ -1813,17 +1860,23 @@ async fn connect(
                 // Reporting an RTCP arrival delay as RTT would be a guess.
                 let pictures = counters.pictures.load(std::sync::atomic::Ordering::Relaxed);
                 let bytes = counters.bytes.load(std::sync::atomic::Ordering::Relaxed);
-                let elapsed = last_stats_at.elapsed().as_secs_f64().max(0.001);
-                let stats = remote_core::SessionStats {
-                    throughput_bps: (bytes.saturating_sub(last_stats_bytes)) as f64 * 8.0 / elapsed,
-                    fps: (pictures.saturating_sub(last_stats_pictures)) as f32 / elapsed as f32,
-                    bytes_received: bytes,
-                    ..Default::default()
-                };
-                last_stats_at = Instant::now();
-                last_stats_bytes = bytes;
-                last_stats_pictures = pictures;
-                emit(events, SessionEvent::Stats(stats)).await.ok();
+                // Rates are measured over a whole second. The control loop
+                // ticks four times a second, and a window that short reads
+                // zero whenever that particular quarter second was quiet,
+                // which is most of them on a desktop that is not moving.
+                let elapsed = last_stats_at.elapsed().as_secs_f64();
+                if elapsed >= 1.0 {
+                    let stats = remote_core::SessionStats {
+                        throughput_bps: (bytes.saturating_sub(last_stats_bytes)) as f64 * 8.0 / elapsed,
+                        fps: (pictures.saturating_sub(last_stats_pictures)) as f32 / elapsed as f32,
+                        bytes_received: bytes,
+                        ..Default::default()
+                    };
+                    last_stats_at = Instant::now();
+                    last_stats_bytes = bytes;
+                    last_stats_pictures = pictures;
+                    emit(events, SessionEvent::Stats(stats)).await.ok();
+                }
                 media_state.pictures = pictures;
                 media_state.lost = counters.lost.load(std::sync::atomic::Ordering::Relaxed);
                 media_state.dropped = counters.dropped.load(std::sync::atomic::Ordering::Relaxed);
@@ -1861,15 +1914,44 @@ async fn connect(
                             }
                             RoundEnd::Done(clamped) => {
                                 tracing::info!("Apple resize round complete");
-                                // The server may choose a different size when
-                                // the request is more than it can do. Say so
-                                // rather than leaving the user to guess.
+                                // The Mac answers what it can do, which may be
+                                // smaller than what was asked. Accepting that
+                                // would shrink the person's desktop, and a
+                                // desktop that got smaller looks like the
+                                // viewer has zoomed in: every window is
+                                // bigger for the same screen.
+                                //
+                                // So a smaller answer is undone. The picture
+                                // goes back to the size it had, and the
+                                // person is told that the request was more
+                                // than this Mac would stream.
+                                let shrunk = clamped.is_some_and(|(sent, confirmed)| {
+                                    confirmed.pixels.0 < sent.pixels.0
+                                        || confirmed.pixels.1 < sent.pixels.1
+                                });
+                                if shrunk {
+                                    if let Some(before) = round.before {
+                                        let (mw, mh) = baseline.unwrap_or(before.pixels);
+                                        session.send_body(&display_config(
+                                            before.pixels.0, before.pixels.1,
+                                            before.points.0, before.points.1,
+                                            mw, mh,
+                                        )).await?;
+                                        tracing::info!(?before, "Apple answered smaller than asked; desktop restored");
+                                    }
+                                }
                                 if let Some((sent, confirmed)) = clamped {
+                                    let tail = if shrunk {
+                                        " The desktop was put back to its previous size."
+                                    } else {
+                                        ""
+                                    };
                                     emit(events, SessionEvent::Protocol(remote_core::ProtocolEvent::AppleNotice(
                                         format!(
-                                            "The Mac reported {}x{} pixels / {}x{} points; requested {}x{} pixels / {}x{} points. This is a layout acknowledgement, not decoded output.",
+                                            "The Mac reported {}x{} pixels / {}x{} points; requested {}x{} pixels / {}x{} points. This is a layout acknowledgement, not decoded output.{}",
                                             confirmed.pixels.0, confirmed.pixels.1, confirmed.points.0, confirmed.points.1,
                                             sent.pixels.0, sent.pixels.1, sent.points.0, sent.points.1,
+                                            tail,
                                         ),
                                     ))).await.ok();
                                 }
@@ -2653,6 +2735,25 @@ mod tests {
         let records = first_records(None);
         assert_eq!(records.len(), 1);
         assert_eq!(records[0][0], 0x02);
+    }
+
+    #[test]
+    fn an_idle_desktop_is_not_a_stall() {
+        // This stream is damage driven: a screen that has not changed sends
+        // nothing. Asking for a fresh picture then costs the Mac a full
+        // frame every two seconds for nothing.
+        let long_ago = Duration::from_secs(30);
+        assert!(!should_ask_for_stalled_picture(false, true, long_ago));
+        // Packets arriving but no picture completing is a real stall.
+        assert!(should_ask_for_stalled_picture(true, true, long_ago));
+        // A stream that is completing pictures is not stalled.
+        assert!(!should_ask_for_stalled_picture(true, false, long_ago));
+        // And a request that has just gone out is not repeated.
+        assert!(!should_ask_for_stalled_picture(
+            true,
+            true,
+            Duration::from_millis(200)
+        ));
     }
 
     #[test]

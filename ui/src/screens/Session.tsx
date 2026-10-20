@@ -2109,6 +2109,11 @@ function SessionView({
                   ? { w: session.appleMedia.layoutWidth, h: session.appleMedia.layoutHeight }
                   : remoteSize
               }
+              desktopPoints={
+                session.appleMedia && session.appleMedia.desktopWidth > 0
+                  ? { w: session.appleMedia.desktopWidth, h: session.appleMedia.desktopHeight }
+                  : null
+              }
               decoded={
                 mediaStats && mediaStats.pictureWidth > 0
                   ? { w: mediaStats.pictureWidth, h: mediaStats.pictureHeight }

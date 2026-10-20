@@ -243,6 +243,8 @@ export interface ReportInput {
   connectedFor: number;
   requested?: { w: number; h: number } | null;
   layout?: { w: number; h: number } | null;
+  /** The desktop size in points, which is what a person sees as "zoomed". */
+  desktopPoints?: { w: number; h: number } | null;
   decoded?: { w: number; h: number } | null;
   media: AppleMediaState | null;
   stats: { throughput_bps?: number; fps?: number; rtt_ms?: number; rtt_source?: string } | null;
@@ -280,6 +282,7 @@ export function report(input: ReportInput): string {
   push("Geometry");
   push(`  requested: ${input.requested ? `${input.requested.w}x${input.requested.h}` : "none"}`);
   push(`  layout:    ${input.layout ? `${input.layout.w}x${input.layout.h}` : "none"}`);
+  push(`  desktop:   ${input.desktopPoints ? `${input.desktopPoints.w}x${input.desktopPoints.h} points` : "unknown"}`);
   push(`  decoded:   ${input.decoded ? `${input.decoded.w}x${input.decoded.h}` : "none"}`);
   push();
   push("Stream");
