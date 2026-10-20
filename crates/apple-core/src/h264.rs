@@ -488,6 +488,15 @@ impl Depacketizer {
             return None;
         }
         self.fu.extend_from_slice(&payload[2..]);
+        if self.fu.len() + self.pending_bytes > MAX_ACCESS_UNIT_BYTES {
+            // The fragment is already past the largest access unit this
+            // receiver will assemble. Waiting for its end packet to notice
+            // bounds memory by the sender's patience instead of by this
+            // limit, and the picture is unusable either way.
+            self.stats.malformed += 1;
+            self.damage_picture();
+            return None;
+        }
         if end {
             self.fu_open = false;
             Some(std::mem::take(&mut self.fu))
@@ -712,6 +721,32 @@ mod tests {
             "a picture with an inter slice needs its references"
         );
         assert!(!units[0].reset);
+    }
+
+    #[test]
+    fn an_unfinished_fragment_cannot_grow_past_the_access_unit_cap() {
+        // A fragment whose end never arrives used to accumulate until the
+        // complete NAL was checked, which is unbounded for an unfinished
+        // one. The limit now applies while the fragment grows.
+        let mut d = Depacketizer::default();
+        assert!(d.push(1, 50, false, &[0x7c, 0x85, 0xaa]).is_empty());
+        let chunk = vec![0xa5u8; 1024 * 1024];
+        let mut seq = 2u16;
+        while d.stats.malformed == 0 && seq < 40 {
+            let mut payload = vec![0x7c, 0x05];
+            payload.extend_from_slice(&chunk);
+            d.push(seq, 50, false, &payload);
+            seq += 1;
+        }
+        assert_eq!(d.stats.malformed, 1, "the fragment grew without a limit");
+        assert!(
+            d.fu.len() + d.pending_bytes <= MAX_ACCESS_UNIT_BYTES,
+            "{} bytes are still held",
+            d.fu.len() + d.pending_bytes
+        );
+        // The picture was abandoned, and the next whole one still arrives.
+        let units = d.push(seq, 51, true, &[0x65, 0xbb]);
+        assert_eq!(units.len(), 1);
     }
 
     #[test]
