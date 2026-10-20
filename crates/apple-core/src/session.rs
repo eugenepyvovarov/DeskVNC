@@ -1806,6 +1806,17 @@ async fn connect(
                     }
                     Some(ClientCommand::MacDisplay(action)) => {
                         use remote_core::MacDisplayAction;
+                        if display_reply.is_some() {
+                            // One display operation at a time. Replacing the
+                            // receiver dropped the previous settlement, and
+                            // the worker answered a closed channel by
+                            // stopping, which left every later request with
+                            // no worker at all.
+                            emit(events, SessionEvent::Protocol(remote_core::ProtocolEvent::AppleNotice(
+                                "A Mac display change is still in progress. Try again when it finishes.".into(),
+                            ))).await.ok();
+                            continue;
+                        }
                         let changes_mode = !matches!(action, MacDisplayAction::List);
                         if changes_mode {
                             // A pending stream resize was made for the old
@@ -1872,8 +1883,18 @@ async fn connect(
                 }
             } => {
                 use remote_core::ProtocolEvent;
-                let result = display.expect("a display reply");
                 display_reply = None;
+                let Some(result) = display else {
+                    // The worker went away without answering. Say so rather
+                    // than panicking on a closed channel: the session can
+                    // still be used, and the display state is unknown.
+                    display_action = None;
+                    tracing::warn!("the Mac display worker stopped without answering");
+                    emit(events, SessionEvent::Protocol(ProtocolEvent::AppleDisplay(Err(
+                        "The Mac display worker stopped before it answered. The display's current mode is unverified.".into(),
+                    )))).await.ok();
+                    continue;
+                };
                 let action = display_action.take();
                 // Reading the mode list changes nothing, so it must not
                 // resize the picture. A change does, and so does a restore.
