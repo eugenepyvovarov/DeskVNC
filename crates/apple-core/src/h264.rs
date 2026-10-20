@@ -267,7 +267,22 @@ impl Depacketizer {
         };
         let expected = self.expected.unwrap_or(seq);
         let skipped = seq.wrapping_sub(expected);
-        self.report_gap(expected, u64::from(skipped));
+        // A buffered packet that is BEHIND the stream is stale: it waited
+        // while the stream moved past it. Wrapping subtraction turns that
+        // into a hole of almost the whole sequence space, and counting it as
+        // loss reported 196617 lost packets on a stream that had lost a
+        // handful, then asked for every one of them. Drop it as late.
+        if skipped > MAX_LOSS_GAP {
+            if let Some(packet) = self.reorder.remove(&seq) {
+                self.reorder_bytes = self.reorder_bytes.saturating_sub(packet.payload.len());
+            }
+            self.stats.late += 1;
+            return;
+        }
+        // The packet that was waited for is not a loss at all.
+        if skipped > 0 {
+            self.report_gap(expected, u64::from(skipped));
+        }
         let Some(packet) = self.reorder.remove(&seq) else {
             return;
         };
@@ -598,6 +613,31 @@ mod tests {
         assert_eq!(&au.annex_b[..4], &[0, 0, 0, 1]);
         // reconstructed NAL header is 0x65 (IDR) then aa bb
         assert!(au.annex_b.windows(3).any(|w| w == [0x65, 0xaa, 0xbb]));
+    }
+
+    #[test]
+    fn a_stale_buffered_packet_is_not_counted_as_a_hole() {
+        // The reorder buffer fills, and its oldest entry is now behind the
+        // stream. Wrapping subtraction reads that as a hole of 65534
+        // packets, which is where "196617 lost" came from.
+        let mut d = Depacketizer::default();
+        d.push(1, 1, true, &[0x61, 0xc0]);
+        // Far ahead, so the entries are buffered as reordering.
+        for seq in 2..=(MAX_REORDER_PACKETS as u16 + 4) {
+            d.push(seq, 2, true, &[0x61, 0xc0]);
+        }
+        // Now the stream has moved past the early buffered entries.
+        d.push(40_000, 3, true, &[0x61, 0xc0]);
+        let before = d.stats.lost_packets;
+        // Filling the buffer forces flushes of whatever is stale.
+        for seq in 40_001..=(40_000 + MAX_REORDER_PACKETS as u16 + 8) {
+            d.push(seq, 4, true, &[0x61, 0xc0]);
+        }
+        assert!(
+            d.stats.lost_packets - before < 100,
+            "a stale entry was counted as {} lost packets",
+            d.stats.lost_packets - before
+        );
     }
 
     #[test]

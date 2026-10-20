@@ -60,6 +60,8 @@ describe("findings", () => {
     const slow = findings(sample({ decodeMs: 400 }));
     expect(slow.some((f) => f.title === "Decoding on the CPU")).toBe(false);
     expect(slow.some((f) => f.title.includes("400 ms"))).toBe(true);
+    // With nothing queued the delay is the pipeline, not the arithmetic.
+    expect(slow.find((f) => f.title.includes("400 ms"))?.detail).toContain("pipeline");
 
     const software = findings(sample({ decodeMs: 400, acceleration: "software" }));
     expect(software.some((f) => f.title === "Decoding on the CPU")).toBe(true);

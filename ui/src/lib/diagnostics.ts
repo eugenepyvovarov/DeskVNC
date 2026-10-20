@@ -165,13 +165,15 @@ export function findings(sample: Sample, totals: { stalls?: number; dropped?: nu
   if (sample.decodeMs >= 250) {
     out.push({
       severity: "warning",
-      title: `A picture takes ${Math.round(sample.decodeMs)} ms to decode`,
-      detail: "This includes any time spent waiting in the decoder queue, so it grows when the decoder cannot keep up.",
+      title: `A picture arrives ${Math.round(sample.decodeMs)} ms after it was handed over`,
+      detail: sample.queued === 0
+        ? "Nothing is queued, so this is buffering in the decoder pipeline rather than slow arithmetic."
+        : "Some of this is pictures waiting in the decoder queue, which grows when the decoder cannot keep up.",
     });
   } else if (sample.decodeMs >= 60) {
     out.push({
       severity: "notice",
-      title: `Decoding takes ${Math.round(sample.decodeMs)} ms per picture`,
+      title: `A picture takes ${Math.round(sample.decodeMs)} ms to come back`,
     });
   }
 
@@ -308,7 +310,8 @@ export function report(input: ReportInput): string {
   }
   if (input.decoder) {
     const d = input.decoder;
-    push(`  decoder:    ${d.queued ?? 0} queued, ${d.decoded ?? 0} of ${d.submitted ?? 0} decoded, ${Math.round(d.latencyMs ?? 0)} ms`);
+    push(`  picture lag: ${Math.round(d.latencyMs ?? 0)} ms from handover to output`);
+    push(`  decoder:    ${d.queued ?? 0} queued, ${d.decoded ?? 0} of ${d.submitted ?? 0} decoded`);
     push(`  decoding:   ${d.acceleration ?? "unknown"}${d.behind ? ", dropped its queue" : ""}`);
   }
   if (input.queue) {
