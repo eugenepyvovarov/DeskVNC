@@ -238,6 +238,19 @@ const H264_MAX_FAILURES = 3;
 const H264_FRAME_TIMEOUT_MS = 500;
 
 /**
+ * How many unmatched submission timestamps a decoder may hold.
+ *
+ * A decoder that consumes input and never produces output kept one entry
+ * per submitted chunk, so a long stall grew this map without a bound. The
+ * oldest entries are dropped first: their pictures are never coming, and a
+ * latency sample that old is not a measurement any more.
+ */
+const H264_MAX_SUBMITTED = 128;
+
+/** How long an unmatched submission timestamp is worth keeping, in ms. */
+const H264_SUBMITTED_MAX_AGE_MS = 5_000;
+
+/**
  * Hard cap on queued updates before the drain loop stops being polite.
  *
  * Below this, only rects that are provably invisible get dropped (see
@@ -723,6 +736,8 @@ export class WebGLRenderer {
   private mediaDecoded = 0;
   /** A running average of the time from the wire to the picture. */
   private mediaLatencyMs = 0;
+  /** Latency samples dropped without a matching output. */
+  private mediaLatencyDropped = 0;
   /** The size of the picture that came out of the decoder. */
   private mediaPictureWidth = 0;
   private mediaPictureHeight = 0;
@@ -1093,6 +1108,8 @@ export class WebGLRenderer {
     frameHeight: number;
     /** Pictures that did not describe the desktop the Mac confirmed. */
     mismatches: number;
+    /** Latency samples dropped because no picture ever answered them. */
+    latencySamplesDropped: number;
     /** `hardware` or `software`, as the webview actually configured it. */
     acceleration: "hardware" | "software";
     /** The decoder could not keep up and its queue was dropped. */
@@ -1113,6 +1130,7 @@ export class WebGLRenderer {
       frameHeight: this.fbHeight,
       /** Pictures whose shape did not match the confirmed desktop. */
       mismatches: this.mediaMismatches,
+      latencySamplesDropped: this.mediaLatencyDropped,
       // What the webview actually agreed to, not what was asked for. A
       // fallback to software is a fact about this machine, and the panel
       // should not have to guess it from a duration.
@@ -1353,6 +1371,17 @@ export class WebGLRenderer {
 
     ctx.timestamp += 1000; // 1 ms apart: monotonic is all the decoder needs
     const ts = ctx.timestamp;
+    // Bound the unmatched timestamps before adding another one. Their order
+    // is insertion order, so the first key is the oldest.
+    const cutoff = performance.now() - H264_SUBMITTED_MAX_AGE_MS;
+    while (ctx.submitted.size > 0) {
+      const oldest = ctx.submitted.keys().next().value;
+      if (oldest === undefined) break;
+      const sentAt = ctx.submitted.get(oldest) as number;
+      if (ctx.submitted.size < H264_MAX_SUBMITTED && sentAt >= cutoff) break;
+      ctx.submitted.delete(oldest);
+      this.mediaLatencyDropped += 1;
+    }
     ctx.submitted.set(ts, performance.now());
     this.mediaSubmitted += 1;
     const wait = this.continuousH264 ? null : this.awaitH264Frame(ctx, ts);
@@ -1653,8 +1682,16 @@ export class WebGLRenderer {
       if (!configured) throw new Error("H.264 configure failed");
       ctx.configured = true;
     } catch {
-      // The configuration itself was refused. Try again on the next key
-      // picture, a bounded number of times, and then say what is wrong.
+      // The configuration itself was refused. The decoder was constructed
+      // before it was configured, so close it rather than leaving a platform
+      // resource that nothing can reach.
+      try {
+        ctx.decoder.close();
+      } catch {
+        /* already gone */
+      }
+      // Try again on the next key picture, a bounded number of times, and
+      // then say what is wrong.
       this.h264Failures += 1;
       if (this.h264Failures >= H264_MAX_FAILURES) {
         this.h264Failed = true;

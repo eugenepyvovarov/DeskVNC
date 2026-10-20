@@ -63,7 +63,7 @@ function sizedDecoderHarness(extra: Record<string, unknown> = {}) {
   return decoderHarness({
     fbWidth: 3600, fbHeight: 2338, sawFrame: true,
     mediaPictureWidth: 3600, mediaPictureHeight: 2338,
-    mediaDecoded: 0, mediaMismatches: 0,
+    mediaDecoded: 0, mediaMismatches: 0, mediaLatencyDropped: 0,
     pendingLayout: null, layoutMismatchRun: 0,
     frameTex: {}, scratchTex: {},
     gl: {
@@ -193,6 +193,51 @@ it("asks for a fresh picture when a decoder fails", () => {
   renderer.createH264({ x: 0, y: 0, w: 3600, h: 2338 }, 0, new Uint8Array());
   error(new Error("decode failed again"));
   expect(behind).toHaveBeenCalledOnce();
+});
+
+it("bounds the timestamps of pictures that never come back", async () => {
+  // A decoder that consumes input and never produces output used to keep one
+  // timing entry per submitted chunk, so a stall grew the map forever.
+  vi.stubGlobal("VideoDecoder", class {
+    state = "configured";
+    decodeQueueSize = 0;
+    configure() {}
+    decode() {}
+    close() { this.state = "closed"; }
+  });
+  vi.stubGlobal("EncodedVideoChunk", class {
+    constructor(public init: unknown) { Object.assign(this, init); }
+  });
+  const renderer = sizedDecoderHarness();
+  await renderer.decodeH264({
+    h264Context: 0, h264Key: true, h264Reset: true,
+    payload: new Uint8Array([0, 0, 0, 1, 0x65, 0xaa]),
+  });
+  for (let i = 0; i < 500; i++) {
+    await renderer.decodeH264({
+      h264Context: 0, h264Key: false,
+      payload: new Uint8Array([0, 0, 0, 1, 0x61, 0xbb]),
+    });
+  }
+  const ctx = renderer.h264.get(0)!;
+  expect(ctx.submitted.size).toBeLessThanOrEqual(128);
+  expect(renderer.mediaLatencyDropped).toBeGreaterThan(0);
+});
+
+it("closes a decoder whose configuration was refused", () => {
+  let closed = 0;
+  vi.stubGlobal("VideoDecoder", class {
+    state = "unconfigured";
+    configure() { throw new Error("no codec"); }
+    close() { closed += 1; this.state = "closed"; }
+  });
+  const renderer = sizedDecoderHarness();
+  const ctx = renderer.createH264(
+    { x: 0, y: 0, w: 3600, h: 2338 }, 0,
+    new Uint8Array([0, 0, 0, 1, 0x67, 0x64, 0, 0x1f, 0, 0, 0, 1, 0x68, 0xee]),
+  );
+  expect(ctx).toBeNull();
+  expect(closed).toBe(1);
 });
 
 it("reconfigures a decoder that a backlog reset left unconfigured", () => {
@@ -387,6 +432,7 @@ it("reports what the decoder is doing", () => {
     mediaPictureWidth: 3600,
     mediaPictureHeight: 2338,
     mediaMismatches: 0,
+    mediaLatencyDropped: 0,
   });
   expect(renderer.getMediaStats()).toEqual({
     queued: 3,
@@ -398,6 +444,7 @@ it("reports what the decoder is doing", () => {
     frameWidth: 3600,
     frameHeight: 2338,
     mismatches: 0,
+    latencySamplesDropped: 0,
     acceleration: "hardware",
     behind: false,
   });
