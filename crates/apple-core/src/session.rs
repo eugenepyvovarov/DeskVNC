@@ -37,12 +37,14 @@ fn first_records(geometry: Option<remote_core::options::AppleGeometry>) -> Vec<V
         // Retina panel, sending pixels where points belong doubles the
         // desktop and makes the decoded picture look zoomed.
         out.push(display_config(
-            geometry.pixel_width,
-            geometry.pixel_height,
-            geometry.point_width,
-            geometry.point_height,
-            geometry.pixel_width,
-            geometry.pixel_height,
+            DisplayRequest {
+                points: (geometry.point_width, geometry.point_height),
+                scale: backing_scale(
+                    (geometry.pixel_width, geometry.pixel_height),
+                    (geometry.point_width, geometry.point_height),
+                ),
+            },
+            (geometry.pixel_width, geometry.pixel_height),
         ));
     }
     out.push(set_encodings());
@@ -475,14 +477,7 @@ async fn request_resize(
         }
         ResizeAction::Send(target) => {
             session
-                .send_body(&display_config(
-                    target.pixels.0,
-                    target.pixels.1,
-                    target.points.0,
-                    target.points.1,
-                    baseline.0,
-                    baseline.1,
-                ))
+                .send_body(&display_config(request_for(target), baseline))
                 .await?;
             tracing::info!(?target, "Apple display resize requested");
             Ok(())
@@ -2050,10 +2045,10 @@ async fn connect(
                         match finish_round(&mut round) {
                             RoundEnd::Send(target) => {
                                 tracing::info!(?target, "Apple queued resize sent");
-                                let (mw, mh) = baseline.unwrap_or((session.width, session.height));
-                                session.send_body(&display_config(
-                                    target.pixels.0, target.pixels.1, target.points.0, target.points.1, mw, mh,
-                                )).await?;
+                                let cap = baseline.unwrap_or((session.width, session.height));
+                                session
+                                    .send_body(&display_config(request_for(target), cap))
+                                    .await?;
                             }
                             RoundEnd::Done(clamped) => {
                                 tracing::info!("Apple resize round complete");
@@ -2071,12 +2066,10 @@ async fn connect(
                                 let shrunk = answered_smaller(clamped);
                                 if shrunk {
                                     if let Some(before) = round.before {
-                                        let (mw, mh) = baseline.unwrap_or(before.pixels);
-                                        session.send_body(&display_config(
-                                            before.pixels.0, before.pixels.1,
-                                            before.points.0, before.points.1,
-                                            mw, mh,
-                                        )).await?;
+                                        let cap = baseline.unwrap_or(before.pixels);
+                                        session
+                                            .send_body(&display_config(request_for(before), cap))
+                                            .await?;
                                         tracing::info!(?before, "Apple answered smaller than asked; desktop restored");
                                     }
                                 }
@@ -2260,33 +2253,80 @@ fn viewer_info() -> Vec<u8> {
     msg
 }
 
-/// `0x1d` SetDisplayConfiguration carrying the FULL dynamic descriptor
-/// (RFC §7.1/§7.3): `display_flags = 1`, `display_type = 4`, `rotations = 7`,
-/// a five-entry mode table with separately requested pixel/point geometry.
-/// A mid-session request is answered with `0x451` + a re-offered encoder.
-/// Acceptance and preservation of the physical desktop require live verification.
-/// A display configuration for the Mac.
+/// The desktop size a request asks for, and the pixels per point it wants.
 ///
-/// `width` and `height` are the PIXEL size the picture should be encoded
-/// at, and `logical_width` and `logical_height` are the size of the desktop
-/// in points. The two are separate on a retina display: a 3600x2338 panel
-/// is 1800x1169 points.
+/// The two are separate because a Mac display has two resolutions: the
+/// desktop in points, which is what a person sees as "how big things are",
+/// and the backing store in pixels, which is how sharp they are. Asking for
+/// the wrong one of them is what made a quality change look like a zoom.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct DisplayRequest {
+    points: (u16, u16),
+    /// Backing pixels per point: 2.0 is a Retina panel, 1.0 is a plain one.
+    scale: f32,
+}
+
+/// The request a geometry means: its desktop size, and its pixels per point.
+fn request_for(geometry: DisplayGeometry) -> DisplayRequest {
+    DisplayRequest {
+        points: geometry.points,
+        scale: backing_scale(geometry.pixels, geometry.points),
+    }
+}
+
+/// Pixels per point for a picture of `pixels` on a desktop of `points`.
+fn backing_scale(pixels: (u16, u16), points: (u16, u16)) -> f32 {
+    if points.0 == 0 || points.1 == 0 {
+        return 1.0;
+    }
+    let x = f64::from(pixels.0) / f64::from(points.0);
+    let y = f64::from(pixels.1) / f64::from(points.1);
+    let scale = ((x + y) / 2.0).clamp(1.0, 3.0);
+    (scale * 100.0).round() as f32 / 100.0
+}
+
+/// The point sizes a Mac display offers, from the native mode table.
 ///
-/// The mode table keeps the logical size and changes the pixel size. That
-/// is what makes a quality change a quality change: the desktop stays the
-/// size the person arranged it at, and only the number of pixels that
-/// arrive changes. A table that scaled the logical size with the pixel
-/// size would resize the desktop, and a window the person had arranged
-/// would move.
-fn display_config(
-    width: u16,
-    height: u16,
-    logical_width: u16,
-    logical_height: u16,
-    max_width: u16,
-    max_height: u16,
-) -> Vec<u8> {
-    const MODE_COUNT: usize = 5;
+/// The daemon expects a mode list that looks like a display's: several
+/// different sizes, not the same size repeated with shrinking pixels. A
+/// table that does not look like one is answered with the server's own
+/// fallback, which is how a request for the native panel came back as
+/// 800x600 points. These are the reference sizes, scaled to whatever was
+/// asked for.
+const NATIVE_MODES: [(u32, u32); 5] = [
+    (1920, 1080),
+    (1440, 900),
+    (1920, 1080),
+    (1440, 810),
+    (1312, 848),
+];
+
+/// The smallest cap that is advertised, matching the reference client.
+///
+/// `max_width`/`max_height` are the bound the daemon caps the display with,
+/// and a request outside it is answered with a fallback rather than being
+/// clamped. Advertising the *current* desktop as the bound is what made the
+/// answer depend on the state the previous session left behind: a session
+/// that started small could never ask for anything larger.
+const MAX_BACKING: (u32, u32) = (3840, 2160);
+
+/// `0x1d` SetDisplayConfiguration.
+///
+/// The message is the same at connect time and for a mid-session resize; the
+/// server answers a steady-state one with `0x451` and restarts the encoder,
+/// which is why a re-offer follows it.
+///
+/// Shape, per the protocol notes and the reference client that interoperates
+/// with the daemon:
+///
+/// * `display_flags = 0x01` (dynamic resolution) and `display_type = 4`, or
+///   the message is not treated as a resize at all.
+/// * `max_width`/`max_height` bound the display. They must cover the request
+///   with room to spare, and must never be smaller than the panel.
+/// * the mode table carries the desktop's point sizes and, for each, the
+///   backing pixels. The first entry is the size being asked for.
+fn display_config(request: DisplayRequest, cap: (u16, u16)) -> Vec<u8> {
+    const MODE_COUNT: usize = NATIVE_MODES.len();
     let di_size = 0x9c + 28 * MODE_COUNT;
     // message_size counts from AFTER the size field (RFC §7.1): the front
     // matter past the 4-byte prefix is 8 bytes, then the descriptor.
@@ -2305,50 +2345,45 @@ fn display_config(
     m.extend_from_slice(&1u32.to_be_bytes()); // display_flags: DYNAMIC_RESOLUTION
                                               // display_type 4. The value is required for a dynamic descriptor, and
                                               // the native viewer sends the same descriptor for the physical console
-                                              // display, so it is not a request for a private display. The server
-                                              // also uses the field to choose between its display paths, and that is
-                                              // what the name "virtual" in the protocol notes comes from: the
-                                              // meaning of the field is not the same thing as what the session
-                                              // shows.
+                                              // display, so it is not a request for a private display.
     m.extend_from_slice(&4u32.to_be_bytes());
     m.extend_from_slice(&369.45f32.to_be_bytes()); // physical mm (native)
     m.extend_from_slice(&207.82f32.to_be_bytes());
-    // The maximum bounds are the Mac's own panel, so the server knows what
-    // the screen really is. They must cover the request as well, or the
-    // server clamps it: the native panel here is 3600x2338, taller than the
-    // 2160 the native templates assume.
-    m.extend_from_slice(&u32::from(width).max(u32::from(max_width)).to_be_bytes()); // max_width
-    m.extend_from_slice(&u32::from(height).max(u32::from(max_height)).to_be_bytes()); // max_height
+    let wanted_backing = (
+        (f64::from(request.points.0) * f64::from(request.scale)).round() as u32,
+        (f64::from(request.points.1) * f64::from(request.scale)).round() as u32,
+    );
+    let max_w = wanted_backing.0.max(u32::from(cap.0)).max(MAX_BACKING.0);
+    let max_h = wanted_backing.1.max(u32::from(cap.1)).max(MAX_BACKING.1);
+    m.extend_from_slice(&max_w.to_be_bytes());
+    m.extend_from_slice(&max_h.to_be_bytes());
     m.extend_from_slice(&0u16.to_be_bytes()); // current_mode_index
     m.extend_from_slice(&0u16.to_be_bytes()); // preferred_mode_index
     m.extend_from_slice(&7u32.to_be_bytes()); // rotations: the native sends 7
     m.extend_from_slice(&(MODE_COUNT as u16).to_be_bytes());
-    // The mode table: the same desktop, at a different pixel size. The
-    // first entry is the mode that is asked for; the others are the same
-    // desktop at the sizes the server may prefer.
-    let logical = (
-        u32::from(logical_width).max(1),
-        u32::from(logical_height).max(1),
-    );
-    let mut modes: Vec<(u32, u32)> = vec![(width as u32, height as u32)];
-    // A few smaller steps, so the server has something to choose from if it
-    // does not want the size that was asked for.
-    for step in [3u32, 2, 1] {
-        let w = u32::from(width) * step / 4;
-        let h = u32::from(height) * step / 4;
-        modes.push((w.max(2), h.max(2)));
-    }
-    modes.push((width as u32, height as u32));
-    debug_assert_eq!(modes.len(), MODE_COUNT);
-    for (mw, mh) in modes {
-        m.extend_from_slice(&mw.to_be_bytes()); // pixel width
-        m.extend_from_slice(&mh.to_be_bytes()); // pixel height
-        m.extend_from_slice(&logical.0.to_be_bytes()); // scaled width (points)
-        m.extend_from_slice(&logical.1.to_be_bytes()); // scaled height (points)
+    // A mode list that looks like a display's, scaled to the desktop that
+    // was asked for. The backing size follows the requested ratio, so a
+    // quality change moves the pixels and leaves the points alone.
+    let sx = f64::from(request.points.0) / 1920.0;
+    let sy = f64::from(request.points.1) / 1080.0;
+    for (template_w, template_h) in NATIVE_MODES {
+        let points_w = (f64::from(template_w) * sx).round().max(2.0) as u32;
+        let points_h = (f64::from(template_h) * sy).round().max(2.0) as u32;
+        let backing_w = even_u32((f64::from(points_w) * f64::from(request.scale)).round() as u32);
+        let backing_h = even_u32((f64::from(points_h) * f64::from(request.scale)).round() as u32);
+        m.extend_from_slice(&backing_w.to_be_bytes()); // pixel width
+        m.extend_from_slice(&backing_h.to_be_bytes()); // pixel height
+        m.extend_from_slice(&points_w.to_be_bytes()); // scaled width (points)
+        m.extend_from_slice(&points_h.to_be_bytes()); // scaled height (points)
         m.extend_from_slice(&60f64.to_be_bytes());
         m.extend_from_slice(&0u32.to_be_bytes()); // mode flags
     }
     m
+}
+
+/// H.264 4:2:0 chroma wants an even size, and an odd one has to be cropped.
+fn even_u32(value: u32) -> u32 {
+    (value + 1) & !1
 }
 
 fn set_encodings() -> Vec<u8> {
@@ -2837,19 +2872,23 @@ mod tests {
             u32::from_be_bytes(records[0][mode + 12..mode + 16].try_into().unwrap()),
             1169
         );
-        // Every mode keeps the desktop points. The native pixel size must
-        // not be substituted for them, or a Retina desktop is doubled.
+        // The mode list is a display's, so its entries offer different
+        // desktop sizes; a table of one size repeated is answered with the
+        // daemon's own fallback. The first entry is the desktop the person
+        // has now, in points, at the panel's pixels per point.
+        let mut points = Vec::new();
         for entry in 0..5 {
             let at = mode + entry * 28;
-            assert_eq!(
+            points.push((
                 u32::from_be_bytes(records[0][at + 8..at + 12].try_into().unwrap()),
-                1800
-            );
-            assert_eq!(
                 u32::from_be_bytes(records[0][at + 12..at + 16].try_into().unwrap()),
-                1169
-            );
+            ));
         }
+        assert_eq!(points[0], (1800, 1169));
+        assert!(
+            points.windows(2).any(|w| w[0] != w[1]),
+            "the mode list offers one desktop size five times: {points:?}"
+        );
     }
 
     #[test]
@@ -3095,8 +3134,15 @@ mod tests {
     }
 
     #[test]
-    fn dynamic_display_config_matches_the_native_shape() {
-        let m = display_config(1920, 1080, 1800, 1169, 3600, 2338);
+    fn the_display_config_asks_for_a_desktop_and_its_pixels_per_point() {
+        // 1800x1169 points at 2x: the panel's own shape.
+        let m = display_config(
+            DisplayRequest {
+                points: (1800, 1169),
+                scale: 2.0,
+            },
+            (3600, 2338),
+        );
         assert_eq!(m[0], 0x1d);
         let message_size = u16::from_be_bytes([m[2], m[3]]) as usize;
         assert_eq!(message_size, m.len() - 4);
@@ -3108,133 +3154,146 @@ mod tests {
         assert_eq!(
             u32::from_be_bytes(m[d + 0x7a..d + 0x7e].try_into().unwrap()),
             1
-        ); // dynamic flag
+        ); // dynamic flag, or the daemon does not treat it as a resize
         assert_eq!(
             u32::from_be_bytes(m[d + 0x7e..d + 0x82].try_into().unwrap()),
             4
         ); // display_type
-           // The maximum bounds are the Mac's own panel.
-        assert_eq!(
-            u32::from_be_bytes(m[d + 0x8a..d + 0x8e].try_into().unwrap()),
-            3600
+           // The cap must cover the request with room to spare. Advertising the
+           // current desktop here is what made the answer depend on the state
+           // the previous session left behind.
+        let max_w = u32::from_be_bytes(m[d + 0x8a..d + 0x8e].try_into().unwrap());
+        let max_h = u32::from_be_bytes(m[d + 0x8e..d + 0x92].try_into().unwrap());
+        assert!(
+            max_w >= 3600 && max_h >= 2338,
+            "the cap excludes the request"
         );
-        assert_eq!(
-            u32::from_be_bytes(m[d + 0x8e..d + 0x92].try_into().unwrap()),
-            2338
-        );
-        assert_eq!(
-            u16::from_be_bytes(m[d + 0x92..d + 0x94].try_into().unwrap()),
-            0
-        ); // mode index < count
-        assert_eq!(
-            u32::from_be_bytes(m[d + 0x96..d + 0x9a].try_into().unwrap()),
-            7
+        assert!(
+            max_w >= 3840 && max_h >= 2160,
+            "the reference cap is not met"
         );
         assert_eq!(
             u16::from_be_bytes(m[d + 0x9a..d + 0x9c].try_into().unwrap()),
             5
         );
         let mode = d + 0x9c;
+        // The first entry is the desktop that was asked for, at the ratio
+        // that was asked for.
         assert_eq!(
             u32::from_be_bytes(m[mode..mode + 4].try_into().unwrap()),
-            1920
+            3600
         );
         assert_eq!(
             u32::from_be_bytes(m[mode + 4..mode + 8].try_into().unwrap()),
-            1080
+            2338
         );
         assert_eq!(
-            f64::from_be_bytes(m[mode + 16..mode + 24].try_into().unwrap()),
-            60.0
+            u32::from_be_bytes(m[mode + 8..mode + 12].try_into().unwrap()),
+            1800
+        );
+        assert_eq!(
+            u32::from_be_bytes(m[mode + 12..mode + 16].try_into().unwrap()),
+            1169
         );
     }
 
-    /// A framebuffer update carrying one rectangle with the given encoding
-    /// and payload.
+    #[test]
+    fn the_mode_table_looks_like_a_display_rather_than_one_size_repeated() {
+        // A table of five identical point sizes with shrinking pixels is not
+        // what a display offers, and the daemon answers a table that does not
+        // look like one with its own fallback mode.
+        let m = display_config(
+            DisplayRequest {
+                points: (1800, 1169),
+                scale: 2.0,
+            },
+            (3600, 2338),
+        );
+        let mode = 12 + 0x9c;
+        let mut points: Vec<(u32, u32)> = Vec::new();
+        for entry in 0..5 {
+            let at = mode + entry * 28;
+            points.push((
+                u32::from_be_bytes(m[at + 8..at + 12].try_into().unwrap()),
+                u32::from_be_bytes(m[at + 12..at + 16].try_into().unwrap()),
+            ));
+        }
+        assert!(
+            points.windows(2).any(|w| w[0] != w[1]),
+            "every mode offered the same desktop: {points:?}"
+        );
+        // And each entry's backing is its points times the ratio, so the
+        // desktop the person sees keeps its size.
+        for entry in 0..5 {
+            let at = mode + entry * 28;
+            let px = u32::from_be_bytes(m[at..at + 4].try_into().unwrap());
+            let pts = u32::from_be_bytes(m[at + 8..at + 12].try_into().unwrap());
+            assert!((px as i64 - (pts as i64 * 2)).abs() <= 2, "entry {entry}");
+        }
+    }
+
+    #[test]
+    fn a_quality_change_moves_the_pixels_and_leaves_the_desktop_alone() {
+        // The same desktop at 1x and at 2x: the point size must be identical,
+        // because a desktop with fewer points is what "zoomed in" looks like.
+        let plain = display_config(
+            DisplayRequest {
+                points: (1800, 1169),
+                scale: 1.0,
+            },
+            (3600, 2338),
+        );
+        let retina = display_config(
+            DisplayRequest {
+                points: (1800, 1169),
+                scale: 2.0,
+            },
+            (3600, 2338),
+        );
+        let mode = 12 + 0x9c;
+        for m in [&plain, &retina] {
+            assert_eq!(
+                u32::from_be_bytes(m[mode + 8..mode + 12].try_into().unwrap()),
+                1800
+            );
+            assert_eq!(
+                u32::from_be_bytes(m[mode + 12..mode + 16].try_into().unwrap()),
+                1169
+            );
+        }
+        assert_eq!(
+            u32::from_be_bytes(plain[mode..mode + 4].try_into().unwrap()),
+            1800
+        );
+        assert_eq!(
+            u32::from_be_bytes(retina[mode..mode + 4].try_into().unwrap()),
+            3600
+        );
+    }
+
+    #[test]
+    fn pixels_per_point_survives_a_round_trip() {
+        assert_eq!(backing_scale((3600, 2338), (1800, 1169)), 2.0);
+        assert_eq!(backing_scale((1800, 1170), (1800, 1169)), 1.0);
+        // Nothing known about the desktop is not a ratio.
+        assert_eq!(backing_scale((3600, 2338), (0, 0)), 1.0);
+        let request = request_for(DisplayGeometry {
+            pixels: (2700, 1754),
+            points: (1800, 1169),
+        });
+        assert_eq!(request.points, (1800, 1169));
+        assert!((request.scale - 1.5).abs() < 0.01);
+    }
+
+    /// A framebuffer update body carrying one rectangle.
     fn update_with(encoding: i32, payload: &[u8]) -> Vec<u8> {
         let mut body = vec![0u8, 0, 0, 1];
         body.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0]); // x, y, w, h
         body.extend_from_slice(&encoding.to_be_bytes());
+        // A metadata rectangle carries its own length inside the payload, so
+        // nothing is added here.
         body.extend_from_slice(payload);
         body
-    }
-
-    #[test]
-    fn the_layout_is_found_after_another_rectangle() {
-        // A message that carries something else first is still a message
-        // that carries the layout.
-        let mut body = vec![0u8, 0, 0, 2];
-        body.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0]);
-        body.extend_from_slice(&1103i32.to_be_bytes()); // the rekey
-        body.extend_from_slice(&[0u8; 36]);
-        body.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0]);
-        body.extend_from_slice(&1105i32.to_be_bytes()); // the layout
-        let mut payload = vec![0u8; 82];
-        payload[0..2].copy_from_slice(&82u16.to_be_bytes());
-        payload[2..4].copy_from_slice(&5u16.to_be_bytes());
-        payload[4..6].copy_from_slice(&1800u16.to_be_bytes());
-        payload[6..8].copy_from_slice(&1169u16.to_be_bytes());
-        payload[8..10].copy_from_slice(&3600u16.to_be_bytes());
-        payload[10..12].copy_from_slice(&2338u16.to_be_bytes());
-        body.extend_from_slice(&payload);
-        assert_eq!(
-            find_display_layout(&body),
-            Some(((1800, 1169), (3600, 2338)))
-        );
-    }
-
-    #[test]
-    fn a_rekey_is_found_after_another_rectangle() {
-        let mut body = vec![0u8, 0, 0, 2];
-        body.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0]);
-        body.extend_from_slice(&1105i32.to_be_bytes()); // the layout
-        let mut payload = vec![0u8; 82];
-        payload[0..2].copy_from_slice(&82u16.to_be_bytes());
-        body.extend_from_slice(&payload);
-        body.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0]);
-        body.extend_from_slice(&1103i32.to_be_bytes()); // the rekey
-        body.extend_from_slice(&[0u8; 36]);
-        // The rekey is recognised by its encoding, wherever it is.
-        assert!(find_rekey(&body, &[0; 16]).is_some());
-    }
-
-    #[test]
-    fn a_rekey_is_not_mistaken_for_something_else() {
-        // A message with a long body that is not a rekey must not be
-        // treated as one: doing that resets the cipher and the next record
-        // fails its integrity check.
-        let body = update_with(1104, &[0u8; 64]);
-        assert!(find_rekey(&body, &[0; 16]).is_none());
-    }
-
-    #[test]
-    fn a_quality_change_keeps_the_desktop_the_size_it_was() {
-        // The mode table says how big the desktop is in points and how many
-        // pixels it is encoded at. A quality change must change the pixels
-        // and leave the points alone: a window the person arranged would
-        // otherwise move.
-        let m = display_config(2216, 1440, 1800, 1169, 3600, 2338);
-        let d = 12;
-        let mode = d + 0x9c;
-        for entry in 0..5 {
-            let at = mode + entry * 28;
-            let pixel_w = u32::from_be_bytes(m[at..at + 4].try_into().unwrap());
-            let pixel_h = u32::from_be_bytes(m[at + 4..at + 8].try_into().unwrap());
-            let scaled_w = u32::from_be_bytes(m[at + 8..at + 12].try_into().unwrap());
-            let scaled_h = u32::from_be_bytes(m[at + 12..at + 16].try_into().unwrap());
-            assert_eq!(scaled_w, 1800, "the desktop width moved");
-            assert_eq!(scaled_h, 1169, "the desktop height moved");
-            assert!(pixel_w > 0 && pixel_h > 0);
-        }
-        // And the first entry is the size that was asked for.
-        assert_eq!(
-            u32::from_be_bytes(m[mode..mode + 4].try_into().unwrap()),
-            2216
-        );
-        assert_eq!(
-            u32::from_be_bytes(m[mode + 4..mode + 8].try_into().unwrap()),
-            1440
-        );
     }
 
     #[test]
