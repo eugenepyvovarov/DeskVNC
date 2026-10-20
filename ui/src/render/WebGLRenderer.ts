@@ -160,6 +160,36 @@ interface H264Context {
  */
 const H264_SIZE_TOLERANCE = 32;
 
+/**
+ * How far a picture's shape may differ from the layout's before the two are
+ * treated as different desktops.
+ *
+ * A quality tier is the same desktop with fewer pixels: its shape is the
+ * layout's shape, and it can be scaled into the layout without changing what
+ * the person sees. A picture with a different shape is another desktop (a
+ * server fallback, another session), and stretching it across this one would
+ * show a screen that is not the Mac's.
+ */
+const H264_ASPECT_TOLERANCE = 0.02;
+
+/**
+ * How many pictures may disagree with the layout before the picture wins.
+ *
+ * Rejecting a differently shaped picture keeps a wrong picture off the
+ * screen, which is right for a moment. A stream that keeps disagreeing is
+ * the real content, though, and refusing it for ever would freeze the pane.
+ */
+const H264_MISMATCH_GIVE_UP = 20;
+
+/** Whether two sizes describe the same desktop, allowing encoder padding. */
+function sameDesktop(
+  pictureW: number, pictureH: number, layoutW: number, layoutH: number,
+): boolean {
+  if (pictureW <= 0 || pictureH <= 0 || layoutW <= 0 || layoutH <= 0) return false;
+  const layoutAspect = layoutW / layoutH;
+  return Math.abs(pictureW / pictureH - layoutAspect) <= layoutAspect * H264_ASPECT_TOLERANCE;
+}
+
 /** Maximum simultaneous decoder contexts, mirrors the backend's cap. */
 const H264_MAX_CONTEXTS = 64;
 
@@ -694,6 +724,20 @@ export class WebGLRenderer {
   private continuousH264 = false;
   private latestVideo: { frame: VideoFrame; ctx: H264Context } | null = null;
   /**
+   * A layout the Mac confirmed while the last picture is still on screen.
+   *
+   * The framebuffer, the texture and the decoder must change together, or the
+   * view shows the old picture stretched into the new geometry. So the layout
+   * is held here and committed with the picture that answers it, instead of
+   * being dropped (which left the renderer at the old size for ever) or
+   * applied early (which blanked the pane and lost the last good frame).
+   */
+  private pendingLayout: { width: number; height: number } | null = null;
+  /** Pictures whose shape did not match the desktop the layout describes. */
+  private mediaMismatches = 0;
+  /** Consecutive disagreeing pictures; reset by any picture that agrees. */
+  private layoutMismatchRun = 0;
+  /**
    * The decoder fell behind and its queue was dropped. Until an independent
    * picture arrives, delta pictures cannot be decoded anyway, so they are
    * thrown away rather than queued.
@@ -814,12 +858,22 @@ export class WebGLRenderer {
 
   /** Set remote framebuffer size (on connect and DesktopResize). */
   setRemoteSize(width: number, height: number, preserveVideo = false): void {
+    if (width === this.fbWidth && height === this.fbHeight) {
+      this.pendingLayout = null;
+      return;
+    }
     // Apple is a full-picture stream: keep its last texture and decoder
-    // while a layout announces the next size. Only decoded replacement
-    // output (preserveVideo) can resize it. A cached *old* picture size must
-    // not override that output, or an ordinary VNC/RDP framebuffer resize.
-    if (this.continuousH264 && !preserveVideo && this.h264.size > 0) return;
-    if (width === this.fbWidth && height === this.fbHeight) return;
+    // while a layout announces the next size, and commit the layout with the
+    // replacement picture (see the decoder output callback). Dropping the
+    // layout here left a resized session drawing at its old size for ever;
+    // applying it now would reallocate the texture and throw away the last
+    // good picture before there is anything to replace it.
+    if (this.continuousH264 && !preserveVideo && this.h264.size > 0) {
+      this.pendingLayout = { width, height };
+      return;
+    }
+    this.pendingLayout = null;
+    this.layoutMismatchRun = 0;
     const gl = this.gl;
     this.fbWidth = width;
     this.fbHeight = height;
@@ -1013,6 +1067,8 @@ export class WebGLRenderer {
     /** The size of the framebuffer the picture is drawn into. */
     frameWidth: number;
     frameHeight: number;
+    /** Pictures that did not describe the desktop the Mac confirmed. */
+    mismatches: number;
     /** `hardware` or `software`, as the webview actually configured it. */
     acceleration: "hardware" | "software";
     /** The decoder could not keep up and its queue was dropped. */
@@ -1031,6 +1087,8 @@ export class WebGLRenderer {
       pictureHeight: this.mediaPictureHeight,
       frameWidth: this.fbWidth,
       frameHeight: this.fbHeight,
+      /** Pictures whose shape did not match the confirmed desktop. */
+      mismatches: this.mediaMismatches,
       // What the webview actually agreed to, not what was asked for. A
       // fallback to software is a fact about this machine, and the panel
       // should not have to guess it from a duration.
@@ -1436,24 +1494,70 @@ export class WebGLRenderer {
             // deadlocks that pipeline until each waiter expires.
             const w = frame.displayWidth || frame.codedWidth;
             const h = frame.displayHeight || frame.codedHeight;
-            // The Mac's own layout is authoritative for the desktop's size,
-            // and its encoder does not always follow it: a stream asked for
-            // 3600x2338 arrived at 1800x1168, and adopting that would have
-            // changed the desktop's size in the middle of a session, which
-            // reads as the view suddenly zooming.
-            //
-            // So a picture that disagrees with a known layout is scaled into
-            // that layout instead of redefining it. The tolerance is wider
-            // than the macroblock padding an encoder adds.
-            const layoutKnown = this.fbWidth > 0 && this.fbHeight > 0;
-            const disagrees = layoutKnown
-              && (Math.abs(w - this.fbWidth) > H264_SIZE_TOLERANCE
-                || Math.abs(h - this.fbHeight) > H264_SIZE_TOLERANCE);
-            if (disagrees) {
-              ctx.stretch = true;
-              ctx.w = this.fbWidth;
-              ctx.h = this.fbHeight;
-            } else {
+            // The layout the Mac confirmed is what the desktop is. A picture
+            // that reports a different shape is a different desktop (the
+            // server's fallback, another session), not this one at another
+            // quality: stretching it across this layout would show a screen
+            // that is not the Mac's. Keep the last good picture and ask for a
+            // fresh one instead.
+            const pending = this.pendingLayout;
+            const layoutW = pending?.width ?? this.fbWidth;
+            const layoutH = pending?.height ?? this.fbHeight;
+            const layoutKnown = layoutW > 0 && layoutH > 0;
+            if (layoutKnown && !sameDesktop(w, h, layoutW, layoutH)) {
+              this.mediaMismatches += 1;
+              this.layoutMismatchRun += 1;
+              if (this.layoutMismatchRun >= H264_MISMATCH_GIVE_UP) {
+                // The layout is what is stale, not the stream: this many
+                // pictures in a row are the Mac's real desktop.
+                console.warn(
+                  `[render] adopting ${w}x${h} after ${this.layoutMismatchRun} pictures that did not match ${layoutW}x${layoutH}`,
+                );
+                this.layoutMismatchRun = 0;
+                this.pendingLayout = null;
+                this.setRemoteSize(w, h, true);
+                ctx.stretch = false;
+                ctx.w = w;
+                ctx.h = h;
+                this.latestVideo?.frame.close();
+                this.latestVideo = { frame, ctx };
+                return;
+              }
+              if (this.layoutMismatchRun === 1) {
+                console.warn(
+                  `[render] the picture is ${w}x${h} and the desktop layout is ${layoutW}x${layoutH}; keeping the last good picture`,
+                );
+                this.notice("The Mac's picture does not match the desktop layout it confirmed. Keeping the last good picture.");
+                // One request per run: a stream that keeps arriving wrong
+                // does not need a request per picture on top of it.
+                this.onDecoderBehind?.();
+              }
+              frame.close();
+              return;
+            }
+            this.layoutMismatchRun = 0;
+            // The new layout and the picture that answers it are committed
+            // together: the framebuffer, the texture and the view transform
+            // change at once, so the screen never mixes one geometry with the
+            // other's picture.
+            if (pending) {
+              this.pendingLayout = null;
+              this.setRemoteSize(pending.width, pending.height, true);
+            }
+            // Same desktop, possibly fewer pixels: that is a quality tier, and
+            // it is scaled into the layout rather than redefining it. The
+            // tolerance is wider than the macroblock padding an encoder adds.
+            const matches = layoutKnown
+              && Math.abs(w - this.fbWidth) <= H264_SIZE_TOLERANCE
+              && Math.abs(h - this.fbHeight) <= H264_SIZE_TOLERANCE;
+            if (!layoutKnown) {
+              // Nothing has said what this desktop is yet, and the first
+              // picture is the only evidence there is.
+              ctx.stretch = false;
+              ctx.w = w;
+              ctx.h = h;
+              this.setRemoteSize(w, h, true);
+            } else if (matches) {
               ctx.stretch = false;
               ctx.w = w;
               ctx.h = h;
@@ -1461,6 +1565,10 @@ export class WebGLRenderer {
               // size while the texture still has the previous size. Compare
               // against the framebuffer, not against that context rectangle.
               this.setRemoteSize(w, h, true);
+            } else {
+              ctx.stretch = true;
+              ctx.w = Math.max(1, this.fbWidth);
+              ctx.h = Math.max(1, this.fbHeight);
             }
             // Decode all reference pictures, but present only the freshest
             // output at the next paint. Never turn a burst into a display FIFO.

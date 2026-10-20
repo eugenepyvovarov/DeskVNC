@@ -63,7 +63,8 @@ function sizedDecoderHarness(extra: Record<string, unknown> = {}) {
   return decoderHarness({
     fbWidth: 3600, fbHeight: 2338, sawFrame: true,
     mediaPictureWidth: 3600, mediaPictureHeight: 2338,
-    mediaDecoded: 0,
+    mediaDecoded: 0, mediaMismatches: 0,
+    pendingLayout: null, layoutMismatchRun: 0,
     frameTex: {}, scratchTex: {},
     gl: {
       bindTexture: vi.fn(), texImage2D: vi.fn(), texSubImage2D: vi.fn(),
@@ -112,6 +113,27 @@ it("scales a picture that disagrees with the confirmed layout instead of resizin
   expect(renderer.h264.get(0)).toBe(ctx);
 });
 
+it("accepts the stream's own desktop after it keeps disagreeing with the layout", () => {
+  // A permanently disagreeing stream is the real content; refusing it for
+  // ever would leave the pane frozen on a picture from an older geometry.
+  let output: (frame: unknown) => void = () => {};
+  vi.stubGlobal("VideoDecoder", class {
+    state = "configured";
+    constructor(callbacks: { output: typeof output }) { output = callbacks.output; }
+    configure() {}
+    close() { this.state = "closed"; }
+  });
+  const renderer = sizedDecoderHarness();
+  renderer.createH264({ x: 0, y: 0, w: 3600, h: 2338 }, 0, new Uint8Array());
+  for (let i = 0; i < 19; i++) {
+    output({ displayWidth: 1600, displayHeight: 1200, timestamp: i, close: vi.fn() });
+  }
+  expect(renderer.getRemoteSize()).toEqual({ width: 3600, height: 2338 });
+  output({ displayWidth: 1600, displayHeight: 1200, timestamp: 99, close: vi.fn() });
+  expect(renderer.getRemoteSize()).toEqual({ width: 1600, height: 1200 });
+  expect(renderer.latestVideo?.ctx.stretch).toBe(false);
+});
+
 it("lets the first picture define the size when no layout is known yet", () => {
   let output: (frame: unknown) => void = () => {};
   vi.stubGlobal("VideoDecoder", class {
@@ -128,7 +150,10 @@ it("lets the first picture define the size when no layout is known yet", () => {
   expect(renderer.getRemoteSize()).toEqual({ width: 1800, height: 1168 });
 });
 
-it("keeps the layout a continuous stream confirmed when the picture differs", () => {
+it("commits a layout the Mac confirmed together with the picture that answers it", () => {
+  // The layout is authoritative. Dropping it left the renderer at the old
+  // size for ever; applying it before the replacement picture blanked the
+  // pane. Both change at once, when the replacement arrives.
   let output: (frame: unknown) => void = () => {};
   vi.stubGlobal("VideoDecoder", class {
     state = "configured";
@@ -139,13 +164,40 @@ it("keeps the layout a continuous stream confirmed when the picture differs", ()
   const renderer = sizedDecoderHarness();
   const ctx = renderer.createH264({ x: 0, y: 0, w: 3600, h: 2338 }, 0, new Uint8Array());
   renderer.setRemoteSize(2700, 1754);
+  // Nothing changes until there is something to put in the new geometry.
   expect(renderer.getRemoteSize()).toEqual({ width: 3600, height: 2338 });
-  expect(renderer.h264.get(0)).toBe(ctx);
   expect(renderer.gl.texImage2D).not.toHaveBeenCalled();
   output({ displayWidth: 2700, displayHeight: 1754, close: vi.fn() });
-  expect(renderer.getRemoteSize()).toEqual({ width: 3600, height: 2338 });
-  expect(renderer.latestVideo?.ctx.stretch).toBe(true);
+  expect(renderer.getRemoteSize()).toEqual({ width: 2700, height: 1754 });
+  expect(renderer.latestVideo?.ctx.stretch).toBe(false);
   expect(renderer.h264.get(0)).toBe(ctx);
+});
+
+it("keeps the picture on screen when the Mac sends a different desktop", () => {
+  // 1600x1200 for a 3600x2338 desktop is not a quality tier of this desktop:
+  // it is a different screen (a server fallback). Stretching 4:3 across a
+  // Retina desktop shows something that is not the Mac's screen, so the last
+  // good picture stays and recovery is asked for.
+  let output: (frame: unknown) => void = () => {};
+  vi.stubGlobal("VideoDecoder", class {
+    state = "configured";
+    constructor(callbacks: { output: typeof output }) { output = callbacks.output; }
+    configure() {}
+    close() { this.state = "closed"; }
+  });
+  const behind = vi.fn();
+  const renderer = sizedDecoderHarness({ onDecoderBehind: behind });
+  renderer.createH264({ x: 0, y: 0, w: 3600, h: 2338 }, 0, new Uint8Array());
+  const good = { displayWidth: 3600, displayHeight: 2338, timestamp: 1, close: vi.fn() };
+  output(good);
+  const fallback = { displayWidth: 1600, displayHeight: 1200, timestamp: 2, close: vi.fn() };
+  output(fallback);
+  expect(renderer.latestVideo?.frame).toBe(good);
+  expect(fallback.close).toHaveBeenCalledOnce();
+  expect(renderer.mediaMismatches).toBe(1);
+  expect(renderer.getRemoteSize()).toEqual({ width: 3600, height: 2338 });
+  expect(renderer.notice).toHaveBeenCalled();
+  expect(behind).toHaveBeenCalledOnce();
 });
 
 it("ignores output and errors from a retired decoder sharing the replacement's slot", () => {
@@ -225,6 +277,7 @@ it("reports what the decoder is doing", () => {
     fbHeight: 2338,
     mediaPictureWidth: 3600,
     mediaPictureHeight: 2338,
+    mediaMismatches: 0,
   });
   expect(renderer.getMediaStats()).toEqual({
     queued: 3,
@@ -235,6 +288,7 @@ it("reports what the decoder is doing", () => {
     pictureHeight: 2338,
     frameWidth: 3600,
     frameHeight: 2338,
+    mismatches: 0,
     acceleration: "hardware",
     behind: false,
   });

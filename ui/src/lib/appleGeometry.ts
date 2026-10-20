@@ -73,8 +73,17 @@ export function isPanelGeometry(geometry: AppleGeometry | null): geometry is App
 export function writeAppleGeometry(hostId: string | null | undefined, geometry: AppleGeometry | null): void {
   if (!hostId || !isPanelGeometry(geometry)) return;
   const existing = readAppleGeometry(hostId);
-  // A later layout can be a shrunk window-sized desktop. Keep the panel.
-  if (existing && existing.pointWidth * existing.pointHeight > geometry.pointWidth * geometry.pointHeight) return;
+  if (existing) {
+    const existingPoints = existing.pointWidth * existing.pointHeight;
+    const nextPoints = geometry.pointWidth * geometry.pointHeight;
+    // A later layout can be a shrunk window-sized desktop. Keep the panel.
+    if (existingPoints > nextPoints) return;
+    // The same desktop at a lower stream quality is not a smaller desktop.
+    // Overwriting the sharp pixels with them is how one Low session made
+    // every later connection ask the Mac for a blurry stream.
+    if (existingPoints === nextPoints
+      && existing.pixelWidth * existing.pixelHeight >= geometry.pixelWidth * geometry.pixelHeight) return;
+  }
   try {
     localStorage.setItem(
       key(hostId),
