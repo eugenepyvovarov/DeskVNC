@@ -66,6 +66,8 @@ pub struct Stats {
     pub access_units: u64,
     /// Half-assembled pictures thrown away because a packet was missing.
     pub discarded: u64,
+    /// Packets ignored because the picture they belong to was damaged.
+    pub damaged_packets: u64,
     /// Times the sequence numbers jumped instead of skipping a packet: an
     /// encoder restart or a reset stream, not a network loss.
     pub discontinuities: u64,
@@ -87,6 +89,11 @@ pub struct Depacketizer {
     fu: Vec<u8>,
     fu_timestamp: u32,
     fu_open: bool,
+    /// The timestamp of a picture that lost part of itself. Every other
+    /// packet carrying it is refused: the surviving slices are not the
+    /// picture, and publishing them would hand the decoder a picture with a
+    /// hole in it, which it conceals rather than reports.
+    damaged: Option<u32>,
     pending: Vec<Vec<u8>>,
     pending_bytes: usize,
     timestamp: Option<u32>,
@@ -162,7 +169,7 @@ impl Depacketizer {
                     // on the way; the picture in hand is dropped because its
                     // references are gone.
                     self.stats.discontinuities += 1;
-                    self.discard_picture();
+                    self.damage_picture();
                     self.expected = Some(seq);
                     self.assemble(timestamp, marker, payload);
                     self.expected = Some(seq.wrapping_add(1));
@@ -188,6 +195,7 @@ impl Depacketizer {
     /// Forget the stream: the next picture starts a new one.
     pub fn reset(&mut self) {
         self.discard_picture();
+        self.damaged = None;
         self.timestamp = None;
         self.expected = None;
         self.reorder.clear();
@@ -306,6 +314,19 @@ impl Depacketizer {
             let excess = self.stats.lost_sequences.len() - 64;
             self.stats.lost_sequences.drain(..excess);
         }
+        self.damage_picture();
+    }
+
+    /// Abandon the picture being assembled, and refuse the rest of it.
+    ///
+    /// Clearing the assembly buffers alone is not enough: a later slice that
+    /// carries the same timestamp would start a fresh assembly with the part
+    /// that did survive, and that partial picture would be published as if
+    /// it were complete.
+    fn damage_picture(&mut self) {
+        if let Some(timestamp) = self.timestamp {
+            self.damaged = Some(timestamp);
+        }
         self.discard_picture();
     }
 
@@ -320,6 +341,17 @@ impl Depacketizer {
     }
 
     fn assemble(&mut self, timestamp: u32, marker: bool, payload: &[u8]) {
+        if let Some(damaged) = self.damaged {
+            if damaged == timestamp {
+                // Part of this picture went missing, so its remaining slices
+                // are not the picture. Wait for a different timestamp.
+                self.stats.damaged_packets += 1;
+                return;
+            }
+            // A different picture: the damage was confined to the one that
+            // was abandoned.
+            self.damaged = None;
+        }
         if self.timestamp != Some(timestamp) {
             // A new picture. Anything half-assembled belonged to the old
             // one, including an unfinished fragment: it can never be
@@ -336,7 +368,7 @@ impl Depacketizer {
                     // A truncated aggregation: the picture is broken. No
                     // packet went missing, but the picture is unusable.
                     self.stats.malformed += 1;
-                    self.discard_picture();
+                    self.damage_picture();
                     return;
                 }
             },
@@ -357,7 +389,7 @@ impl Depacketizer {
             self.pending_bytes += nal.len();
             if self.pending_bytes > MAX_ACCESS_UNIT_BYTES {
                 self.stats.malformed += 1;
-                self.discard_picture();
+                self.damage_picture();
                 return;
             }
             self.pending.push(nal);
@@ -680,6 +712,48 @@ mod tests {
             "a picture with an inter slice needs its references"
         );
         assert!(!units[0].reset);
+    }
+
+    #[test]
+    fn the_surviving_tail_of_a_damaged_picture_is_not_published() {
+        // A multi-slice IDR loses its middle packets. The slices that did
+        // arrive carry the same timestamp, and publishing them would hand
+        // the decoder a picture that is missing a slice. The decoder does
+        // not report that: it conceals the hole and keeps the corruption.
+        let mut d = Depacketizer::default();
+        d.push(1, 100, false, &[0x65, 0xaa]); // first slice, not the last
+        d.push(20, 100, false, &[0x65, 0xbb]); // 2..19 are gone
+        assert_eq!(d.stats.gaps, 1, "the hole was not noticed");
+        let units = d.push(21, 100, true, &[0x65, 0xcc]); // marker slice
+        assert!(units.is_empty(), "a damaged picture was published");
+        // The next picture is whole and is published normally.
+        let units = d.push(22, 200, true, &[0x65, 0xdd]);
+        assert_eq!(units.len(), 1);
+        assert!(units[0].keyframe);
+    }
+
+    #[test]
+    fn a_restart_after_a_jump_starts_a_new_picture() {
+        // A sequence jump is a restarted encoder, not a lost packet. The
+        // picture in hand is abandoned; the first picture of the new stream
+        // has its own timestamp and is published.
+        let mut d = Depacketizer::default();
+        d.push(1, 7, false, &[0x65, 0xaa]);
+        let units = d.push(30_000, 8, true, &[0x65, 0xbb]);
+        assert_eq!(d.stats.discontinuities, 1);
+        assert_eq!(units.len(), 1, "the new stream's first picture");
+        assert!(units[0].keyframe);
+    }
+
+    #[test]
+    fn a_malformed_aggregation_damages_the_whole_picture() {
+        let mut d = Depacketizer::default();
+        // A STAP-A whose declared length runs past the packet.
+        d.push(1, 9, false, &[0x78, 0x00, 0x00, 0x10, 0x65, 0xaa]);
+        assert_eq!(d.stats.malformed, 1);
+        // The rest of that timestamp is the same broken picture.
+        assert!(d.push(2, 9, true, &[0x65, 0xbb]).is_empty());
+        assert_eq!(d.push(3, 10, true, &[0x65, 0xcc]).len(), 1);
     }
 
     #[test]
