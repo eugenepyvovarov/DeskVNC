@@ -94,14 +94,23 @@ impl PictureBuffer {
     /// paints corruption that lasts until the next independent picture.
     pub fn pop(&mut self) -> Option<AccessUnit> {
         if self.broken {
-            // Look for an independent picture. Everything before it belongs
-            // to the chain that was broken.
+            // Look for the oldest independent picture. It is the point the
+            // chain can be resumed from, and everything queued before it is
+            // older than that point.
             let position = self.queue.iter().position(|unit| unit.keyframe);
             match position {
                 Some(at) => {
-                    let unit = self.queue.remove(at);
+                    // Those older pictures are deltas of the broken chain:
+                    // their references were dropped, and emitting one after
+                    // the recovery picture would put a picture from before
+                    // the recovery after it. Remove them, not just the one
+                    // in front of the recovery picture.
+                    for _ in 0..at {
+                        self.queue.pop_front();
+                        self.dropped += 1;
+                    }
                     self.broken = false;
-                    return unit;
+                    return self.queue.pop_front();
                 }
                 None => {
                     // Nothing independent has arrived yet. The pictures in
@@ -186,6 +195,42 @@ mod tests {
                                      // handing either over would paint corruption.
         assert!(buffer.pop().is_none());
         assert_eq!(buffer.dropped(), 3);
+    }
+
+    #[test]
+    fn recovery_discards_the_deltas_queued_before_the_independent_picture() {
+        // The recovery picture is a new starting point. The deltas queued
+        // before it belong to the broken chain, and handing them over after
+        // it would show a picture from before the recovery.
+        let mut buffer = PictureBuffer::with_capacity(4);
+        for _ in 0..4 {
+            buffer.push(picture(false));
+        }
+        buffer.push(picture(true)); // overflows, so the chain is broken
+        assert!(buffer.is_broken());
+        let unit = buffer.pop().expect("the recovery picture is handed over");
+        assert!(unit.keyframe);
+        // One delta was dropped to make room, and the three remaining stale
+        // deltas are dropped with the recovery, not emitted after it.
+        assert_eq!(buffer.dropped(), 4);
+        assert_eq!(buffer.len(), 0);
+        assert!(buffer.pop().is_none());
+    }
+
+    #[test]
+    fn recovery_keeps_the_valid_successors_of_the_picture_it_chose() {
+        let mut buffer = PictureBuffer::with_capacity(3);
+        buffer.push(picture(false)); // d1
+        buffer.push(picture(false)); // d2
+        buffer.push(picture(false)); // d3
+        buffer.push(picture(true)); // key 1, drops d1
+        buffer.push(picture(false)); // d4, drops d2
+        buffer.push(picture(true)); // key 2, drops d3
+        assert!(buffer.is_broken());
+        assert!(buffer.pop().expect("key 1 first").keyframe);
+        assert!(!buffer.pop().expect("its successor").keyframe);
+        assert!(buffer.pop().expect("then key 2").keyframe);
+        assert!(buffer.pop().is_none());
     }
 
     #[test]
