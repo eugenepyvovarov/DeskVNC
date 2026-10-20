@@ -71,6 +71,8 @@ pub struct Stats {
     /// Times the sequence numbers jumped instead of skipping a packet: an
     /// encoder restart or a reset stream, not a network loss.
     pub discontinuities: u64,
+    /// Configuration packets that were ordered and applied.
+    pub configuration: u64,
 }
 
 /// One access unit, ready for the decoder.
@@ -135,15 +137,6 @@ impl Depacketizer {
         if payload.is_empty() {
             return Vec::new();
         }
-        if payload[0] == 0x92 {
-            // Apple's configuration packet. It is not part of a picture, and
-            // it means the encoder changed: anything half-assembled belongs
-            // to the previous parameter sets.
-            self.discard_picture();
-            self.timestamp = None;
-            self.config(payload);
-            return Vec::new();
-        }
         match self.expected {
             None => {
                 self.expected = Some(seq);
@@ -175,8 +168,10 @@ impl Depacketizer {
                     self.expected = Some(seq.wrapping_add(1));
                     self.drain();
                 } else {
-                    // Too far ahead: the packets in between are lost.
-                    self.report_gap(expected, u64::from(ahead - 1));
+                    // Too far ahead: the packets between the expected one
+                    // and this one are lost, and the expected one is the
+                    // first of them.
+                    self.report_gap(expected, u64::from(ahead));
                     self.expected = Some(seq);
                     self.assemble(timestamp, marker, payload);
                     self.expected = Some(seq.wrapping_add(1));
@@ -268,26 +263,40 @@ impl Depacketizer {
         }
     }
 
-    /// Abandon the hole and process the oldest buffered packet.
+    /// Abandon the hole and process the nearest buffered packet ahead of it.
     fn flush_oldest(&mut self) {
-        let Some(&seq) = self.reorder.keys().next() else {
+        let Some(expected) = self.expected else {
             return;
         };
-        let expected = self.expected.unwrap_or(seq);
-        let skipped = seq.wrapping_sub(expected);
         // A buffered packet that is BEHIND the stream is stale: it waited
         // while the stream moved past it. Wrapping subtraction turns that
         // into a hole of almost the whole sequence space, and counting it as
         // loss reported 196617 lost packets on a stream that had lost a
-        // handful, then asked for every one of them. Drop it as late.
-        if skipped > MAX_LOSS_GAP {
+        // handful, then asked for every one of them. Drop those first, as
+        // late, so they cannot be chosen as the nearest packet.
+        let stale: Vec<u16> = self
+            .reorder
+            .keys()
+            .copied()
+            .filter(|seq| seq.wrapping_sub(expected) > MAX_LOSS_GAP)
+            .collect();
+        for seq in stale {
             if let Some(packet) = self.reorder.remove(&seq) {
                 self.reorder_bytes = self.reorder_bytes.saturating_sub(packet.payload.len());
             }
             self.stats.late += 1;
-            return;
         }
-        // The packet that was waited for is not a loss at all.
+        // Nearest by FORWARD distance, not by numeric order: 0 is two
+        // ahead of 65534, and choosing the numerically smallest key made
+        // the packet that was actually next wait behind a later one.
+        let Some(&seq) = self
+            .reorder
+            .keys()
+            .min_by_key(|seq| seq.wrapping_sub(expected))
+        else {
+            return;
+        };
+        let skipped = seq.wrapping_sub(expected);
         if skipped > 0 {
             self.report_gap(expected, u64::from(skipped));
         }
@@ -341,6 +350,20 @@ impl Depacketizer {
     }
 
     fn assemble(&mut self, timestamp: u32, marker: bool, payload: &[u8]) {
+        if payload[0] == 0x92 {
+            // Apple's configuration packet shares the media sequence space,
+            // so it is ordered like any other packet and only becomes a
+            // configuration when its turn comes. Treating it before ordering
+            // left its sequence number unexplained: the next media packet
+            // looked like it followed a lost one.
+            self.stats.configuration += 1;
+            // The encoder changed, so anything half assembled belongs to the
+            // previous parameter sets.
+            self.damage_picture();
+            self.timestamp = None;
+            self.config(payload);
+            return;
+        }
         if let Some(damaged) = self.damaged {
             if damaged == timestamp {
                 // Part of this picture went missing, so its remaining slices
@@ -694,11 +717,11 @@ mod tests {
         assert_eq!(d.stats.discontinuities, 1);
         assert!(d.stats.lost_sequences.is_empty(), "nothing to ask for");
         // A hole inside the stream is still loss, and still asked for: the
-        // 28 packets between the expected one and the one that arrived.
+        // expected packet and the 28 after it, up to the one that arrived.
         d.push(30_030, 3, true, &[0x61, 0xc0]);
-        assert_eq!(d.stats.lost_packets, 28);
+        assert_eq!(d.stats.lost_packets, 29);
         assert_eq!(d.stats.lost_sequences.first(), Some(&30_001));
-        assert_eq!(d.stats.lost_sequences.len(), 28);
+        assert_eq!(d.stats.lost_sequences.len(), 29);
     }
 
     #[test]
@@ -721,6 +744,75 @@ mod tests {
             "a picture with an inter slice needs its references"
         );
         assert!(!units[0].reset);
+    }
+
+    #[test]
+    fn every_packet_of_a_far_gap_is_asked_for() {
+        // The expected packet is the first one missing, so the count is the
+        // distance to the packet that arrived, not one less. A gap this far
+        // ahead is reported immediately rather than buffered.
+        let mut d = Depacketizer::default();
+        d.push(10, 1, true, &[0x61, 0xc0]);
+        assert_eq!(d.stats.lost_packets, 0);
+        d.push(30, 2, true, &[0x61, 0xc0]);
+        assert_eq!(d.stats.lost_packets, 19, "11..29 are missing");
+        assert_eq!(d.stats.lost_sequences.first(), Some(&11));
+        assert_eq!(d.stats.lost_sequences.last(), Some(&29));
+        assert_eq!(d.stats.lost_sequences.len(), 19);
+    }
+
+    #[test]
+    fn expiry_takes_the_next_packet_across_the_sequence_wrap() {
+        // 65534 was lost, and the buffer holds 65535, 0 and 1. Numeric order
+        // says 0 comes first, but it is two packets ahead: the packet that is
+        // actually next is 65535.
+        let mut d = Depacketizer::default();
+        d.push(65_533, 1, true, &[0x61, 0xaa]);
+        d.push(65_535, 2, true, &[0x61, 0xbb]);
+        d.push(0, 3, true, &[0x61, 0xcc]);
+        d.push(1, 4, true, &[0x61, 0xdd]);
+        // The flush gives up on 65534, takes 65535, then drains the two that
+        // follow it in order.
+        d.flush_oldest();
+        assert_eq!(d.expected, Some(2));
+        assert_eq!(d.stats.late, 0);
+        assert_eq!(d.stats.lost_packets, 1, "only 65534 went missing");
+        let order: Vec<u8> = d
+            .ready
+            .iter()
+            .filter_map(|unit| unit.annex_b.last().copied())
+            .collect();
+        assert_eq!(order, vec![0xbb, 0xcc, 0xdd], "a packet was reordered");
+    }
+
+    #[test]
+    fn a_configuration_packet_does_not_leave_a_hole_in_the_sequence() {
+        // Configuration packets share the media sequence space. Treating
+        // one before ordering left its number unexplained, so the media
+        // packet after it looked like it followed a lost one.
+        let mut d = Depacketizer::default();
+        let config = [0x92, b'a', b'v', b'c', b'C', 1, 0x64, 0, 0, 0];
+        assert_eq!(d.push(1, 10, true, &[0x61, 0xaa]).len(), 1);
+        d.push(2, 11, false, &config);
+        let units = d.push(3, 12, true, &[0x61, 0xbb]);
+        assert_eq!(units.len(), 1, "the picture after the configuration");
+        assert_eq!(d.stats.lost_packets, 0);
+        assert_eq!(d.stats.gaps, 0);
+        assert_eq!(d.stats.configuration, 1);
+    }
+
+    #[test]
+    fn a_configuration_packet_ahead_is_applied_in_wire_order() {
+        let mut d = Depacketizer::default();
+        let config = [0x92, b'a', b'v', b'c', b'C', 1, 0x64, 0, 0, 0];
+        d.push(1, 20, true, &[0x61, 0xaa]);
+        // The configuration arrives before the packet it follows.
+        d.push(3, 22, false, &config);
+        assert_eq!(d.stats.configuration, 0, "applied before its turn");
+        d.push(2, 21, true, &[0x61, 0xbb]);
+        assert_eq!(d.stats.configuration, 1);
+        assert_eq!(d.stats.lost_packets, 0);
+        assert_eq!(d.stats.gaps, 0);
     }
 
     #[test]
