@@ -1,5 +1,14 @@
 # Why the requested picture size varied between sessions
 
+> Historical hypothesis, not a confirmed root-cause analysis. Superseded by
+> [the resolution stabilization audit and repair plan](../plans/2026-10-20-apple-resolution-stabilization-plan.md)
+> at `6933f0d`. The old serializer already used `max(request, prior cap)`, so
+> the claim below that a small advertised cap necessarily prevented growth
+> is not established. The mode-table explanation and the claim that the
+> encoder always follows points also remain unverified. The newer audit
+> reproduces false one-pixel rollback, stale rollback state, and stale local
+> presentation, and records the required implementation and validation steps.
+
 ## What was observed
 
 Two sessions to the same Mac, minutes apart, asked for the same thing and got
