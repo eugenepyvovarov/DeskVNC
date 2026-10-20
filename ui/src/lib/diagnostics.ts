@@ -129,7 +129,13 @@ export function findings(sample: Sample, totals: { stalls?: number; dropped?: nu
     });
   }
 
-  if (sample.jitter >= 120) {
+  // A session that answers input in a few tens of milliseconds is working.
+  // An idle desktop sends few pictures, and its spacing is uneven because
+  // each one is a small change rather than a frame; reporting that as jitter
+  // and as a low frame rate is what made a healthy session look broken.
+  const responsive = sample.inputLatencyMs > 0 && sample.inputLatencyMs < 250;
+
+  if (sample.jitter >= 120 && !responsive) {
     out.push({
       severity: "warning",
       title: `Picture spacing varies by ${Math.round(sample.jitter)} ms`,
@@ -185,7 +191,7 @@ export function findings(sample: Sample, totals: { stalls?: number; dropped?: nu
     });
   }
 
-  if (sample.fps > 0 && sample.fps < 5 && sample.throughput > 0) {
+  if (sample.fps > 0 && sample.fps < 5 && sample.throughput > 0 && !responsive) {
     out.push({
       severity: "warning",
       title: `Only ${sample.fps.toFixed(1)} pictures per second`,

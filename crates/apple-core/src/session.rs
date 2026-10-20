@@ -314,6 +314,10 @@ const SILENT_STREAM_TIMEOUT: Duration = Duration::from_secs(2);
 /// offered again. A request over UDP asks a media session that may no longer
 /// exist; a re-offer over the control connection rebuilds it.
 const REVIVE_AFTER: Duration = Duration::from_secs(5);
+/// The longest wait between asks for a picture the Mac has not sent. The
+/// wait doubles, so a pointer moving over an unchanged screen costs a handful
+/// of requests a minute rather than thirty.
+const OWED_RETRY_MAX: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Copy)]
 enum VideoRequest {
@@ -1240,6 +1244,11 @@ async fn connect(
             let mut always_refresh = false;
             let mut last_always_refresh = Instant::now() - ALWAYS_REFRESH_INTERVAL;
             let mut last_silence_request = Instant::now() - SILENT_STREAM_TIMEOUT;
+            // How long to wait before asking again for a picture the Mac owes
+            // us. It doubles while the asks go unanswered, because a pointer
+            // moving over an unchanged screen is not a fault and must not
+            // cost the Mac a full picture every two seconds.
+            let mut owed_retry = SILENT_STREAM_TIMEOUT;
             // When the last video packet arrived, whatever it contained. A
             // still desktop sends nothing at all, and that is not a stall.
             let mut last_packet_at: Option<Instant> = None;
@@ -1323,7 +1332,8 @@ async fn connect(
                         let owed_long_enough = owed_at != 0
                             && now_ms.saturating_sub(owed_at) >= SILENT_STREAM_TIMEOUT.as_millis() as u64
                             && now_ms.saturating_sub(last_picture_ms) >= SILENT_STREAM_TIMEOUT.as_millis() as u64;
-                        if owed_long_enough
+                        let ask_for_owed = owed_long_enough && last_silence_request.elapsed() >= owed_retry;
+                        if ask_for_owed
                             || should_ask_for_stalled_picture(
                                 packets_arriving,
                                 streams.active_picture_stalled(now, SILENT_STREAM_TIMEOUT),
@@ -1331,8 +1341,11 @@ async fn connect(
                             )
                         {
                             last_silence_request = now;
-                            // Asking again two seconds later if this one is
-                            // not answered either.
+                            // Asking again later if this one is not answered
+                            // either, and less often each time.
+                            if ask_for_owed {
+                                owed_retry = (owed_retry * 2).min(OWED_RETRY_MAX);
+                            }
                             video_owed.store(now_ms, std::sync::atomic::Ordering::Relaxed);
                             video_counters
                                 .stalls
@@ -1486,6 +1499,9 @@ async fn connect(
                     // How long the person waited for this picture, if they
                     // had asked for one. The mark is cleared so the wait is
                     // measured once, not counted again by the next picture.
+                    // A picture arrived, so whatever was owed has been paid
+                    // and the next ask starts from the short wait again.
+                    owed_retry = SILENT_STREAM_TIMEOUT;
                     let asked_at = video_owed.swap(0, std::sync::atomic::Ordering::Relaxed);
                     if asked_at != 0 && last_picture_ms > asked_at {
                         let waited = (last_picture_ms - asked_at).min(60_000) as u32;

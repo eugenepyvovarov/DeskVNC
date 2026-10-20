@@ -67,6 +67,17 @@ describe("findings", () => {
     expect(software.some((f) => f.title === "Decoding on the CPU")).toBe(true);
   });
 
+  it("does not call a responsive session broken because it is idle", () => {
+    // 1.6 pictures a second with uneven spacing is what a still desktop
+    // looks like. If input is answered in 56 ms, it is working.
+    const idle = findings(sample({ fps: 1.6, jitter: 321, throughput: 2e4, inputLatencyMs: 56 }));
+    expect(idle.some((f) => f.title.includes("pictures per second"))).toBe(false);
+    expect(idle.some((f) => f.title.includes("spacing varies"))).toBe(false);
+    // Without that evidence the same numbers are worth reporting.
+    const unknown = findings(sample({ fps: 1.6, jitter: 321, throughput: 2e4, inputLatencyMs: 0 }));
+    expect(unknown.some((f) => f.title.includes("pictures per second"))).toBe(true);
+  });
+
   it("judges picture lag against the spacing between pictures", () => {
     // The decoder holds one picture until the next arrives, so at two
     // pictures a second a 400 ms delay is the wait, not a fault.
