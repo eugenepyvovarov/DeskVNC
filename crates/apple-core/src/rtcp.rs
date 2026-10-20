@@ -32,6 +32,31 @@ pub fn receiver_report(sender: Ssrc) -> Vec<u8> {
     out
 }
 
+/// The Full Intra Request command sequence for one sender and target.
+///
+/// A new command needs a number the target has not seen; a retransmission of
+/// the same command keeps it. Every request this client makes is a new
+/// command, and the number wraps as the RFC allows. A constant zero made
+/// every request look like a repeat of the first one.
+#[derive(Debug, Default)]
+pub struct FirSequence(u8);
+
+impl FirSequence {
+    /// Start at `seed`, which the session randomises so a restarted client
+    /// is not mistaken for the old one.
+    #[must_use]
+    pub fn new(seed: u8) -> Self {
+        Self(seed)
+    }
+
+    /// The number for a new request, and the next one to hand out.
+    pub fn next(&mut self) -> u8 {
+        let seq = self.0;
+        self.0 = self.0.wrapping_add(1);
+        seq
+    }
+}
+
 /// A Full Intra Request (RFC 5104 §4.3.1.1) for one media stream.
 pub fn full_intra_request(sender: Ssrc, target: Ssrc, seq: u8) -> Vec<u8> {
     let mut out = Vec::with_capacity(20);
@@ -207,6 +232,21 @@ mod tests {
         // Nor is a scrap of nothing.
         assert!(!is_rtcp(&[0x80]));
         assert!(!is_rtcp(&[]));
+    }
+
+    #[test]
+    fn a_new_fir_command_carries_a_new_sequence_number() {
+        let mut fir = FirSequence::new(250);
+        let first = full_intra_request(1, 2, fir.next());
+        let second = full_intra_request(1, 2, fir.next());
+        assert_eq!(first[16], 250, "the sequence number is not in the packet");
+        assert_eq!(second[16], 251);
+        assert_ne!(first, second, "a new command looked like a repeat");
+        // The number wraps, which the RFC allows.
+        let mut wrapping = FirSequence::new(255);
+        assert_eq!(wrapping.next(), 255);
+        assert_eq!(wrapping.next(), 0);
+        assert_eq!(wrapping.next(), 1);
     }
 
     #[test]

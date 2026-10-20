@@ -131,6 +131,26 @@ async fn release_all(session: &mut Live, held: &mut Held) -> Result<(), SessionE
     Ok(())
 }
 
+/// The rate limit and the command numbering for one feedback destination.
+///
+/// They travel together because they share a lifetime: a request is either
+/// allowed and gets the next FIR number, or it is held back and nothing is
+/// consumed.
+struct FeedbackClock {
+    last: Instant,
+    fir: crate::rtcp::FirSequence,
+}
+
+impl Default for FeedbackClock {
+    fn default() -> Self {
+        Self {
+            // A fresh session may ask at once.
+            last: Instant::now() - KEYFRAME_REQUEST_INTERVAL,
+            fir: crate::rtcp::FirSequence::new(rand::random()),
+        }
+    }
+}
+
 /// Ask the Mac for a fresh independent picture.
 ///
 /// The request goes out on the control socket, which is where the Mac's
@@ -147,16 +167,16 @@ async fn request_keyframe(
     media: u32,
     ctrl: Option<&UdpSocket>,
     ctrl_dest: &str,
-    last: &mut Instant,
+    clock: &mut FeedbackClock,
     requests: &std::sync::atomic::AtomicU64,
 ) -> bool {
     // Requests are rate limited. A burst of loss would otherwise turn into
     // a burst of requests, which the Mac answers with a burst of full
     // pictures.
-    if last.elapsed() < KEYFRAME_REQUEST_INTERVAL {
+    if clock.last.elapsed() < KEYFRAME_REQUEST_INTERVAL {
         return false;
     }
-    *last = Instant::now();
+    clock.last = Instant::now();
     let Some(encryptor) = feedback.as_mut() else {
         return false;
     };
@@ -164,7 +184,7 @@ async fn request_keyframe(
     let packet = crate::rtcp::compound(
         sender,
         &[
-            crate::rtcp::full_intra_request(sender, media, 0),
+            crate::rtcp::full_intra_request(sender, media, clock.fir.next()),
             crate::rtcp::picture_loss_indication(sender, media),
             crate::rtcp::legacy_intra_request(media),
         ]
@@ -1263,7 +1283,7 @@ async fn connect(
             let mut gaps_seen = 0u64;
             // The last time a keyframe was asked for, so a burst of loss
             // does not turn into a burst of requests.
-            let mut last_request = Instant::now() - Duration::from_secs(10);
+            let mut clock = FeedbackClock::default();
             // The media generation the video task last saw.
             let mut last_generation = 0u64;
             // Pictures the shell did not take in time.
@@ -1313,7 +1333,7 @@ async fn connect(
                                         ssrc,
                                         ctrl.as_ref(),
                                         &ctrl_dest,
-                                        &mut last_request,
+                                        &mut clock,
                                         &video_counters.requests,
                                     ).await;
                                 } else {
@@ -1390,7 +1410,7 @@ async fn connect(
                                     ssrc,
                                     ctrl.as_ref(),
                                     &ctrl_dest,
-                                    &mut last_request,
+                                    &mut clock,
                                     &video_counters.requests,
                                 ).await {
                                     video_counters.recoveries.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1406,7 +1426,7 @@ async fn connect(
                                     ssrc,
                                     ctrl.as_ref(),
                                     &ctrl_dest,
-                                    &mut last_request,
+                                    &mut clock,
                                     &video_counters.requests,
                                 ).await;
                             }
@@ -1423,7 +1443,7 @@ async fn connect(
                                     ssrc,
                                     ctrl.as_ref(),
                                     &ctrl_dest,
-                                    &mut last_request,
+                                    &mut clock,
                                     &video_counters.requests,
                                 )
                                 .await;
@@ -1519,7 +1539,7 @@ async fn connect(
                         ssrc,
                         ctrl.as_ref(),
                         &ctrl_dest,
-                        &mut last_request,
+                        &mut clock,
                         &video_counters.requests,
                     )
                     .await;
@@ -1630,7 +1650,7 @@ async fn connect(
                         ssrc,
                         ctrl.as_ref(),
                         &ctrl_dest,
-                        &mut last_request,
+                        &mut clock,
                         &video_counters.requests,
                     )
                     .await
@@ -3072,7 +3092,7 @@ mod tests {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let dest = format!("{}", socket.local_addr().unwrap());
         let encryptor = SrtcpEncryptor::from_blob(&[3; 46]).unwrap();
-        let mut last = Instant::now() - Duration::from_secs(10);
+        let mut clock = FeedbackClock::default();
         let requests = std::sync::atomic::AtomicU64::new(0);
         request_keyframe(
             &mut Some(encryptor),
@@ -3080,7 +3100,7 @@ mod tests {
             0x3333_4444,
             Some(&socket),
             &dest,
-            &mut last,
+            &mut clock,
             &requests,
         )
         .await;
@@ -3108,7 +3128,7 @@ mod tests {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let dest = format!("{}", socket.local_addr().unwrap());
         let encryptor = SrtcpEncryptor::from_blob(&[3; 46]).unwrap();
-        let mut last = Instant::now() - Duration::from_secs(10);
+        let mut clock = FeedbackClock::default();
         let requests = std::sync::atomic::AtomicU64::new(0);
         request_keyframe(
             &mut Some(encryptor),
@@ -3116,7 +3136,7 @@ mod tests {
             2,
             Some(&socket),
             &dest,
-            &mut last,
+            &mut clock,
             &requests,
         )
         .await;
@@ -3131,7 +3151,7 @@ mod tests {
             2,
             Some(&socket),
             &dest,
-            &mut last,
+            &mut clock,
             &requests,
         )
         .await;
