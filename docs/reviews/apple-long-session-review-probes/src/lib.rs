@@ -103,6 +103,7 @@ mod review {
         );
     }
     #[test]
+    #[ignore = "fixed: the corrected-behaviour regression is in the production suite, see docs/plans/2026-10-20-apple-long-session-progress.md"]
     fn confirms_buffer_replays_delta_preceding_recovery_keyframe() {
         let mut b = pictures::PictureBuffer::with_capacity(3);
         for (id, key) in [(1, false), (2, false), (3, true), (4, false)] {
@@ -116,6 +117,7 @@ mod review {
         );
     }
     #[test]
+    #[ignore = "fixed: the corrected-behaviour regression is in the production suite, see docs/plans/2026-10-20-apple-long-session-progress.md"]
     fn confirms_stream_capacity_permanently_blocks_33rd_restart() {
         let mut r = receiver();
         let now = Instant::now();
@@ -144,6 +146,7 @@ mod review {
         assert_eq!(r.active(), Some(20));
     }
     #[test]
+    #[ignore = "fixed: the corrected-behaviour regression is in the production suite, see docs/plans/2026-10-20-apple-long-session-progress.md"]
     fn confirms_same_timestamp_tail_after_loss_published_as_complete_key() {
         let mut d = h264::Depacketizer::default();
         d.push(1, 100, false, &[0x65, 0xb8]);
@@ -155,6 +158,7 @@ mod review {
         assert_eq!(d.stats.lost_packets, 1);
     }
     #[test]
+    #[ignore = "fixed: the corrected-behaviour regression is in the production suite, see docs/plans/2026-10-20-apple-long-session-progress.md"]
     fn confirms_far_gap_lost_count_is_one_short() {
         let mut d = h264::Depacketizer::default();
         d.push(1, 1, true, &[0x65, 0xb8]);
@@ -166,6 +170,7 @@ mod review {
         assert_eq!(d.stats.lost_sequences.last(), Some(&18));
     }
     #[test]
+    #[ignore = "fixed: the corrected-behaviour regression is in the production suite, see docs/plans/2026-10-20-apple-long-session-progress.md"]
     fn confirms_config_sequence_is_reported_as_lost() {
         let mut d = h264::Depacketizer::default();
         d.push(1, 1, true, &[0x65, 0xb8]);
@@ -180,6 +185,7 @@ mod review {
         );
     }
     #[test]
+    #[ignore = "fixed: the corrected-behaviour regression is in the production suite, see docs/plans/2026-10-20-apple-long-session-progress.md"]
     fn confirms_numeric_reorder_wrap_loses_received_pre_wrap_packet() {
         let mut d = h264::Depacketizer::default();
         d.push(65533, 1, true, &[0x65, 0xb8]);
@@ -197,6 +203,7 @@ mod review {
         assert_eq!(d.stats.late, 1);
     }
     #[test]
+    #[ignore = "fixed: the corrected-behaviour regression is in the production suite, see docs/plans/2026-10-20-apple-long-session-progress.md"]
     fn confirms_fragment_buffer_exceeds_documented_8mib_limit() {
         let mut d = h264::Depacketizer::default();
         let mut payload = vec![0xaa; 65500];
@@ -212,6 +219,7 @@ mod review {
         );
     }
     #[test]
+    #[ignore = "fixed: the corrected-behaviour regression is in the production suite, see docs/plans/2026-10-20-apple-long-session-progress.md"]
     fn confirms_srtp_padding_is_removed_before_decryption() {
         let mut p = vec![0xa0, 123, 0, 1, 0, 0, 0, 1, 0, 0, 0, 10, 0x65, 0xb8, 0, 2];
         let mut tx = srtp::SrtpEncryptor::from_blob(&[0x12; 46]).unwrap();

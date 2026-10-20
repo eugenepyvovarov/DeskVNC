@@ -17,6 +17,14 @@ ui/node_modules/.bin/vitest run --config docs/reviews/apple-long-session-review-
 
 At the reviewed revision: **59 Rust tests passed** (48 imported existing module tests, 11 fresh characterizations) and **5 renderer characterizations passed**.
 
+**After the first round of fixes** (see
+[the progress document](../../plans/2026-10-20-apple-long-session-progress.md)),
+eight Rust characterizations are marked `#[ignore]` because the behaviour they
+assert no longer exists. Their corrected-behaviour regressions are in the
+production suite, named in that document. The ignored tests are kept as the
+record of what `abfaecb` did; a green run here no longer means "the defects are
+present", and a red one would mean a fix regressed.
+
 Rust cases cover permanent stream-33 rejection, retired-SSRC reuse, stale deltas after recovery keyframes, partial IDR publication after loss, an off-by-one missing count, configuration sequence accounting, numeric order across RTP wrap, unbounded unfinished FU accumulation, encrypted RTP padding, ROC-2 continuation after reset, and replay readmission after reset.
 
 Renderer cases cover unconfigured decode after backlog reset with a non-IDR independent picture, accumulating errors plus a same-size reset signal retaining the failure latch, missing recovery callback after async decoder error, unbounded unmatched timestamp metadata, and unclosed decoder ownership after failed configuration.
