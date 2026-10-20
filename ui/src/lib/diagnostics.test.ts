@@ -3,7 +3,11 @@ import { History, findings, lossFraction, report, type Sample } from "./diagnost
 import type { AppleMediaState } from "./appleMedia";
 
 function sample(over: Partial<Sample> = {}): Sample {
-  return { at: 0, throughput: 4e6, fps: 30, loss: 0, jitter: 10, queued: 0, decodeMs: 5, ...over };
+  return {
+    at: 0, throughput: 4e6, fps: 30, loss: 0, jitter: 10, queued: 0, decodeMs: 5,
+    acceleration: "hardware", behind: false,
+    ...over,
+  };
 }
 
 function media(over: Partial<AppleMediaState> = {}): AppleMediaState {
@@ -48,6 +52,23 @@ describe("findings", () => {
     expect(list[0].severity).toBe("bad");
     expect(list[0].title).toContain("8.0%");
     expect(list[0].detail).toContain("MTU");
+  });
+
+  it("only claims software decoding when the webview said so", () => {
+    // A slow decode is not evidence of a software decoder. Saying it was is
+    // how a guess becomes a wrong diagnosis.
+    const slow = findings(sample({ decodeMs: 400 }));
+    expect(slow.some((f) => f.title === "Decoding on the CPU")).toBe(false);
+    expect(slow.some((f) => f.title.includes("400 ms"))).toBe(true);
+
+    const software = findings(sample({ decodeMs: 400, acceleration: "software" }));
+    expect(software.some((f) => f.title === "Decoding on the CPU")).toBe(true);
+  });
+
+  it("reports a decoder that dropped its queue as a warning", () => {
+    const list = findings(sample({ behind: true }));
+    expect(list[0].severity).toBe("warning");
+    expect(list[0].title).toContain("could not keep up");
   });
 
   it("explains a growing decoder queue as this machine being behind", () => {

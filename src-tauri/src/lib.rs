@@ -23,27 +23,6 @@ use tauri::{Manager, RunEvent};
 use state::AppState;
 
 pub fn run() {
-    use tracing_subscriber::layer::SubscriberExt;
-    use tracing_subscriber::util::SubscriberInitExt;
-
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,deskvncviewer_lib=debug"));
-    let registry = tracing_subscriber::registry().with(filter);
-    // The terminal gets colours and the file does not; both get the same
-    // lines, so a report can quote what a developer would have watched.
-    let stderr = tracing_subscriber::fmt::layer();
-    match logging::log_dir().and_then(|dir| logging::LogFile::open(&dir).ok()) {
-        Some(file) => registry
-            .with(stderr)
-            .with(
-                tracing_subscriber::fmt::layer()
-                    .with_ansi(false)
-                    .with_writer(file),
-            )
-            .init(),
-        None => registry.with(stderr).init(),
-    }
-
     let mut builder = tauri::Builder::default();
 
     #[cfg(desktop)]
@@ -82,6 +61,10 @@ pub fn run() {
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_store::Builder::new().build())
         .setup(|app| {
+            // Logging goes next to the rest of this app's data. It is set up
+            // here rather than before the builder because the directory is
+            // the shell's, not a guess at one.
+            logging::init(app.handle());
             // Storage lives under the per-user Tauri app data dir.
             let data_dir = app.path().app_data_dir()?;
             std::fs::create_dir_all(&data_dir)?;

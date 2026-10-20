@@ -40,6 +40,10 @@ export interface Sample {
   queued: number;
   /** Submission-to-output decoder delay, in milliseconds. */
   decodeMs: number;
+  /** What the webview configured: hardware or software. */
+  acceleration: "hardware" | "software" | "unknown";
+  /** The decoder dropped its queue because it could not keep up. */
+  behind: boolean;
 }
 
 /** How many seconds of history the trend line keeps. */
@@ -139,11 +143,35 @@ export function findings(sample: Sample, totals: { stalls?: number; dropped?: nu
     });
   }
 
-  if (sample.decodeMs >= 60) {
+  if (sample.behind) {
+    out.push({
+      severity: "warning",
+      title: "The decoder could not keep up and dropped its queue",
+      detail: "Pictures are shown fresh rather than late, and a new one is requested. A smaller stream size is the real fix.",
+    });
+  }
+
+  // Reported only when the webview said so. A slow decode time is not
+  // evidence of software decoding, and saying it was is how a guess turns
+  // into a wrong diagnosis.
+  if (sample.acceleration === "software") {
+    out.push({
+      severity: "notice",
+      title: "Decoding on the CPU",
+      detail: "The webview did not take a hardware decoder. A hardware path would leave far more headroom at this picture size.",
+    });
+  }
+
+  if (sample.decodeMs >= 250) {
+    out.push({
+      severity: "warning",
+      title: `A picture takes ${Math.round(sample.decodeMs)} ms to decode`,
+      detail: "This includes any time spent waiting in the decoder queue, so it grows when the decoder cannot keep up.",
+    });
+  } else if (sample.decodeMs >= 60) {
     out.push({
       severity: "notice",
       title: `Decoding takes ${Math.round(sample.decodeMs)} ms per picture`,
-      detail: "Software decoding. Hardware decoding would leave more headroom.",
     });
   }
 
@@ -189,7 +217,7 @@ export function findings(sample: Sample, totals: { stalls?: number; dropped?: nu
 export function sampleFrom(
   media: AppleMediaState | null,
   stats: { throughput_bps?: number; fps?: number } | null,
-  decoder: { queued?: number; latencyMs?: number } | null,
+  decoder: { queued?: number; latencyMs?: number; acceleration?: "hardware" | "software"; behind?: boolean } | null,
   at: number,
 ): Sample {
   return {
@@ -200,6 +228,8 @@ export function sampleFrom(
     jitter: media?.jitterMs ?? 0,
     queued: decoder?.queued ?? 0,
     decodeMs: decoder?.latencyMs ?? 0,
+    acceleration: decoder?.acceleration ?? "unknown",
+    behind: decoder?.behind ?? false,
   };
 }
 
@@ -216,7 +246,9 @@ export interface ReportInput {
   decoded?: { w: number; h: number } | null;
   media: AppleMediaState | null;
   stats: { throughput_bps?: number; fps?: number; rtt_ms?: number; rtt_source?: string } | null;
-  decoder: { queued?: number; submitted?: number; decoded?: number; latencyMs?: number } | null;
+  decoder:
+    | { queued?: number; submitted?: number; decoded?: number; latencyMs?: number; acceleration?: "hardware" | "software"; behind?: boolean }
+    | null;
   queue: { depth?: number; bytes?: number; dropped?: number } | null;
   findings: Finding[];
   history: readonly Sample[];
@@ -274,6 +306,7 @@ export function report(input: ReportInput): string {
   if (input.decoder) {
     const d = input.decoder;
     push(`  decoder:    ${d.queued ?? 0} queued, ${d.decoded ?? 0} of ${d.submitted ?? 0} decoded, ${Math.round(d.latencyMs ?? 0)} ms`);
+    push(`  decoding:   ${d.acceleration ?? "unknown"}${d.behind ? ", dropped its queue" : ""}`);
   }
   if (input.queue) {
     const q = input.queue;

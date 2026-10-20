@@ -464,6 +464,10 @@ function SessionView({
     }
     rendererRef.current = renderer;
     renderer.setContinuousH264(params.protocol === "apple");
+    // The decoder drops its queue when it cannot keep up, and a picture that
+    // references what was dropped cannot be decoded. The session asks the
+    // Mac for an independent one; the shell rate limits the request.
+    renderer.onDecoderBehind = () => sessionRef.current.refreshScreen();
     // The pointer preference was read before this renderer existed; see the
     // effect that owns `showRemoteCursorRef`.
     renderer.setCursorVisible(showRemoteCursorRef.current);
@@ -733,6 +737,8 @@ function SessionView({
     pictureHeight: number;
     frameWidth: number;
     frameHeight: number;
+    acceleration: "hardware" | "software";
+    behind: boolean;
   } | null>(null);
   // The renderer's own queue, sampled on the same clock as the decoder, so
   // the diagnostics panel can say whether a slow picture is the decoder or

@@ -153,6 +153,25 @@ interface H264Context {
 const H264_MAX_CONTEXTS = 64;
 
 /**
+ * How many pictures may wait inside the decoder.
+ *
+ * `decode()` is asynchronous and returns immediately, so a decoder that is
+ * slower than the stream silently accumulates work: the queue grows, and
+ * every picture is shown later than the one before it until the display is
+ * seconds behind. A queue this deep already means the decoder cannot keep
+ * up, so the stream is cut back to independent pictures and the shell is
+ * asked for one instead of queueing pictures nobody will see in time.
+ */
+const H264_MAX_DECODE_QUEUE = 4;
+
+/**
+ * How often the renderer may ask the shell for a fresh picture. The shell
+ * rate limits the request itself; this only stops a burst of updates from
+ * becoming a burst of asks.
+ */
+const H264_BEHIND_ASK_INTERVAL_MS = 1000;
+
+/**
  * How many times a stream's decoder may fail before the stream is given up
  * on. Each failure is followed by a fresh attempt on the next independent
  * picture, so a couple of failures are a hiccup rather than a dead end.
@@ -644,6 +663,15 @@ export class WebGLRenderer {
    * hardware path is refused, and the change is reported.
    */
   private h264Acceleration: VideoDecoderConfig["hardwareAcceleration"] = "prefer-hardware";
+  /**
+   * Whether the webview took the hardware path.
+   *
+   * `configure()` accepting `prefer-hardware` is the only signal WebCodecs
+   * gives, so this says what was accepted rather than what was requested.
+   * It is what the diagnostics panel reports, because claiming "software"
+   * from a slow decode time would be a guess dressed up as a measurement.
+   */
+  private hardwareDecoding = false;
   /** Pictures handed to the decoder, and pictures that came out of it. */
   private mediaSubmitted = 0;
   private mediaDecoded = 0;
@@ -654,6 +682,19 @@ export class WebGLRenderer {
   private mediaPictureHeight = 0;
   private continuousH264 = false;
   private latestVideo: { frame: VideoFrame; ctx: H264Context } | null = null;
+  /**
+   * The decoder fell behind and its queue was dropped. Until an independent
+   * picture arrives, delta pictures cannot be decoded anyway, so they are
+   * thrown away rather than queued.
+   */
+  private h264Behind = false;
+  private behindAskedAt = 0;
+  /**
+   * Called when the decoder had to drop its queue, so the session can ask
+   * the Mac for a fresh picture. Set by the view; the renderer has no
+   * channel to the protocol driver of its own.
+   */
+  onDecoderBehind: (() => void) | null = null;
 
   /** Full-screen media streams must not wait for a frame before feeding the next. */
   setContinuousH264(enabled: boolean): void {
@@ -961,6 +1002,10 @@ export class WebGLRenderer {
     /** The size of the framebuffer the picture is drawn into. */
     frameWidth: number;
     frameHeight: number;
+    /** `hardware` or `software`, as the webview actually configured it. */
+    acceleration: "hardware" | "software";
+    /** The decoder could not keep up and its queue was dropped. */
+    behind: boolean;
   } {
     let queued = 0;
     for (const ctx of this.h264.values()) {
@@ -975,6 +1020,11 @@ export class WebGLRenderer {
       pictureHeight: this.mediaPictureHeight,
       frameWidth: this.fbWidth,
       frameHeight: this.fbHeight,
+      // What the webview actually agreed to, not what was asked for. A
+      // fallback to software is a fact about this machine, and the panel
+      // should not have to guess it from a duration.
+      acceleration: this.hardwareDecoding ? "hardware" : "software",
+      behind: this.h264Behind,
     };
   }
 
@@ -1191,6 +1241,16 @@ export class WebGLRenderer {
       return;
     }
 
+    // A decoder that is behind is not helped by more pictures. Drop the
+    // queue, and from then on keep only independent pictures until one
+    // arrives: a delta without its references is not decodable, and queueing
+    // it is what made the picture arrive seconds late.
+    if (ctx.decoder.decodeQueueSize >= H264_MAX_DECODE_QUEUE) {
+      this.dropBehind(ctx, id);
+    }
+    if (this.h264Behind && !isKey) return;
+    if (this.h264Behind && isKey) this.h264Behind = false;
+
     ctx.timestamp += 1000; // 1 ms apart: monotonic is all the decoder needs
     const ts = ctx.timestamp;
     ctx.submitted.set(ts, performance.now());
@@ -1219,6 +1279,31 @@ export class WebGLRenderer {
       return;
     }
     this.uploadVideoFrame(frame, ctx);
+  }
+
+  /**
+   * The decoder cannot keep up: throw the work away and ask for a picture
+   * that can be shown.
+   *
+   * Resetting rather than closing keeps the context's rectangle and
+   * acceleration, so the key picture that answers the ask decodes into the
+   * same place. The ask is rate limited here as well as in the shell, so a
+   * backlog of updates cannot turn into a backlog of requests.
+   */
+  private dropBehind(ctx: H264Context, id: number): void {
+    this.h264Behind = true;
+    for (const settle of Array.from(ctx.waiters.values())) settle(null);
+    ctx.waiters.clear();
+    ctx.submitted.clear();
+    try {
+      ctx.decoder.reset();
+    } catch {
+      this.closeH264(id);
+    }
+    const now = performance.now();
+    if (now - this.behindAskedAt < H264_BEHIND_ASK_INTERVAL_MS) return;
+    this.behindAskedAt = now;
+    this.onDecoderBehind?.();
   }
 
   /**
@@ -1368,6 +1453,7 @@ export class WebGLRenderer {
         try {
           ctx.decoder.configure({ ...stream, hardwareAcceleration: acceleration });
           ctx.acceleration = acceleration;
+          this.hardwareDecoding = acceleration === "prefer-hardware";
           configured = true;
           break;
         } catch {
@@ -1414,6 +1500,7 @@ export class WebGLRenderer {
       // Say it. A picture that is not perfect beats a pane that is empty,
       // but a silent change of decoder is not something to hide.
       this.h264Acceleration = "prefer-software";
+      this.hardwareDecoding = false;
       this.notice("Hardware H.264 decoding was refused; falling back to software decoding.");
     }
     if (this.h264Failures >= H264_MAX_FAILURES) {

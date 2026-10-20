@@ -20,7 +20,9 @@ import { History, findings, sampleFrom, type Finding, type Sample, lossFraction 
 export interface DiagnosticsInput {
   media: AppleMediaState | null;
   stats: { throughput_bps?: number; fps?: number; rtt_ms?: number; rtt_source?: string } | null;
-  decoder: { queued?: number; submitted?: number; decoded?: number; latencyMs?: number } | null;
+  decoder:
+    | { queued?: number; submitted?: number; decoded?: number; latencyMs?: number; acceleration?: "hardware" | "software"; behind?: boolean }
+    | null;
   queue: { depth?: number; bytes?: number; dropped?: number } | null;
 }
 
@@ -33,7 +35,7 @@ export interface DiagnosticsState {
 }
 
 /** One second of healthy stream, before the first real sample arrives. */
-const IDLE: Sample = { at: 0, throughput: 0, fps: 0, loss: 0, jitter: 0, queued: 0, decodeMs: 0 };
+const IDLE: Sample = { at: 0, throughput: 0, fps: 0, loss: 0, jitter: 0, queued: 0, decodeMs: 0, acceleration: "unknown", behind: false };
 
 export function useConnectionDiagnostics(
   input: DiagnosticsInput,

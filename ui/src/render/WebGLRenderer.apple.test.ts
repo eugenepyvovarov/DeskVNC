@@ -208,18 +208,31 @@ it("does not rebuild the decoder for a key picture that is not a reset", async (
 
 it("reports what the decoder is doing", () => {
   // The queue is how much the decoder has been given and has not finished,
-  // and the delay is how old the picture on screen is.
+  // and the delay is how old the picture on screen is. The acceleration is
+  // reported from what the webview accepted, never inferred from the delay.
   const renderer = Object.assign(Object.create(WebGLRenderer.prototype), {
     h264: new Map([[0, { decoder: { decodeQueueSize: 3 } }]]),
     mediaSubmitted: 10,
     mediaDecoded: 8,
     mediaLatencyMs: 42.4,
+    hardwareDecoding: true,
+    h264Behind: false,
+    fbWidth: 3600,
+    fbHeight: 2338,
+    mediaPictureWidth: 3600,
+    mediaPictureHeight: 2338,
   });
   expect(renderer.getMediaStats()).toEqual({
     queued: 3,
     submitted: 10,
     decoded: 8,
     latencyMs: 42,
+    pictureWidth: 3600,
+    pictureHeight: 2338,
+    frameWidth: 3600,
+    frameHeight: 2338,
+    acceleration: "hardware",
+    behind: false,
   });
 });
 

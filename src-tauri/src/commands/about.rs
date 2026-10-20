@@ -54,10 +54,7 @@ pub fn about_info() -> AboutInfo {
         os_version: info.version().to_string(),
         arch: std::env::consts::ARCH.into(),
         webview_version: tauri::webview_version().unwrap_or_else(|_| "unknown".into()),
-        log_path: crate::logging::log_dir()
-            .map(|dir| dir.join("deskvnc.log"))
-            .filter(|path| path.exists())
-            .map(|path| path.display().to_string()),
+        log_path: crate::logging::log_path().map(|path| path.display().to_string()),
     }
 }
 

@@ -15,7 +15,7 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 /// How large the log may grow before it is started over.
 const MAX_LOG_BYTES: u64 = 8 * 1024 * 1024;
@@ -23,7 +23,6 @@ const MAX_LOG_BYTES: u64 = 8 * 1024 * 1024;
 /// The log file, and where it is.
 pub struct LogFile {
     file: Mutex<std::fs::File>,
-    #[cfg(test)]
     path: PathBuf,
 }
 
@@ -47,12 +46,10 @@ impl LogFile {
         }
         Ok(Self {
             file: Mutex::new(file),
-            #[cfg(test)]
             path,
         })
     }
 
-    #[cfg(test)]
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -89,10 +86,51 @@ impl Write for LogWriter<'_> {
     }
 }
 
-/// Where the log lives, next to the database and the thumbnails.
-pub fn log_dir() -> Option<PathBuf> {
-    directories::ProjectDirs::from("com", "deskvncviewer", "DeskVNCViewer")
-        .map(|dirs| dirs.data_dir().join("logs"))
+/// The log file this run opened, if it opened one.
+///
+/// Set once at startup and read afterwards by the About command, so a
+/// report can name the file without guessing where a framework would have
+/// put it. The directory is the shell's own app data directory, the same one
+/// the database and the thumbnails live in: a second convention for one
+/// directory is how a log ends up somewhere nobody looks.
+static LOG_PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
+
+/// Start logging to `dir/deskvnc.log`, keeping the terminal output too.
+pub fn init(app: &tauri::AppHandle) {
+    use tauri::Manager;
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,deskvncviewer_lib=debug"));
+    let registry = tracing_subscriber::registry().with(filter);
+    // The terminal gets colours and the file does not; both get the same
+    // lines, so a report can quote what a developer would have watched.
+    let stderr = tracing_subscriber::fmt::layer();
+    let file = app
+        .path()
+        .app_data_dir()
+        .ok()
+        .map(|dir| dir.join("logs"))
+        .and_then(|dir| LogFile::open(&dir).ok());
+    let path = file.as_ref().map(|log| log.path().to_path_buf());
+    let _ = LOG_PATH.set(path);
+    match file {
+        Some(file) => registry
+            .with(stderr)
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_ansi(false)
+                    .with_writer(file),
+            )
+            .init(),
+        None => registry.with(stderr).init(),
+    }
+}
+
+/// The log file this run writes, once [`init`] has run.
+pub fn log_path() -> Option<PathBuf> {
+    LOG_PATH.get().cloned().flatten()
 }
 
 #[cfg(test)]

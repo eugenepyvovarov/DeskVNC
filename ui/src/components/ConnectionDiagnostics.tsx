@@ -12,7 +12,7 @@
  */
 
 import { useCallback, useEffect, useState, type ReactNode } from "react";
-import { safeInvoke } from "../lib/tauri";
+import { safeInvoke, writeClipboard } from "../lib/tauri";
 import type { AppleMediaState } from "../lib/appleMedia";
 import { normalize, report, type Finding, type Sample } from "../lib/diagnostics";
 import { useConnectionDiagnostics, lossPercent } from "../hooks/useConnectionDiagnostics";
@@ -62,7 +62,9 @@ export interface ConnectionDiagnosticsProps {
   host: string;
   media: AppleMediaState | null;
   stats: { throughput_bps?: number; fps?: number; rtt_ms?: number; rtt_source?: string } | null;
-  decoder: { queued?: number; submitted?: number; decoded?: number; latencyMs?: number } | null;
+  decoder:
+    | { queued?: number; submitted?: number; decoded?: number; latencyMs?: number; acceleration?: "hardware" | "software"; behind?: boolean }
+    | null;
   queue: { depth?: number; bytes?: number; dropped?: number } | null;
   requested?: { w: number; h: number } | null;
   layout?: { w: number; h: number } | null;
@@ -118,10 +120,10 @@ export function ConnectionDiagnostics(props: ConnectionDiagnosticsProps): ReactN
       findings: diagnostics.findings,
       history: diagnostics.history,
     });
-    void navigator.clipboard
-      .writeText(text)
-      .then(() => setCopied("Copied"))
-      .catch(() => setCopied("Could not copy"));
+    // Through the shell, not `navigator.clipboard`: WebKit only honours the
+    // DOM API while a user gesture is still active, and the copy is the last
+    // step of building a report.
+    void writeClipboard(text).then((ok) => setCopied(ok ? "Copied" : "Could not copy"));
     window.setTimeout(() => setCopied(null), 2000);
   }, [about, diagnostics, props]);
 
@@ -158,6 +160,9 @@ export function ConnectionDiagnostics(props: ConnectionDiagnosticsProps): ReactN
         <Row label="Jitter" value={`${Math.round(sample.jitter)} ms`} />
         <Row label="Decoder queue" value={`${sample.queued}`} />
         <Row label="Decode" value={`${Math.round(sample.decodeMs)} ms`} />
+        {props.decoder?.acceleration
+          ? <Row label="Decoder" value={props.decoder.acceleration} />
+          : null}
         {props.media ? <Row label="Stalls" value={`${props.media.stalls}`} /> : null}
         {props.media ? <Row label="Dropped" value={`${props.media.dropped}`} /> : null}
         {props.media ? <Row label="Recoveries" value={`${props.media.recoveries}`} /> : null}

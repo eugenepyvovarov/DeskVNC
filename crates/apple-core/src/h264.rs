@@ -26,6 +26,15 @@ const MAX_REORDER_BYTES: usize = 512 * 1024;
 /// How far ahead of the expected sequence number a packet may be and still
 /// count as reordered rather than lost.
 const MAX_LOOKAHEAD: u16 = 16;
+/// The largest hole that is treated as packets lost on the way.
+///
+/// A picture is tens of packets, so a hole of a thousand is not a loss
+/// burst: it is the stream having jumped, which happens when the encoder
+/// restarts and starts numbering again. Counting that as loss reported
+/// 65573 lost packets on a session that had lost two, and sent a retransmit
+/// request for every "missing" packet, which is the storm the rate limits
+/// elsewhere exist to prevent.
+const MAX_LOSS_GAP: u16 = 1000;
 /// How long a packet may wait for the ones before it. A hole that is not
 /// filled within this time is a loss, and the picture it belongs to is
 /// thrown away rather than left half-assembled.
@@ -57,6 +66,9 @@ pub struct Stats {
     pub access_units: u64,
     /// Half-assembled pictures thrown away because a packet was missing.
     pub discarded: u64,
+    /// Times the sequence numbers jumped instead of skipping a packet: an
+    /// encoder restart or a reset stream, not a network loss.
+    pub discontinuities: u64,
 }
 
 /// One access unit, ready for the decoder.
@@ -144,6 +156,17 @@ impl Depacketizer {
                 } else if ahead <= MAX_LOOKAHEAD {
                     // Close enough behind to be reordering rather than loss.
                     self.buffer(seq, timestamp, marker, payload);
+                } else if ahead > MAX_LOSS_GAP {
+                    // The numbering jumped. That is a restart, not a loss,
+                    // so nothing is asked for and nothing is counted as lost
+                    // on the way; the picture in hand is dropped because its
+                    // references are gone.
+                    self.stats.discontinuities += 1;
+                    self.discard_picture();
+                    self.expected = Some(seq);
+                    self.assemble(timestamp, marker, payload);
+                    self.expected = Some(seq.wrapping_add(1));
+                    self.drain();
                 } else {
                     // Too far ahead: the packets in between are lost.
                     self.report_gap(expected, u64::from(ahead - 1));
@@ -575,6 +598,26 @@ mod tests {
         assert_eq!(&au.annex_b[..4], &[0, 0, 0, 1]);
         // reconstructed NAL header is 0x65 (IDR) then aa bb
         assert!(au.annex_b.windows(3).any(|w| w == [0x65, 0xaa, 0xbb]));
+    }
+
+    #[test]
+    fn a_jump_in_the_sequence_numbers_is_a_restart_not_a_loss() {
+        // The encoder restarted and began numbering again. Counting the hole
+        // as loss reported 65573 lost packets on a session that had lost
+        // two, and asked the Mac for every one of them.
+        let mut d = Depacketizer::default();
+        d.push(100, 1, true, &[0x61, 0xc0]);
+        assert_eq!(d.stats.lost_packets, 0);
+        d.push(30_000, 2, true, &[0x61, 0xc0]);
+        assert_eq!(d.stats.lost_packets, 0, "a jump is not loss");
+        assert_eq!(d.stats.discontinuities, 1);
+        assert!(d.stats.lost_sequences.is_empty(), "nothing to ask for");
+        // A hole inside the stream is still loss, and still asked for: the
+        // 28 packets between the expected one and the one that arrived.
+        d.push(30_030, 3, true, &[0x61, 0xc0]);
+        assert_eq!(d.stats.lost_packets, 28);
+        assert_eq!(d.stats.lost_sequences.first(), Some(&30_001));
+        assert_eq!(d.stats.lost_sequences.len(), 28);
     }
 
     #[test]
