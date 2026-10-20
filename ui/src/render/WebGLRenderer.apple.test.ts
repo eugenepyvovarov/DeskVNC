@@ -134,6 +134,54 @@ it("accepts the stream's own desktop after it keeps disagreeing with the layout"
   expect(renderer.latestVideo?.ctx.stretch).toBe(false);
 });
 
+it("reconfigures a decoder that a backlog reset left unconfigured", () => {
+  // WebCodecs reset() clears the configuration. An independent non-IDR
+  // picture then reached decode() without configure(), was refused, and the
+  // context was closed: the picture was lost even though it could start a
+  // decoder.
+  let decoders = 0;
+  let configureCalls = 0;
+  let decodeCalls = 0;
+  let decodeThrows = 0;
+  vi.stubGlobal("VideoDecoder", class {
+    state = "unconfigured";
+    decodeQueueSize = 0;
+    configured = false;
+    constructor(_callbacks: unknown) { decoders += 1; }
+    configure() { this.configured = true; this.state = "configured"; configureCalls += 1; }
+    reset() { this.configured = false; this.state = "unconfigured"; }
+    decode() {
+      decodeCalls += 1;
+      if (!this.configured) { decodeThrows += 1; throw new Error("unconfigured"); }
+    }
+    close() { this.state = "closed"; }
+  });
+  vi.stubGlobal("EncodedVideoChunk", class {
+    constructor(public init: unknown) { Object.assign(this, init); }
+  });
+  const renderer = sizedDecoderHarness();
+  const key = new Uint8Array([0, 0, 0, 1, 0x65, 0xaa]);
+  const delta = new Uint8Array([0, 0, 0, 1, 0x61, 0xbb]);
+  return (async () => {
+    await renderer.decodeH264({ h264Context: 0, h264Key: true, h264Reset: true, payload: key });
+    expect(decoders).toBe(1);
+    // Fill the decoder queue so the next picture drops the backlog and
+    // resets the decoder.
+    const ctx = renderer.h264.get(0)!;
+    ctx.decoder.decodeQueueSize = 4;
+    await renderer.decodeH264({ h264Context: 0, h264Key: false, payload: delta });
+    expect(ctx.decoder.state).toBe("unconfigured");
+    expect(decodeThrows).toBe(0);
+    // An independent non-IDR picture arrives as the recovery picture.
+    await renderer.decodeH264({ h264Context: 0, h264Key: true, h264Reset: false, payload: key });
+    expect(decoders).toBe(2);
+    expect(configureCalls).toBe(2);
+    expect(decodeThrows).toBe(0);
+    expect(decodeCalls).toBe(2);
+    expect(renderer.h264.get(0)).toBeDefined();
+  })();
+});
+
 it("lets the first picture define the size when no layout is known yet", () => {
   let output: (frame: unknown) => void = () => {};
   vi.stubGlobal("VideoDecoder", class {

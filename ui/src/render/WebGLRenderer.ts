@@ -148,6 +148,11 @@ interface H264Context {
   /** Whether this decoder has produced a picture yet. */
   outputSeen: boolean;
   /**
+   * Whether the decoder currently holds a configuration. WebCodecs clears it
+   * on `reset()`, and decoding an unconfigured decoder throws.
+   */
+  configured: boolean;
+  /**
    * The pictures are a different size from the framebuffer, so they are
    * scaled into it rather than cropping to its top-left corner.
    */
@@ -1298,6 +1303,13 @@ export class WebGLRenderer {
     if (r.payload.byteLength === 0) return; // control message: nothing to decode
 
     let ctx = this.h264.get(id);
+    if (ctx && ctx.configured === false) {
+      // The backlog reset left the decoder unconfigured, so `decode()` would
+      // throw and throw the picture away. Rebuild it from the picture that
+      // is arriving now, which is the key picture recovery asked for.
+      this.closeH264(id);
+      ctx = undefined;
+    }
     if (r.h264Reset || !ctx) {
       if (ctx) this.closeH264(id);
       // A decoder can only start on an IDR; anything else is undecodable.
@@ -1366,6 +1378,9 @@ export class WebGLRenderer {
     ctx.submitted.clear();
     try {
       ctx.decoder.reset();
+      // WebCodecs drops the configuration on reset; the next picture rebuilds
+      // the decoder instead of being handed to one that cannot decode.
+      ctx.configured = false;
     } catch {
       this.closeH264(id);
     }
@@ -1456,6 +1471,7 @@ export class WebGLRenderer {
       submitted: new Map(),
       acceleration: this.h264Acceleration,
       outputSeen: false,
+      configured: true,
       stretch: false,
     };
     try {
@@ -1601,6 +1617,7 @@ export class WebGLRenderer {
         }
       }
       if (!configured) throw new Error("H.264 configure failed");
+      ctx.configured = true;
     } catch {
       // The configuration itself was refused. Try again on the next key
       // picture, a bounded number of times, and then say what is wrong.
