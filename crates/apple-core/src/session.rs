@@ -1706,6 +1706,10 @@ async fn connect(
         }
     });
 
+    // Whether this attempt ended because a worker died. That is a failed
+    // attempt, not a session the person ended, and the supervisor has to be
+    // able to tell the two apart.
+    let mut worker_failed = false;
     loop {
         tokio::select! {
             _ = cancel.cancelled() => break,
@@ -2159,8 +2163,13 @@ async fn connect(
                 // A video receiver that died leaves a session that reports
                 // itself connected and shows nothing. The supervisor
                 // restarts it.
-                if video_task.is_finished() {
-                    tracing::warn!("the video receiver stopped; the session will be restarted");
+                if video_task.is_finished() || picture_task.is_finished() {
+                    worker_failed = true;
+                    tracing::warn!(
+                        video = video_task.is_finished(),
+                        publisher = picture_task.is_finished(),
+                        "an Apple media worker stopped; the attempt will be restarted"
+                    );
                     break;
                 }
                 // Finish, report or time out a resize round.
@@ -2277,6 +2286,12 @@ async fn connect(
     let _ = tokio::time::timeout(Duration::from_secs(25), display_task).await;
     video_task.abort();
     picture_task.abort();
+    if worker_failed {
+        // The control connection was fine; the pipeline that turns it into a
+        // picture was not. Reporting this as a clean end made the supervisor
+        // stop for ever, which is a connected session with an empty pane.
+        return Err(SessionError::new("an Apple media worker stopped"));
+    }
     let _ = fail(events, "disconnected").await;
     Ok(())
 }
