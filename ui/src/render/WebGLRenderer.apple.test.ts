@@ -134,6 +134,67 @@ it("accepts the stream's own desktop after it keeps disagreeing with the layout"
   expect(renderer.latestVideo?.ctx.stretch).toBe(false);
 });
 
+it("does not latch a failure that healthy output has recovered from", () => {
+  // Three errors spread across a long healthy session used to add up until
+  // video was disabled for the rest of the renderer's life.
+  let callbacks: { error: (e: Error) => void; output: (f: unknown) => void } | null = null;
+  vi.stubGlobal("VideoDecoder", class {
+    state = "configured";
+    constructor(c: { error: (e: Error) => void; output: (f: unknown) => void }) { callbacks = c; }
+    configure() {}
+    close() { this.state = "closed"; }
+  });
+  const renderer = sizedDecoderHarness();
+  for (let round = 0; round < 3; round++) {
+    renderer.createH264({ x: 0, y: 0, w: 3600, h: 2338 }, 0, new Uint8Array());
+    callbacks!.error(new Error("decoder hiccup"));
+    expect(renderer.h264Failures).toBe(1);
+    // A fresh decoder produces a picture, which is what recovery looks like.
+    renderer.createH264({ x: 0, y: 0, w: 3600, h: 2338 }, 0, new Uint8Array());
+    callbacks!.output({ displayWidth: 3600, displayHeight: 2338, timestamp: 1, close: vi.fn() });
+    expect(renderer.h264Failures).toBe(0);
+  }
+  expect(renderer.h264Failed).toBe(false);
+});
+
+it("clears transient decoder state when a new attempt begins", () => {
+  // A reconnect can arrive at the same size, so the renderer must be told
+  // about the new attempt explicitly or a failed decoder stays latched.
+  const renderer = sizedDecoderHarness({
+    h264Failed: true, h264Failures: 3, h264Behind: true, closeAllH264: vi.fn(),
+  });
+  renderer.beginConnectionAttempt();
+  expect(renderer.h264Failed).toBe(false);
+  expect(renderer.h264Failures).toBe(0);
+  expect(renderer.h264Behind).toBe(false);
+  // A platform with no decoder at all does not become able because of a
+  // reconnect, so that fact is kept.
+  const unsupported = sizedDecoderHarness({
+    h264Failed: true, h264Unsupported: true, closeAllH264: vi.fn(),
+  });
+  unsupported.beginConnectionAttempt();
+  expect(unsupported.h264Failed).toBe(true);
+});
+
+it("asks for a fresh picture when a decoder fails", () => {
+  let error: (e: Error) => void = () => {};
+  vi.stubGlobal("VideoDecoder", class {
+    state = "configured";
+    constructor(callbacks: { error: typeof error }) { error = callbacks.error; }
+    configure() {}
+    close() { this.state = "closed"; }
+  });
+  const behind = vi.fn();
+  const renderer = sizedDecoderHarness({ onDecoderBehind: behind, behindAskedAt: 0 });
+  renderer.createH264({ x: 0, y: 0, w: 3600, h: 2338 }, 0, new Uint8Array());
+  error(new Error("decode failed"));
+  expect(behind).toHaveBeenCalledOnce();
+  // A burst of errors must not become a burst of requests.
+  renderer.createH264({ x: 0, y: 0, w: 3600, h: 2338 }, 0, new Uint8Array());
+  error(new Error("decode failed again"));
+  expect(behind).toHaveBeenCalledOnce();
+});
+
 it("reconfigures a decoder that a backlog reset left unconfigured", () => {
   // WebCodecs reset() clears the configuration. An independent non-IDR
   // picture then reached decode() without configure(), was refused, and the

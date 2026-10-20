@@ -1112,6 +1112,11 @@ function SessionView({
    */
   useEffect(() => {
     if (session.state.state === "connected") {
+      // A connection can come back with exactly the geometry of the one
+      // before it, so a size change is not an attempt boundary. This call
+      // is: transient decoder state must not outlive the attempt that made
+      // it.
+      rendererRef.current?.beginConnectionAttempt();
       setConnectedAt((previous) => previous ?? Date.now());
     } else if (session.state.state === "disconnected") {
       // A reconnect builds a new connection underneath, so the clock starts

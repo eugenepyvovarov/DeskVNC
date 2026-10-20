@@ -756,6 +756,25 @@ export class WebGLRenderer {
    */
   onDecoderBehind: (() => void) | null = null;
 
+  /**
+   * A new connection attempt is starting.
+   *
+   * A reconnect can arrive with exactly the geometry of the previous one, so
+   * a size change is not an attempt boundary. Called by the view when the
+   * session reaches `connected`, and by any framebuffer resize that is not a
+   * video replacement, this is what makes a failed decoder recoverable over
+   * a reconnect instead of latched for the renderer's lifetime. A platform
+   * that truly has no decoder is not transient and is kept.
+   */
+  beginConnectionAttempt(): void {
+    this.closeAllH264();
+    this.h264Failures = 0;
+    this.h264Behind = false;
+    this.behindAskedAt = 0;
+    this.layoutMismatchRun = 0;
+    if (!this.h264Unsupported) this.h264Failed = false;
+  }
+
   /** Full-screen media streams must not wait for a frame before feeding the next. */
   setContinuousH264(enabled: boolean): void {
     this.continuousH264 = enabled;
@@ -1384,8 +1403,19 @@ export class WebGLRenderer {
     } catch {
       this.closeH264(id);
     }
+    this.askForFreshPicture();
+  }
+
+  /**
+   * Ask the session for an independent picture, at most once per interval.
+   *
+   * `behindAskedAt` of zero means no ask has been made yet. Comparing it
+   * with `performance.now()` directly rate-limited the FIRST ask of a
+   * session whenever the clock was still inside the interval.
+   */
+  private askForFreshPicture(): void {
     const now = performance.now();
-    if (now - this.behindAskedAt < H264_BEHIND_ASK_INTERVAL_MS) return;
+    if (this.behindAskedAt !== 0 && now - this.behindAskedAt < H264_BEHIND_ASK_INTERVAL_MS) return;
     this.behindAskedAt = now;
     this.onDecoderBehind?.();
   }
@@ -1483,6 +1513,10 @@ export class WebGLRenderer {
           }
           ctx.outputSeen = true;
           this.mediaDecoded += 1;
+          // The counter is about CONSECUTIVE failures. Errors spread across
+          // a long healthy session used to add up until video was disabled
+          // for the rest of the renderer's life.
+          this.h264Failures = 0;
           const pictureWidth = frame.displayWidth || frame.codedWidth;
           const pictureHeight = frame.displayHeight || frame.codedHeight;
           if (pictureWidth !== this.mediaPictureWidth || pictureHeight !== this.mediaPictureHeight) {
@@ -1664,6 +1698,10 @@ export class WebGLRenderer {
       this.h264Failed = true;
       this.notice(`H.264 decoding failed (${detail}); the video stream cannot be shown.`);
     }
+    // A failed decoder has lost its references. On a damage driven stream
+    // the next independent picture may never come on its own, so ask once,
+    // at the same rate limit the backlog path uses.
+    this.askForFreshPicture();
   }
 
   /**
