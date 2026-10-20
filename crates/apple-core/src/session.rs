@@ -745,6 +745,7 @@ pub async fn run(
         if cancel.is_cancelled() {
             break;
         }
+        let started = Instant::now();
         let result = connect(
             &options.host,
             options.port,
@@ -761,6 +762,7 @@ pub async fn run(
             &reconnect,
         )
         .await;
+        let uptime = started.elapsed();
         let reason = match result {
             Ok(()) => {
                 if !reconnect.swap(false, std::sync::atomic::Ordering::SeqCst) {
@@ -780,8 +782,12 @@ pub async fn run(
             break;
         }
         let _ = fail(&events, &reason).await;
-        let wait = Duration::from_millis(500u64 << attempt.min(4));
-        attempt = attempt.saturating_add(1);
+        // The wait grows with consecutive failures, and starts over only
+        // after an attempt that stayed up long enough to be a session. The
+        // old code reset the count after every wait, so ten transient
+        // failures were ten waits of half a second each.
+        let (next_attempt, wait) = next_retry(attempt, uptime);
+        attempt = next_attempt;
         let _ = emit_state(
             &events,
             SessionState::Reconnecting {
@@ -795,12 +801,30 @@ pub async fn run(
             // The session was asked to stop.
             return;
         }
-        // A new attempt starts from a clean slate: the session is a new
-        // one, and the old backoff does not apply to it.
-        attempt = 0;
         username = credentials.0.clone();
         password = credentials.1.clone();
     }
+}
+
+/// How long an attempt must stay up before the backoff starts over.
+const STABLE_UPTIME: Duration = Duration::from_secs(60);
+
+/// The first wait between attempts, doubled for each consecutive failure.
+const RETRY_BASE_MS: u64 = 500;
+
+/// How many doublings the wait takes before it stops growing.
+const RETRY_MAX_SHIFT: u32 = 4;
+
+/// The attempt number to report next, and how long to wait for it.
+///
+/// A failure that follows a session which stayed up is the first of a new
+/// run, not the sixth of an old one. A failure that follows another failure
+/// keeps growing the wait, so a Mac that refuses connections is not asked
+/// twice a second for ever.
+fn next_retry(attempt: u32, uptime: Duration) -> (u32, Duration) {
+    let attempt = if uptime >= STABLE_UPTIME { 0 } else { attempt };
+    let wait = Duration::from_millis(RETRY_BASE_MS << attempt.min(RETRY_MAX_SHIFT));
+    (attempt.saturating_add(1), wait)
 }
 
 /// Wait before the next attempt. Returns true when the session should end.
@@ -3077,6 +3101,32 @@ mod tests {
             true,
             Duration::from_millis(200)
         ));
+    }
+
+    #[test]
+    fn repeated_failures_back_off_and_a_stable_session_starts_over() {
+        // The old loop reset the count after every wait, so ten transient
+        // failures were ten waits of half a second each.
+        let mut attempt = 0;
+        let mut waits = Vec::new();
+        for _ in 0..7 {
+            let (next, wait) = next_retry(attempt, Duration::from_secs(1));
+            assert_eq!(next, attempt + 1);
+            waits.push(wait.as_millis() as u64);
+            attempt = next;
+        }
+        assert_eq!(waits, vec![500, 1_000, 2_000, 4_000, 8_000, 8_000, 8_000]);
+        // An attempt that stayed up is not the seventh failure of an old
+        // run: the next one waits as a first attempt again.
+        assert_eq!(
+            next_retry(6, Duration::from_secs(61)),
+            (1, Duration::from_millis(500))
+        );
+        // Just short of that, the backoff continues.
+        assert_eq!(
+            next_retry(6, Duration::from_secs(59)),
+            (7, Duration::from_millis(8_000))
+        );
     }
 
     #[test]
