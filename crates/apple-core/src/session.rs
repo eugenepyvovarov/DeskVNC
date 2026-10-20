@@ -436,6 +436,16 @@ fn finish_round(round: &mut ResizeRound) -> RoundEnd {
     }
 }
 
+/// Whether the Mac answered with a smaller picture than was asked for.
+///
+/// That answer is not a quality setting, it is a smaller desktop: fewer
+/// points, which looks like the viewer has zoomed in.
+fn answered_smaller(clamped: Option<(DisplayGeometry, DisplayGeometry)>) -> bool {
+    clamped.is_some_and(|(sent, confirmed)| {
+        confirmed.pixels.0 < sent.pixels.0 || confirmed.pixels.1 < sent.pixels.1
+    })
+}
+
 /// Ask for a size, or remember the ask until the running round is over.
 async fn request_resize(
     session: &mut Live,
@@ -1925,10 +1935,7 @@ async fn connect(
                                 // goes back to the size it had, and the
                                 // person is told that the request was more
                                 // than this Mac would stream.
-                                let shrunk = clamped.is_some_and(|(sent, confirmed)| {
-                                    confirmed.pixels.0 < sent.pixels.0
-                                        || confirmed.pixels.1 < sent.pixels.1
-                                });
+                                let shrunk = answered_smaller(clamped);
                                 if shrunk {
                                     if let Some(before) = round.before {
                                         let (mw, mh) = baseline.unwrap_or(before.pixels);
@@ -3129,6 +3136,27 @@ mod tests {
             pixels,
             points: (1800, 1169),
         }
+    }
+
+    #[test]
+    fn a_smaller_answer_is_recognised_so_the_desktop_can_be_put_back() {
+        // A Mac that cannot stream the size that was asked for answers with
+        // something smaller. Accepting it shrinks the desktop, and a desktop
+        // with fewer points is what "zoomed in" looks like.
+        let sent = retina((3600, 2338));
+        assert!(answered_smaller(Some((sent, retina((1600, 1200))))));
+        // An answer that matches is not a problem.
+        assert!(!answered_smaller(Some((sent, sent))));
+        // A larger answer that only differs in points is not "smaller".
+        assert!(!answered_smaller(Some((
+            sent,
+            DisplayGeometry {
+                pixels: (3600, 2338),
+                points: (1800, 1170)
+            },
+        ))));
+        // Nothing to compare is not a clamp.
+        assert!(!answered_smaller(None));
     }
 
     #[test]
