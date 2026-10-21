@@ -134,6 +134,42 @@ it("accepts the stream's own desktop after it keeps disagreeing with the layout"
   expect(renderer.latestVideo?.ctx.stretch).toBe(false);
 });
 
+it("decodes the independent picture that triggered a backlog reset", () => {
+  // The reset clears the configuration, and the picture that caused it is
+  // the recovery picture. It must be decoded by a rebuilt decoder, not
+  // handed to an unconfigured one and thrown away.
+  let decoders = 0;
+  let configureCalls = 0;
+  let decodeThrows = 0;
+  vi.stubGlobal("VideoDecoder", class {
+    state = "unconfigured";
+    decodeQueueSize = 0;
+    configured = false;
+    constructor(_callbacks: unknown) { decoders += 1; }
+    configure() { this.configured = true; this.state = "configured"; configureCalls += 1; }
+    reset() { this.configured = false; this.state = "unconfigured"; }
+    decode() { if (!this.configured) { decodeThrows += 1; throw new Error("unconfigured"); } }
+    close() { this.state = "closed"; }
+  });
+  vi.stubGlobal("EncodedVideoChunk", class {
+    constructor(public init: unknown) { Object.assign(this, init); }
+  });
+  const renderer = sizedDecoderHarness();
+  const key = new Uint8Array([0, 0, 0, 1, 0x65, 0xaa]);
+  return (async () => {
+    await renderer.decodeH264({ h264Context: 0, h264Key: true, h264Reset: true, payload: key });
+    // Four requests in the queue, and the next picture is an independent
+    // non-IDR picture: it triggers the reset itself.
+    renderer.h264.get(0)!.decoder.decodeQueueSize = 4;
+    await renderer.decodeH264({ h264Context: 0, h264Key: true, h264Reset: false, payload: key });
+    expect(decodeThrows).toBe(0);
+    expect(decoders).toBe(2);
+    expect(configureCalls).toBe(2);
+    expect(renderer.h264.get(0)).toBeDefined();
+    expect(renderer.h264Behind).toBe(false);
+  })();
+});
+
 it("does not latch a failure that healthy output has recovered from", () => {
   // Three errors spread across a long healthy session used to add up until
   // video was disabled for the rest of the renderer's life.
@@ -276,7 +312,10 @@ it("reconfigures a decoder that a backlog reset left unconfigured", () => {
     const ctx = renderer.h264.get(0)!;
     ctx.decoder.decodeQueueSize = 4;
     await renderer.decodeH264({ h264Context: 0, h264Key: false, payload: delta });
-    expect(ctx.decoder.state).toBe("unconfigured");
+    // A delta cannot be decoded after the reset, so the context is closed
+    // and the next independent picture rebuilds it.
+    expect(ctx.decoder.state).toBe("closed");
+    expect(renderer.h264.get(0)).toBeUndefined();
     expect(decodeThrows).toBe(0);
     // An independent non-IDR picture arrives as the recovery picture.
     await renderer.decodeH264({ h264Context: 0, h264Key: true, h264Reset: false, payload: key });

@@ -1365,6 +1365,19 @@ export class WebGLRenderer {
     // it is what made the picture arrive seconds late.
     if (ctx.decoder.decodeQueueSize >= H264_MAX_DECODE_QUEUE) {
       this.dropBehind(ctx, id);
+      // The reset above cleared the decoder's configuration, and this same
+      // picture is the one that has to be decoded. Rebuilding here is what
+      // keeps an independent picture that triggers the reset from being
+      // thrown away by an unconfigured decoder.
+      if (ctx.configured === false) {
+        this.closeH264(id);
+        ctx = undefined;
+      }
+    }
+    if (!ctx) {
+      if (!isKey) return;
+      ctx = this.createH264(r, id, r.payload) ?? undefined;
+      if (!ctx) return;
     }
     if (this.h264Behind && !isKey) return;
     if (this.h264Behind && isKey) this.h264Behind = false;
