@@ -172,6 +172,8 @@ impl Depacketizer {
                     // and this one are lost, and the expected one is the
                     // first of them.
                     self.report_gap(expected, u64::from(ahead));
+                    // The lost packets may be this picture's first slices.
+                    self.damage_timestamp(timestamp);
                     self.expected = Some(seq);
                     self.assemble(timestamp, marker, payload);
                     self.expected = Some(seq.wrapping_add(1));
@@ -304,6 +306,10 @@ impl Depacketizer {
             return;
         };
         self.reorder_bytes = self.reorder_bytes.saturating_sub(packet.payload.len());
+        if skipped > 0 {
+            // The missing packets may be the first slices of THIS picture.
+            self.damage_timestamp(packet.timestamp);
+        }
         self.expected = Some(seq);
         self.assemble(packet.timestamp, packet.marker, &packet.payload);
         self.expected = Some(seq.wrapping_add(1));
@@ -337,6 +343,16 @@ impl Depacketizer {
             self.damaged = Some(timestamp);
         }
         self.discard_picture();
+    }
+
+    /// Refuse every remaining packet that carries this timestamp.
+    ///
+    /// A gap can swallow the FIRST slice of a picture, so the packet that
+    /// arrives after it may be the tail of a picture that was never whole.
+    /// The timestamp of that packet is damaged too, even though it differs
+    /// from the one being assembled.
+    fn damage_timestamp(&mut self, timestamp: u32) {
+        self.damaged = Some(timestamp);
     }
 
     fn discard_picture(&mut self) {
@@ -782,7 +798,10 @@ mod tests {
             .iter()
             .filter_map(|unit| unit.annex_b.last().copied())
             .collect();
-        assert_eq!(order, vec![0xbb, 0xcc, 0xdd], "a packet was reordered");
+        // The first picture after a gap is abandoned as well: the lost
+        // packet may have been its first slice, and this receiver does not
+        // assume a changed timestamp means a complete picture.
+        assert_eq!(order, vec![0xcc, 0xdd], "a packet was reordered");
     }
 
     #[test]
@@ -855,6 +874,30 @@ mod tests {
         assert!(units.is_empty(), "a damaged picture was published");
         // The next picture is whole and is published normally.
         let units = d.push(22, 200, true, &[0x65, 0xdd]);
+        assert_eq!(units.len(), 1);
+        assert!(units[0].keyframe);
+    }
+
+    #[test]
+    fn a_gap_that_swallows_the_first_slice_does_not_publish_the_tail() {
+        // The first slice of the new picture is the packet that goes
+        // missing, so the only packet seen for that timestamp is its
+        // marker-terminated tail. Damaging the timestamp being assembled
+        // is not enough: the tail carries a different one.
+        let mut d = Depacketizer::default();
+        assert_eq!(d.push(1, 100, true, &[0x65, 0xaa]).len(), 1);
+        // seq 2, the first slice of timestamp 200, is lost. The tail waits
+        // in the reorder buffer until the hole expires.
+        assert!(d.push(3, 200, true, &[0x65, 0xbb]).is_empty());
+        d.flush_oldest();
+        assert_eq!(d.stats.gaps, 1);
+        // The tail must not be published as a complete key picture.
+        assert!(
+            d.ready.is_empty(),
+            "the tail of the damaged picture was published"
+        );
+        // A whole picture after it is published normally.
+        let units = d.push(4, 300, true, &[0x65, 0xcc]);
         assert_eq!(units.len(), 1);
         assert!(units[0].keyframe);
     }
