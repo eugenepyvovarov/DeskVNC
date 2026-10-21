@@ -745,7 +745,10 @@ pub async fn run(
         if cancel.is_cancelled() {
             break;
         }
-        let started = Instant::now();
+        // When this attempt actually reached `connected`. A slow handshake
+        // and a slow teardown are not uptime, and counting them let a
+        // session that never connected reset the backoff.
+        let mut connected_at: Option<Instant> = None;
         let result = connect(
             &options.host,
             options.port,
@@ -760,9 +763,10 @@ pub async fn run(
             &cancel,
             host_keys.clone(),
             &reconnect,
+            &mut connected_at,
         )
         .await;
-        let uptime = started.elapsed();
+        let uptime = connected_at.map_or(Duration::ZERO, |at| at.elapsed());
         let reason = match result {
             Ok(()) => {
                 if !reconnect.swap(false, std::sync::atomic::Ordering::SeqCst) {
@@ -797,9 +801,12 @@ pub async fn run(
             },
         )
         .await;
-        if wait_for_retry(&mut commands, &cancel, wait, &mut credentials).await {
-            // The session was asked to stop.
-            return;
+        match wait_for_retry(&mut commands, &cancel, wait, &mut credentials).await {
+            RetryWait::Stop => return,
+            // A person asked for the retry now, so the next failure is the
+            // first of a new run rather than a continuation of the ladder.
+            RetryWait::Now => attempt = 0,
+            RetryWait::Elapsed => {}
         }
         username = credentials.0.clone();
         password = credentials.1.clone();
@@ -827,24 +834,35 @@ fn next_retry(attempt: u32, uptime: Duration) -> (u32, Duration) {
     (attempt.saturating_add(1), wait)
 }
 
-/// Wait before the next attempt. Returns true when the session should end.
+/// How a retry wait ended.
+#[derive(Debug, PartialEq, Eq)]
+enum RetryWait {
+    /// The wait elapsed: this is still the same run of failures.
+    Elapsed,
+    /// A person asked to retry now.
+    Now,
+    /// The session was told to stop.
+    Stop,
+}
+
+/// Wait before the next attempt.
 async fn wait_for_retry(
     commands: &mut mpsc::Receiver<ClientCommand>,
     cancel: &tokio_util::sync::CancellationToken,
     wait: Duration,
     credentials: &mut (String, String),
-) -> bool {
+) -> RetryWait {
     let deadline = Instant::now() + wait;
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            return false;
+            return RetryWait::Elapsed;
         }
         tokio::select! {
-            _ = cancel.cancelled() => return true,
+            _ = cancel.cancelled() => return RetryWait::Stop,
             cmd = commands.recv() => match cmd {
-                None | Some(ClientCommand::Disconnect) => return true,
-                Some(ClientCommand::ReconnectNow) => return false,
+                None | Some(ClientCommand::Disconnect) => return RetryWait::Stop,
+                Some(ClientCommand::ReconnectNow) => return RetryWait::Now,
                 Some(ClientCommand::ProvideCredentials { username: user, password: pass, .. }) => {
                     // A new password is for the next attempt.
                     if let Some(user) = user {
@@ -858,7 +876,7 @@ async fn wait_for_retry(
                 }
                 _ => {}
             },
-            _ = tokio::time::sleep(remaining) => return false,
+            _ = tokio::time::sleep(remaining) => return RetryWait::Elapsed,
         }
     }
 }
@@ -911,6 +929,7 @@ async fn connect(
     cancel: &tokio_util::sync::CancellationToken,
     host_keys: Option<crate::macos::Verifier>,
     reconnect: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    connected_at: &mut Option<Instant>,
 ) -> Result<(), SessionError> {
     emit_state(events, SessionState::Connecting).await.ok();
     let mut tcp = tokio::time::timeout(Duration::from_secs(15), TcpStream::connect((host, port)))
@@ -1107,6 +1126,7 @@ async fn connect(
     )
     .await
     .ok();
+    *connected_at = Some(Instant::now());
     emit_state(events, SessionState::Connected).await.ok();
 
     let udp = session.udp.take();
@@ -2984,7 +3004,10 @@ mod tests {
         let cancel = tokio_util::sync::CancellationToken::new();
         let mut credentials = ("user".to_string(), "pass".to_string());
         tx.send(ClientCommand::Disconnect).await.unwrap();
-        assert!(wait_for_retry(&mut rx, &cancel, Duration::from_secs(5), &mut credentials).await);
+        assert_eq!(
+            wait_for_retry(&mut rx, &cancel, Duration::from_secs(5), &mut credentials).await,
+            RetryWait::Stop
+        );
     }
 
     #[tokio::test]
@@ -2994,7 +3017,10 @@ mod tests {
         let mut credentials = ("user".to_string(), "pass".to_string());
         tx.send(ClientCommand::ReconnectNow).await.unwrap();
         let start = Instant::now();
-        assert!(!wait_for_retry(&mut rx, &cancel, Duration::from_secs(30), &mut credentials).await);
+        assert_eq!(
+            wait_for_retry(&mut rx, &cancel, Duration::from_secs(30), &mut credentials).await,
+            RetryWait::Now
+        );
         assert!(
             start.elapsed() < Duration::from_secs(1),
             "the retry waited anyway"
@@ -3014,7 +3040,10 @@ mod tests {
         .await
         .unwrap();
         tx.send(ClientCommand::ReconnectNow).await.unwrap();
-        assert!(!wait_for_retry(&mut rx, &cancel, Duration::from_secs(30), &mut credentials).await);
+        assert_eq!(
+            wait_for_retry(&mut rx, &cancel, Duration::from_secs(30), &mut credentials).await,
+            RetryWait::Now
+        );
         assert_eq!(credentials, ("other".to_string(), "new".to_string()));
     }
 
@@ -3131,6 +3160,12 @@ mod tests {
             attempt = next;
         }
         assert_eq!(waits, vec![500, 1_000, 2_000, 4_000, 8_000, 8_000, 8_000]);
+        // An attempt that never reached connected has no uptime at all, so
+        // a slow handshake cannot reset the ladder.
+        assert_eq!(
+            next_retry(6, Duration::ZERO),
+            (7, Duration::from_millis(8_000))
+        );
         // An attempt that stayed up is not the seventh failure of an old
         // run: the next one waits as a first attempt again.
         assert_eq!(
