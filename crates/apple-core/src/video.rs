@@ -7,21 +7,33 @@ use crate::srtp::SrtpContext;
 
 const MAX_STREAMS: usize = 32;
 const STREAM_STALL: Duration = Duration::from_millis(750);
+/// How many replaced streams keep their replay identity.
+///
+/// A tombstone holds only an SRTP context: the accepted packet index and the
+/// replay bitmap. That is what refuses a replayed or delayed packet from an
+/// encoder that has been replaced, and it is small enough to keep for many
+/// more streams than the assembly table. Forgetting one is a bounded loss of
+/// that protection, logged when it happens.
+const RETIRED_CAPACITY: usize = 128;
 
 struct Stream {
     srtp: SrtpContext,
     depay: Depacketizer,
     /// When this stream was last seen, for eviction order.
     last_seen: Instant,
-    /// The generation at which this stream was replaced, or `None` while it
-    /// is active or a candidate. A retired stream may be adopted again only
-    /// after the session has asked the Mac for a newer stream.
-    retired_generation: Option<u64>,
+}
+
+/// A replaced stream's identity, kept after its assembly state is gone.
+struct Retired {
+    srtp: SrtpContext,
+    last_seen: Instant,
 }
 
 pub(crate) struct VideoStreams {
     keys: SrtpContext,
     streams: HashMap<u32, Stream>,
+    /// Replaced streams, kept for replay refusal only.
+    retired: HashMap<u32, Retired>,
     active: Option<u32>,
     last_picture: Instant,
     active_generation: u64,
@@ -35,6 +47,7 @@ impl VideoStreams {
         Self {
             keys,
             streams: HashMap::new(),
+            retired: HashMap::new(),
             active: None,
             last_picture: now,
             active_generation: 0,
@@ -50,13 +63,10 @@ impl VideoStreams {
     /// old ones refuses every packet of the new stream as a replay, so the
     /// picture never comes back.
     pub(crate) fn new_epoch(&mut self) {
+        // Only the streams that could become the new one are reset. A
+        // tombstone keeps its replay window: clearing it would readmit
+        // traffic from an encoder that has already been replaced.
         for stream in self.streams.values_mut() {
-            // A retired stream keeps its replay window: it is not part of the
-            // new stream, and clearing it would readmit traffic from its old
-            // incarnation.
-            if stream.retired_generation.is_some() {
-                continue;
-            }
             stream.srtp.new_epoch();
             stream.depay.reset();
         }
@@ -79,7 +89,7 @@ impl VideoStreams {
             .streams
             .iter()
             .filter(|(ssrc, _)| Some(**ssrc) != self.active)
-            .min_by_key(|(_, stream)| (stream.retired_generation.is_none(), stream.last_seen))
+            .min_by_key(|(_, stream)| stream.last_seen)
             .map(|(ssrc, _)| *ssrc);
         let Some(victim) = victim else {
             return false;
@@ -126,6 +136,21 @@ impl VideoStreams {
             return Vec::new();
         }
         let ssrc = u32::from_be_bytes(packet[8..12].try_into().unwrap());
+        if !self.streams.contains_key(&ssrc) {
+            if let Some(retired) = self.retired.get_mut(&ssrc) {
+                // A packet from an encoder that has been replaced. It is
+                // authenticated against that stream's own replay window, so a
+                // replay is refused and an unseen delayed packet is consumed,
+                // but it is never adopted: a local generation change is not
+                // proof that the sender restarted, and the keys did not
+                // change. Re-adopting here is how delayed old video took the
+                // display back.
+                if retired.srtp.unprotect(packet).is_some() {
+                    retired.last_seen = now;
+                }
+                return Vec::new();
+            }
+        }
         let rtp = if let Some(stream) = self.streams.get_mut(&ssrc) {
             stream.srtp.unprotect(packet)
         } else {
@@ -145,7 +170,6 @@ impl VideoStreams {
                     srtp,
                     depay: Depacketizer::default(),
                     last_seen: now,
-                    retired_generation: None,
                 },
             );
             Some(rtp)
@@ -153,23 +177,6 @@ impl VideoStreams {
         let Some(rtp) = rtp else { return Vec::new() };
         self.authenticated += 1;
         let stream = self.streams.get_mut(&ssrc).unwrap();
-        if let Some(retired_generation) = stream.retired_generation {
-            if generation <= retired_generation {
-                // Delayed traffic from an encoder that has been replaced.
-                return Vec::new();
-            }
-            // The session asked for a new stream since this one was
-            // replaced, so this SSRC may be that new stream. Its replay
-            // window is kept, so a replayed packet from its old incarnation
-            // is still refused.
-            stream.retired_generation = None;
-            stream.depay.reset();
-            tracing::info!(
-                ssrc,
-                generation,
-                "Apple replaced video stream is eligible again"
-            );
-        }
         stream.last_seen = now;
         // Assemble candidates too: skipping their early packets discards
         // precisely the SPS/PPS and first key picture needed for a switch.
@@ -177,6 +184,40 @@ impl VideoStreams {
             .depay
             .push(rtp.seq, rtp.timestamp, rtp.marker, &rtp.payload);
         self.select(ssrc, units, generation, now)
+    }
+
+    /// Move a replaced stream out of the assembly table.
+    ///
+    /// Its depacketizer goes: the half-assembled picture belongs to a decoder
+    /// that is gone. Its SRTP context stays, because it is the only thing
+    /// that can tell a replayed packet from that encoder apart from a new
+    /// one, and the media keys never changed.
+    fn retire(&mut self, ssrc: u32, now: Instant) {
+        let Some(stream) = self.streams.remove(&ssrc) else {
+            return;
+        };
+        if self.retired.len() >= RETIRED_CAPACITY {
+            let oldest = self
+                .retired
+                .iter()
+                .min_by_key(|(_, retired)| retired.last_seen)
+                .map(|(ssrc, _)| *ssrc);
+            if let Some(oldest) = oldest {
+                self.retired.remove(&oldest);
+                tracing::warn!(
+                    ssrc = oldest,
+                    capacity = RETIRED_CAPACITY,
+                    "Apple retired stream identity forgotten at the cap"
+                );
+            }
+        }
+        self.retired.insert(
+            ssrc,
+            Retired {
+                srtp: stream.srtp,
+                last_seen: now,
+            },
+        );
     }
 
     fn select(
@@ -202,15 +243,7 @@ impl VideoStreams {
             units[0].reset = true;
             let previous = self.active.replace(ssrc);
             if let Some(previous) = previous {
-                if let Some(stream) = self.streams.get_mut(&previous) {
-                    // The generation in force when it was replaced: adopting
-                    // a later stream is what makes it eligible again, not a
-                    // packet that arrives under the same generation.
-                    stream.retired_generation = Some(generation);
-                    // The old stream's half-assembled picture belongs to a
-                    // decoder that is gone.
-                    stream.depay.reset();
-                }
+                self.retire(previous, now);
             }
             self.active_generation = generation;
             tracing::info!(
@@ -235,9 +268,6 @@ impl VideoStreams {
         let mut output = Vec::new();
         for ssrc in ids {
             let stream = self.streams.get_mut(&ssrc).unwrap();
-            if stream.retired_generation.is_some() {
-                continue;
-            }
             let units = stream.depay.flush();
             output.extend(self.select(ssrc, units, generation, now));
         }
@@ -465,28 +495,61 @@ mod tests {
                 "{} stream entries are retained",
                 rx.streams.len()
             );
+            assert!(
+                rx.retired.len() <= RETIRED_CAPACITY,
+                "{} retired identities are retained",
+                rx.retired.len()
+            );
         }
-        assert!(rx.evicted() > 0);
     }
 
     #[test]
-    fn a_replaced_stream_can_be_adopted_again_after_a_new_stream_is_asked_for() {
-        // The Mac may reuse an earlier SSRC after a re-offer. Re-adoption is
-        // gated on a generation newer than the one that retired it, so
-        // delayed traffic from its old incarnation cannot come back.
+    fn a_replaced_stream_is_never_readopted_without_a_new_identity() {
+        // A local re-offer is a request, not proof that the sender restarted.
+        // The keys do not change, so a delayed packet from the replaced
+        // encoder authenticates. It is consumed and dropped, never adopted.
         let mut rx = receiver();
         let now = Instant::now();
         rx.push(&packet(10, 0, &key_picture()), 1, now);
         rx.push(&packet(20, 0, &key_picture()), 2, now);
         assert_eq!(rx.active(), Some(20));
-        // A later re-offer makes the earlier SSRC eligible again.
         rx.new_epoch();
+        // An unseen key picture from the replaced encoder.
         let units = rx.push(&packet(10, 1, &key_picture()), 3, now);
-        assert_eq!(units.len(), 1);
-        assert_eq!(rx.active(), Some(10));
-        // Its old packets are still refused as replays.
+        assert!(units.is_empty(), "delayed old video replaced the stream");
+        assert_eq!(rx.active(), Some(20));
+        // A replayed packet from it is still refused.
         assert!(rx.push(&packet(10, 0, &key_picture()), 3, now).is_empty());
-        assert_eq!(rx.active(), Some(10));
+        assert_eq!(rx.active(), Some(20));
+    }
+
+    #[test]
+    fn a_replayed_packet_stays_refused_after_many_replacements() {
+        // Eviction used to remove the replay history with the entry, so an
+        // old key picture was accepted again after enough stream churn.
+        let mut rx = receiver();
+        let now = Instant::now();
+        let original = packet(10, 0, &key_picture());
+        rx.push(&original, 1, now);
+        assert!(rx.push(&original, 1, now).is_empty(), "a replay is refused");
+        for generation in 2..=40u64 {
+            let ssrc = 100 + generation as u32;
+            rx.new_epoch();
+            assert_eq!(
+                rx.push(&packet(ssrc, 0, &key_picture()), generation, now)
+                    .len(),
+                1
+            );
+        }
+        assert!(rx.retired.len() <= RETIRED_CAPACITY);
+        // Long picture silence also permits replacement, so the replay is
+        // offered under exactly those conditions.
+        let later = now + Duration::from_secs(5);
+        assert!(
+            rx.push(&original, 40, later).is_empty(),
+            "an old packet came back after the churn"
+        );
+        assert_eq!(rx.active(), Some(140));
     }
 
     #[test]

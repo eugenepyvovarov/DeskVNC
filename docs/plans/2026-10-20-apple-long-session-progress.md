@@ -20,7 +20,7 @@ the production suite, not that the pipeline has been qualified.
 | REN-02 | A decoder reset by a backlog drop is rebuilt and reconfigured instead of being handed a picture it cannot decode | `40a59c6` | `reconfigures a decoder that a backlog reset left unconfigured` |
 | REN-01 (policy) | Failures are consecutive; healthy output clears them; a new attempt resets transient state; a decoder error asks for one fresh picture at the shared rate limit | `1bf645a` | `does not latch a failure that healthy output has recovered from`, `clears transient decoder state when a new attempt begins`, `asks for a fresh picture when a decoder fails` |
 | MEM-01 (renderer) | Unmatched timing samples are bounded by count and age; a decoder whose configuration was refused is closed | `abfce90` | `bounds the timestamps of pictures that never come back`, `closes a decoder whose configuration was refused` |
-| STREAM-01 | The stream table evicts the longest-silent inactive entry instead of refusing every SSRC after thirty two; a replaced SSRC is eligible again only under a newer generation, with its replay window kept | `dcf7351` | `an_encoder_replacement_beyond_the_stream_limit_is_adopted`, `a_replaced_stream_can_be_adopted_again_after_a_new_stream_is_asked_for` |
+| STREAM-01 | Capacity is bounded, and a replaced stream keeps its replay identity in a tombstone map. It is never re-adopted on a local generation change, because that readmitted delayed old video | `dcf7351`, this pass | `an_encoder_replacement_beyond_the_stream_limit_is_adopted`, `a_replayed_packet_stays_refused_after_many_replacements`, `a_replaced_stream_is_never_readopted_without_a_new_identity` |
 | RTCP-01 (sequence) | Every new FIR command gets the next number for its sender and target pair; the session seeds it randomly | `b4d5779` | `a_new_fir_command_carries_a_new_sequence_number` |
 | DISPLAY-01 (safety) | A second display request waits its turn instead of replacing the reply receiver; a closed reply is a typed failure, not a panic | `3ccf608` | none offline: the control loop needs the fake server |
 | REC-02 (backoff) | The wait doubles per consecutive failure up to eight seconds and restarts only after a minute of uptime | `49c4021` | `repeated_failures_back_off_and_a_stable_session_starts_over` |
@@ -57,6 +57,21 @@ the production suite, not that the pipeline has been qualified.
 | GPU-01, PERF-01..04 | Performance work needs the measurement harness from PERF-01 first. |
 | QA-01..03 | A deterministic fake server, then 2/8/24 hour soaks on an isolated Mac, then installed-artifact qualification. |
 | SIZE-02 | The startup descriptor question is recorded in the resolution plan; it needs a controlled capture. |
+
+## Follow-up review
+
+[The follow-up review](../reviews/2026-10-21-apple-long-session-followup-review.md)
+found five P1 defects in this pass, three of them regressions it introduced
+(F1 eviction dropped replay history, F2 a local generation readmitted delayed
+old video, F3 the attempt reset ran in a passive effect and could close the new
+decoder). F1 and F2 are corrected above by keeping retired replay identity and
+removing re-adoption. F3, F4, F5 and the P2 findings F6 to F9 are open; the
+review's own order is the order to do them in.
+
+The claims below that say a fix is complete should be read with that review:
+DISPLAY-01 rejects a second request rather than queueing it, REN-01's attempt
+boundary is not ordered against media, and the two rows with no offline test
+are implemented logic, not integration-verified behaviour.
 
 ## State of the evidence
 
