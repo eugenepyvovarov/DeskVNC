@@ -64,9 +64,14 @@ the production suite, not that the pipeline has been qualified.
 found five P1 defects in this pass, three of them regressions it introduced
 (F1 eviction dropped replay history, F2 a local generation readmitted delayed
 old video, F3 the attempt reset ran in a passive effect and could close the new
-decoder). F1 and F2 are corrected above by keeping retired replay identity and
-removing re-adoption. F3, F4, F5 and the P2 findings F6 to F9 are open; the
-review's own order is the order to do them in.
+decoder). F1 and F2 are corrected by keeping retired replay identity and removing
+re-adoption. F3 (non-destructive, ordered-by-construction attempt boundary),
+F4 (first post-gap picture is suspect), F5 (the picture that triggers a
+backlog reset is decoded by a rebuilt decoder), F7 (backoff measured from
+connected) and F9 (a manual retry restarts the ladder) are fixed. F6 (a
+closed event consumer must be a terminal outcome, not a retried worker
+failure) and F8 (FIR numbering is session-global, not per sender/target
+pair) remain open.
 
 The claims below that say a fix is complete should be read with that review:
 DISPLAY-01 rejects a second request rather than queueing it, REN-01's attempt
