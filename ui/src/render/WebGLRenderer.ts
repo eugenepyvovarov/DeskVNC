@@ -782,7 +782,19 @@ export class WebGLRenderer {
    * that truly has no decoder is not transient and is kept.
    */
   beginConnectionAttempt(): void {
-    this.closeAllH264();
+    // This runs after the attempt's first media can already have arrived, so
+    // it must NOT close decoder contexts. The first IDR of the new attempt
+    // may have created the new decoder before this call, and closing it would
+    // throw that picture away and leave the deltas that follow with no
+    // context. A new stream's key picture carries a reset flag and replaces
+    // its context anyway.
+    //
+    // What does belong to the previous attempt is queued work: updates that
+    // were parsed but not applied, and a layout waiting for a replacement
+    // picture that will never come from the old stream.
+    this.pending.length = 0;
+    this.pendingBytes = 0;
+    this.pendingLayout = null;
     this.h264Failures = 0;
     this.h264Behind = false;
     this.behindAskedAt = 0;

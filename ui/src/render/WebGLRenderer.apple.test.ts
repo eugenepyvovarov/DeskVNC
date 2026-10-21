@@ -193,16 +193,26 @@ it("does not latch a failure that healthy output has recovered from", () => {
   expect(renderer.h264Failed).toBe(false);
 });
 
-it("clears transient decoder state when a new attempt begins", () => {
+it("clears transient decoder state without closing the new attempt's decoder", () => {
   // A reconnect can arrive at the same size, so the renderer must be told
-  // about the new attempt explicitly or a failed decoder stays latched.
+  // about the new attempt explicitly or a failed decoder stays latched. It
+  // must not close contexts: the new attempt's first IDR may already have
+  // created the new decoder before this call runs.
+  const closeAll = vi.fn();
   const renderer = sizedDecoderHarness({
-    h264Failed: true, h264Failures: 3, h264Behind: true, closeAllH264: vi.fn(),
+    h264Failed: true, h264Failures: 3, h264Behind: true,
+    pending: [{ seq: 1 }], pendingBytes: 10, pendingLayout: { width: 1, height: 1 },
+    closeAllH264: closeAll,
   });
   renderer.beginConnectionAttempt();
   expect(renderer.h264Failed).toBe(false);
   expect(renderer.h264Failures).toBe(0);
   expect(renderer.h264Behind).toBe(false);
+  // Work queued for the previous attempt does not belong to this one.
+  expect(renderer.pending).toHaveLength(0);
+  expect(renderer.pendingBytes).toBe(0);
+  expect(renderer.pendingLayout).toBeNull();
+  expect(closeAll).not.toHaveBeenCalled();
   // A platform with no decoder at all does not become able because of a
   // reconnect, so that fact is kept.
   const unsupported = sizedDecoderHarness({
@@ -210,6 +220,40 @@ it("clears transient decoder state when a new attempt begins", () => {
   });
   unsupported.beginConnectionAttempt();
   expect(unsupported.h264Failed).toBe(true);
+});
+
+it("keeps a decoder the new attempt already created", async () => {
+  // The ordering the review found: connected is committed, the first IDR
+  // arrives and creates the new decoder, and only then does the passive
+  // effect call the boundary. Closing contexts there destroyed the new
+  // decoder and the deltas that followed were dropped.
+  let decoders = 0;
+  let decodeCalls = 0;
+  vi.stubGlobal("VideoDecoder", class {
+    state = "configured";
+    decodeQueueSize = 0;
+    constructor(_callbacks: unknown) { decoders += 1; }
+    configure() {}
+    decode() { decodeCalls += 1; }
+    close() { this.state = "closed"; }
+  });
+  vi.stubGlobal("EncodedVideoChunk", class {
+    constructor(public init: unknown) { Object.assign(this, init); }
+  });
+  const renderer = sizedDecoderHarness();
+  await renderer.decodeH264({
+    h264Context: 0, h264Key: true, h264Reset: true,
+    payload: new Uint8Array([0, 0, 0, 1, 0x65, 0xaa]),
+  });
+  const ctx = renderer.h264.get(0)!;
+  renderer.beginConnectionAttempt();
+  expect(renderer.h264.get(0)).toBe(ctx);
+  await renderer.decodeH264({
+    h264Context: 0, h264Key: false,
+    payload: new Uint8Array([0, 0, 0, 1, 0x61, 0xbb]),
+  });
+  expect(decodeCalls).toBe(2);
+  expect(decoders).toBe(1);
 });
 
 it("asks for a fresh picture when a decoder fails", () => {
@@ -423,6 +467,9 @@ function decoderHarness(extra: Record<string, unknown> = {}) {
     h264Failed: false, h264Unsupported: false, h264Failures: 0,
     h264Acceleration: "prefer-hardware",
     notice: vi.fn(),
+    pending: [], pendingBytes: 0, pendingLayout: null,
+    layoutMismatchRun: 0, mediaMismatches: 0, mediaLatencyDropped: 0,
+    behindAskedAt: 0,
     ...extra,
   });
 }
